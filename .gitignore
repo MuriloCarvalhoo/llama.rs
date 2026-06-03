@@ -2,3 +2,9 @@
 /build-oracle
 /models
 /refs/tensors.txt
+
+# Repositório separado que vive aqui por acaso (tem seu próprio .git)
+/everything-claude-code
+# Scratch da deep-research (notas de verificação, não entregáveis)
+/cuda_knowledge_check.txt
+/final_analysis.txt
