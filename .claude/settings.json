@@ -2,5 +2,18 @@
   "enabledPlugins": {
     "ecc@ecc": true,
     "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/scripts/fmt-hook.sh\""
+          }
+        ]
+      }
+    ]
   }
 }
