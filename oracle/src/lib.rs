@@ -4,6 +4,8 @@
 
 mod error;
 mod parse;
+mod runner;
 
 pub use error::OracleError;
 pub use parse::parse_token_ids;
+pub use runner::Oracle;
