@@ -54,10 +54,10 @@ Princípios estruturais:
 | 0 | Infra: workspace, CI, lints, harness oráculo, modelo de teste (tiny Llama/Qwen ~0.5B) | Harness roda o C++ e captura tokens/logits/tensors de referência |
 | 1 | Parser GGUF + tokenizer | Metadados idênticos; tokens bit-exact num corpus de teste |
 | 2 | Forward pass CPU f32, 1 arquitetura (Llama) | Logits ≤ 1e-4 de tolerância, camada por camada |
-| 3 | Quantização: Q8_0, Q4_0, Q4_K, Q6_K, ... | Dequant bit-exact; perplexity igual à do C++ |
+| 3 | Quantização: Q8_0, Q4_0, Q4_K, Q6_K, ... | Dequant bit-exact; perplexity igual à do C++. **Eixo de memória (primário):** footprint de VRAM/RAM por formato medido e ≤ ao do C++ para o mesmo modelo — é aqui que se ganha o grosso da economia de memória (4x FP16→Q4) |
 | 4 | Sampling + geração ponta-a-ponta (`llama-cli`) | Greedy: sequência de tokens idêntica ao C++ |
-| 5 | KV-cache completo, batching, multi-thread | Mesmos resultados com batch>1; throughput ≥ 70% do C++ CPU |
-| 6 | Backend Vulkan/wgpu (alvo MI50/gfx906) | Logits CPU ≡ GPU; speedup mensurável |
+| 5 | KV-cache completo, batching, multi-thread | Mesmos resultados com batch>1; throughput ≥ 70% do C++ CPU. **Eixo de memória (primário):** KV-cache quantizável (Q8/Q4) e layout eficiente; pico de memória por contexto medido e reportado |
+| 6 | Backend Vulkan/wgpu (alvo MI50/gfx906) | Logits CPU ≡ GPU. **Eixo de performance (primário):** token-gen é memory-bandwidth bound → os ganhos de t/s vêm de (a) **dequant packed-integer** explorando as instruções DL do gfx906 (`V_DOT4_I32_I8`, `V_DOT2_F32_F16`) em vez de dequant elemento-a-elemento, e (b) **Flash Attention wave64-correto** (sem a degradação 2x). Critério: speedup de tg mensurável vs. CPU **e** utilização de banda do kernel reportada. Overhead de runtime host é ~1% na MI50 — **fora de escopo aqui** |
 | 7 | Mais arquiteturas (Qwen, Mistral, Gemma, Phi, ...) | Cada arch validada contra oráculo |
 | 8+ | Server, grammar, LoRA, embeddings, multimodal | Paridade incremental de features |
 
@@ -127,4 +127,4 @@ Itens 2, 3 e 5 são automatizados em CI + hooks. No ultracode, cada agente imple
 - **Escala:** mesmo com escopo de hardware reduzido, é um projeto de meses. Mitigação: fatias verticais — sempre há um artefato executável e validado.
 - **Divergência numérica:** ordem de operações em float difere entre implementações. Mitigação: tolerâncias definidas por fase; comparação camada por camada para localizar divergências.
 - **Upstream móvel:** o llama.cpp evolui. Mitigação: pinar o commit do oráculo; paridade é contra esse pin.
-- **Vulkan em gfx906:** cobertura de drivers RADV para compute é boa, mas wgpu impõe limites (ex.: sem subgroup ops em algumas versões). Mitigação: spike técnico no início da Fase 6; fallback para `ash` (Vulkan puro) se wgpu limitar demais.
+- **Vulkan em gfx906 — wgpu pode não alcançar o maior lever de performance:** o ganho de token-gen depende de dequant packed-integer usando as instruções DL do gfx906 (`V_DOT4_I32_I8`, `V_DOT2_F32_F16`) e de controle wave64/subgroup para Flash Attention. **É provável que o wgpu não exponha nem o math packed int8 nem o controle fino de subgroup wave64.** Se for o caso, o ganho de tg fica na mesa. Mitigação: **gate de decisão obrigatório no início da Fase 6** — um spike que valida, antes de qualquer kernel de produção, se o wgpu atinge as instruções DL do gfx906; se não atingir, migrar o backend para `ash` (Vulkan puro) é decisão tomada ali, não no fim da fase. A cobertura de drivers RADV para compute é boa; o risco é a abstração wgpu, não o driver.
