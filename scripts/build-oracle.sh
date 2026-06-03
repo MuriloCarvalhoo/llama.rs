@@ -7,5 +7,5 @@ cmake -S llama.cpp -B build-oracle \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_CURL=OFF
 cmake --build build-oracle -j"$(nproc)" \
-    --target llama-cli llama-tokenize llama-eval-callback
-build-oracle/bin/llama-cli --version
+    --target llama-completion llama-tokenize llama-eval-callback
+build-oracle/bin/llama-completion --version

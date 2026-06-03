@@ -36,10 +36,12 @@ impl Oracle {
     }
 
     /// Gera `n_tokens` com sampling greedy determinístico; retorna o texto.
+    /// Usa `llama-completion` (modo one-and-done com `-no-cnv`); no llama.cpp
+    /// b9496 o `llama-cli` virou tool de chat interativo e não serve para isso.
     pub fn generate_greedy(&self, prompt: &str, n_tokens: u32) -> Result<String, OracleError> {
         let n = n_tokens.to_string();
         let out = self.run(
-            "llama-cli",
+            "llama-completion",
             &[
                 "-m",
                 &self.model_arg(),
