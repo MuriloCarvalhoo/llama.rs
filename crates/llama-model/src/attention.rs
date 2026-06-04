@@ -8,7 +8,6 @@ use crate::ops::softmax;
 pub(crate) struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
-    n_layer: usize,
     kv_dim: usize,
     ctx: usize,
     len: usize,
@@ -21,7 +20,6 @@ impl KvCache {
         Self {
             k: vec![0.0; cap],
             v: vec![0.0; cap],
-            n_layer,
             kv_dim,
             ctx,
             len: 0,
