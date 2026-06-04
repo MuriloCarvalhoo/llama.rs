@@ -6,4 +6,4 @@ mod reader;
 mod types;
 
 pub use error::GgufError;
-pub use types::GgmlType;
+pub use types::{GgmlType, MetadataArray, MetadataValue};

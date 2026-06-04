@@ -107,6 +107,115 @@ impl TryFrom<u32> for GgmlType {
     }
 }
 
+/// Valor de um par de metadados GGUF.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetadataValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    Array(MetadataArray),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
+/// Array homogêneo de metadados (sem aninhamento — llama.cpp não o produz).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetadataArray {
+    U8(Vec<u8>),
+    I8(Vec<i8>),
+    U16(Vec<u16>),
+    I16(Vec<i16>),
+    U32(Vec<u32>),
+    I32(Vec<i32>),
+    F32(Vec<f32>),
+    Bool(Vec<bool>),
+    String(Vec<String>),
+    U64(Vec<u64>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+}
+
+impl MetadataArray {
+    pub fn len(&self) -> usize {
+        match self {
+            MetadataArray::U8(v) => v.len(),
+            MetadataArray::I8(v) => v.len(),
+            MetadataArray::U16(v) => v.len(),
+            MetadataArray::I16(v) => v.len(),
+            MetadataArray::U32(v) => v.len(),
+            MetadataArray::I32(v) => v.len(),
+            MetadataArray::F32(v) => v.len(),
+            MetadataArray::Bool(v) => v.len(),
+            MetadataArray::String(v) => v.len(),
+            MetadataArray::U64(v) => v.len(),
+            MetadataArray::I64(v) => v.len(),
+            MetadataArray::F64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl MetadataValue {
+    pub fn as_u32(&self, key: &str) -> Result<u32, GgufError> {
+        match self {
+            MetadataValue::U32(v) => Ok(*v),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "u32" }),
+        }
+    }
+
+    pub fn as_f32(&self, key: &str) -> Result<f32, GgufError> {
+        match self {
+            MetadataValue::F32(v) => Ok(*v),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "f32" }),
+        }
+    }
+
+    pub fn as_str(&self, key: &str) -> Result<&str, GgufError> {
+        match self {
+            MetadataValue::String(s) => Ok(s.as_str()),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "string" }),
+        }
+    }
+
+    pub fn as_string_array(&self, key: &str) -> Result<&[String], GgufError> {
+        match self {
+            MetadataValue::Array(MetadataArray::String(v)) => Ok(v),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "string[]" }),
+        }
+    }
+
+    pub fn as_f32_array(&self, key: &str) -> Result<&[f32], GgufError> {
+        match self {
+            MetadataValue::Array(MetadataArray::F32(v)) => Ok(v),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "f32[]" }),
+        }
+    }
+
+    pub fn as_i32_array(&self, key: &str) -> Result<&[i32], GgufError> {
+        match self {
+            MetadataValue::Array(MetadataArray::I32(v)) => Ok(v),
+            _ => Err(GgufError::WrongType { key: key.into(), expected: "i32[]" }),
+        }
+    }
+
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            MetadataValue::Array(a) => Some(a.len()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +230,20 @@ mod tests {
     #[test]
     fn unknown_type_id_is_error() {
         assert!(GgmlType::try_from(9999).is_err());
+    }
+
+    #[test]
+    fn metadata_accessors() {
+        let v = MetadataValue::U32(42);
+        assert_eq!(v.as_u32("k").unwrap(), 42);
+        assert!(v.as_str("k").is_err());
+
+        let s = MetadataValue::String("llama".into());
+        assert_eq!(s.as_str("k").unwrap(), "llama");
+
+        let arr = MetadataValue::Array(MetadataArray::F32(vec![0.5, 1.0]));
+        assert_eq!(arr.as_f32_array("k").unwrap(), &[0.5, 1.0]);
+        assert_eq!(arr.array_len(), Some(2));
     }
 
     #[test]
