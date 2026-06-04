@@ -44,7 +44,9 @@ impl Model {
     }
 
     pub(crate) fn new_cache(&self) -> KvCache {
-        KvCache::new(self.config.n_layer)
+        let c = &self.config;
+        let kv_dim = c.n_head_kv * c.head_dim;
+        KvCache::new(c.n_layer, c.ctx, kv_dim)
     }
 
     /// Soma dos bytes raw de todos os pesos (footprint de RAM, sem dequant).
@@ -134,11 +136,12 @@ impl Model {
                 pos0,
             );
 
-            cache.append(l, &k, &v);
+            cache.append(l, &k, &v)?;
+            let total_len = pos0 + n_tok;
             let attn = attention(
                 &q,
-                &cache.k[l],
-                &cache.v[l],
+                cache.k_slice(l, total_len),
+                cache.v_slice(l, total_len),
                 n_tok,
                 pos0,
                 c.n_head,
@@ -179,6 +182,24 @@ impl Model {
     ) -> Result<u32, ModelError> {
         let logits = self.forward(tokens, cache)?;
         u32::try_from(argmax(&logits)).map_err(|_| ModelError::Overflow)
+    }
+
+    /// Processa um batch de sequências independentes, cada uma com seu próprio cache.
+    /// Retorna um vetor de logits (tamanho `vocab`) por sequência.
+    /// `batch` e `caches` devem ter o mesmo comprimento.
+    pub(crate) fn forward_batch(
+        &self,
+        batch: &[&[u32]],
+        caches: &mut [KvCache],
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        if batch.len() != caches.len() {
+            return Err(ModelError::BatchMismatch(batch.len(), caches.len()));
+        }
+        batch
+            .iter()
+            .zip(caches.iter_mut())
+            .map(|(tokens, cache)| self.forward(tokens, cache))
+            .collect()
     }
 }
 
@@ -263,5 +284,53 @@ mod tests {
             "memory_bytes={} > file_size={file_size}",
             m.memory_bytes()
         );
+    }
+
+    #[test]
+    fn forward_batch_matches_separate_forwards() {
+        let Some(m) = load_model() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let tokens_a = [1u32, 403];
+        let tokens_b = [1u32, 261];
+
+        // Forward individual
+        let mut ca = m.new_cache();
+        let mut cb = m.new_cache();
+        let logits_a = m.forward(&tokens_a, &mut ca).unwrap();
+        let logits_b = m.forward(&tokens_b, &mut cb).unwrap();
+
+        // Forward batch
+        let mut ca2 = m.new_cache();
+        let mut cb2 = m.new_cache();
+        let batch: &[&[u32]] = &[&tokens_a, &tokens_b];
+        let results = m.forward_batch(batch, &mut [ca2, cb2]).unwrap();
+
+        for (r, expected) in results[0].iter().zip(logits_a.iter()) {
+            assert!(
+                (r - expected).abs() < 1e-6,
+                "batch[0] diverge: {r} vs {expected}"
+            );
+        }
+        for (r, expected) in results[1].iter().zip(logits_b.iter()) {
+            assert!(
+                (r - expected).abs() < 1e-6,
+                "batch[1] diverge: {r} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_batch_mismatch_returns_error() {
+        let Some(m) = load_model() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let tokens = [1u32];
+        let batch: &[&[u32]] = &[&tokens];
+        let mut caches = [m.new_cache(), m.new_cache()];
+        let err = m.forward_batch(batch, &mut caches);
+        assert!(err.is_err());
     }
 }

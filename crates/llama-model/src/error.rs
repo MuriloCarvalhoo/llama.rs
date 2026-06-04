@@ -19,4 +19,8 @@ pub enum ModelError {
     Config(String),
     #[error("overflow de conversão numérica")]
     Overflow,
+    #[error("contexto esgotado: posição {0} excede ctx={1}")]
+    ContextOverflow(usize, usize),
+    #[error("batch e caches com tamanhos diferentes: {0} vs {1}")]
+    BatchMismatch(usize, usize),
 }

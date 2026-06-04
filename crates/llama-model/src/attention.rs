@@ -1,20 +1,29 @@
-//! KV cache f32 e atenção causal GQA. Layout K/V: [pos * (n_head_kv*head_dim)].
+//! KV cache f32 e atenção causal GQA. Layout K/V: [n_layer * ctx * kv_dim], token-major por camada.
 #![allow(clippy::indexing_slicing)]
 
+use crate::error::ModelError;
 use crate::ops::softmax;
 
-/// KV cache f32, uma entrada por camada. `len` = posições já armazenadas.
+/// KV cache f32 pré-alocado. Buffer flat `[n_layer * ctx * kv_dim]`.
 pub(crate) struct KvCache {
-    pub k: Vec<Vec<f32>>,
-    pub v: Vec<Vec<f32>>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    n_layer: usize,
+    kv_dim: usize,
+    ctx: usize,
     len: usize,
 }
 
 impl KvCache {
-    pub fn new(n_layer: usize) -> Self {
+    /// Aloca o cache completo de uma vez. Sem realloc durante geração.
+    pub fn new(n_layer: usize, ctx: usize, kv_dim: usize) -> Self {
+        let cap = n_layer * ctx * kv_dim;
         Self {
-            k: vec![Vec::new(); n_layer],
-            v: vec![Vec::new(); n_layer],
+            k: vec![0.0; cap],
+            v: vec![0.0; cap],
+            n_layer,
+            kv_dim,
+            ctx,
             len: 0,
         }
     }
@@ -23,10 +32,33 @@ impl KvCache {
         self.len
     }
 
-    /// Anexa K/V (token-major [n_tok*kv_dim]) à camada `l`.
-    pub fn append(&mut self, l: usize, k: &[f32], v: &[f32]) {
-        self.k[l].extend_from_slice(k);
-        self.v[l].extend_from_slice(v);
+    /// Escreve K/V token-major `[n_tok * kv_dim]` na camada `l` a partir da posição `len`.
+    /// Retorna `Err(ContextOverflow)` se `len + n_tok > ctx`.
+    pub fn append(&mut self, l: usize, k: &[f32], v: &[f32]) -> Result<(), ModelError> {
+        let n_tok = k.len() / self.kv_dim;
+        if self.len + n_tok > self.ctx {
+            return Err(ModelError::ContextOverflow(self.len + n_tok, self.ctx));
+        }
+        let layer_stride = self.ctx * self.kv_dim;
+        let start = l * layer_stride + self.len * self.kv_dim;
+        let end = start + n_tok * self.kv_dim;
+        self.k[start..end].copy_from_slice(k);
+        self.v[start..end].copy_from_slice(v);
+        Ok(())
+    }
+
+    /// Retorna o slice K da camada `l` para `total_len` posições (inclui tokens recém-escritos).
+    pub fn k_slice(&self, l: usize, total_len: usize) -> &[f32] {
+        let layer_stride = self.ctx * self.kv_dim;
+        let start = l * layer_stride;
+        &self.k[start..start + total_len * self.kv_dim]
+    }
+
+    /// Retorna o slice V da camada `l` para `total_len` posições (inclui tokens recém-escritos).
+    pub fn v_slice(&self, l: usize, total_len: usize) -> &[f32] {
+        let layer_stride = self.ctx * self.kv_dim;
+        let start = l * layer_stride;
+        &self.v[start..start + total_len * self.kv_dim]
     }
 
     /// Avança o relógio do cache após processar todas as camadas.
@@ -89,12 +121,11 @@ pub(crate) fn attention(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
     fn single_token_attends_only_itself() {
-        // n_head=1, n_head_kv=1, head_dim=2, 1 token, pos0=0.
-        // Só uma posição → softmax trivial → out == V.
         let q = vec![1.0, 0.0];
         let k = vec![0.5, 0.5];
         let v = vec![9.0, 7.0];
@@ -105,9 +136,7 @@ mod tests {
 
     #[test]
     fn gqa_maps_query_heads_to_kv_heads() {
-        // n_head=2, n_head_kv=1 → ambos query heads usam kv head 0. head_dim=1.
-        // 1 token, 1 posição → out de cada head == V[0].
-        let q = vec![1.0, 2.0]; // head0=1, head1=2
+        let q = vec![1.0, 2.0];
         let k = vec![3.0];
         let v = vec![5.0];
         let out = attention(&q, &k, &v, 1, 0, 2, 1, 1);
@@ -117,21 +146,63 @@ mod tests {
 
     #[test]
     fn causal_two_positions_first_token_ignores_future() {
-        // n_head=1,n_head_kv=1,head_dim=1, 2 tokens prefill, pos0=0.
-        // K=[k0,k1], V=[v0,v1]. token0 (pos0) só vê pos0 → out0=v0.
         let q = vec![1.0, 1.0];
-        let k = vec![0.0, 100.0]; // k1 grande não afeta token0
+        let k = vec![0.0, 100.0];
         let v = vec![2.0, 8.0];
         let out = attention(&q, &k, &v, 2, 0, 1, 1, 1);
-        assert!((out[0] - 2.0).abs() < 1e-6); // token0 → v0
+        assert!((out[0] - 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn kvcache_append_and_advance() {
-        let mut c = KvCache::new(2);
-        c.append(0, &[1.0, 2.0], &[3.0, 4.0]);
+    fn kvcache_append_stores_and_advance_updates_len() {
+        let mut c = KvCache::new(2, 4, 2);
+        c.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap();
         c.advance(1);
         assert_eq!(c.len(), 1);
-        assert_eq!(c.k[0], vec![1.0, 2.0]);
+        assert_eq!(c.k_slice(0, 1), &[1.0, 2.0]);
+        assert_eq!(c.v_slice(0, 1), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn kvcache_second_append_does_not_reallocate() {
+        let mut c = KvCache::new(1, 8, 2);
+        let ptr_before = c.k.as_ptr();
+        c.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        c.advance(1);
+        c.append(0, &[5.0, 6.0], &[7.0, 8.0]).unwrap();
+        c.advance(1);
+        assert_eq!(c.k.as_ptr(), ptr_before);
+        assert_eq!(c.k_slice(0, 2), &[1.0, 2.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn kvcache_overflow_returns_error() {
+        let mut c = KvCache::new(1, 1, 2);
+        c.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        c.advance(1);
+        let err = c.append(0, &[5.0, 6.0], &[7.0, 8.0]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn kvcache_layers_are_independent() {
+        let mut c = KvCache::new(2, 4, 2);
+        c.append(0, &[10.0, 11.0], &[20.0, 21.0]).unwrap();
+        c.append(1, &[30.0, 31.0], &[40.0, 41.0]).unwrap();
+        c.advance(1);
+        assert_eq!(c.k_slice(0, 1), &[10.0, 11.0]);
+        assert_eq!(c.k_slice(1, 1), &[30.0, 31.0]);
+    }
+
+    #[test]
+    fn kvcache_slice_includes_pending_tokens_before_advance() {
+        // k_slice com total_len=pos0+n_tok deve incluir tokens recém-escritos
+        let mut c = KvCache::new(1, 4, 2);
+        c.append(0, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0])
+            .unwrap();
+        // antes de advance, k_slice(0, 2) deve retornar os 2 tokens escritos
+        assert_eq!(c.k_slice(0, 2), &[1.0, 2.0, 3.0, 4.0]);
+        c.advance(2);
+        assert_eq!(c.len(), 2);
     }
 }

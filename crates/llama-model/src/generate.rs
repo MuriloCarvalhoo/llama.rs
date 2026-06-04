@@ -73,6 +73,58 @@ impl Model {
         Ok(tokenizer.decode(&generated))
     }
 
+    /// Gera `n_tokens` para cada prompt em `prompts`, em batch.
+    /// Cada sequência tem seu próprio cache; para quando atinge EOS ou `n_tokens`.
+    /// Retorna um vetor de strings geradas (uma por prompt, sem o texto do prompt).
+    pub fn generate_batch(
+        &self,
+        tokenizer: &Tokenizer,
+        prompts: &[&str],
+        n_tokens: usize,
+        sampler: &Sampler,
+        rng: &mut impl Rng,
+    ) -> Result<Vec<String>, ModelError> {
+        let n = prompts.len();
+        let mut caches: Vec<_> = (0..n).map(|_| self.new_cache()).collect();
+
+        let encoded: Vec<Vec<u32>> = prompts.iter().map(|p| tokenizer.encode(p, true)).collect();
+
+        let batch_refs: Vec<&[u32]> = encoded.iter().map(|v| v.as_slice()).collect();
+        let all_logits = self.forward_batch(&batch_refs, &mut caches)?;
+
+        let mut current: Vec<u32> = all_logits
+            .iter()
+            .map(|logits| {
+                let idx = sampler.sample(logits, rng);
+                u32::try_from(idx).map_err(|_| ModelError::Overflow)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut generated: Vec<Vec<u32>> = vec![Vec::with_capacity(n_tokens); n];
+        let mut done = vec![false; n];
+
+        for _ in 0..n_tokens {
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            for i in 0..n {
+                if done[i] || current[i] == self.config.eos_id {
+                    done[i] = true;
+                    continue;
+                }
+                generated[i].push(current[i]);
+                let logits = self.forward(&[current[i]], &mut caches[i])?;
+                let idx = sampler.sample(&logits, rng);
+                current[i] = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+            }
+        }
+
+        Ok(generated
+            .into_iter()
+            .map(|toks| tokenizer.decode(&toks))
+            .collect())
+    }
+
     /// Gera até `n_tokens` por argmax a partir de `prompt` (com BOS). Para em EOS.
     /// Retorna o texto decodificado dos tokens GERADOS (sem o prompt), espelhando
     /// `--no-display-prompt` do oráculo.
@@ -173,5 +225,47 @@ mod generate_tests {
             out_gen, out_greedy,
             "Sampler::Greedy deve produzir mesma saída que generate_greedy"
         );
+    }
+
+    #[test]
+    fn generate_batch_matches_individual_generate() {
+        let Some((model, tok)) = load() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let prompts = ["Once upon a time", "There was a little"];
+        let n_tokens = 6;
+
+        // Geração individual
+        let mut rng_a = SmallRng::seed_from_u64(42);
+        let out_a = model
+            .generate(&tok, prompts[0], n_tokens, &Sampler::Greedy, &mut rng_a)
+            .unwrap();
+        let mut rng_b = SmallRng::seed_from_u64(42);
+        let out_b = model
+            .generate(&tok, prompts[1], n_tokens, &Sampler::Greedy, &mut rng_b)
+            .unwrap();
+
+        // Geração em batch com Greedy (rng não afeta o resultado)
+        let mut rng_batch = SmallRng::seed_from_u64(42);
+        let results = model
+            .generate_batch(&tok, &prompts, n_tokens, &Sampler::Greedy, &mut rng_batch)
+            .unwrap();
+
+        assert_eq!(results[0], out_a, "batch[0] deve bater com individual");
+        assert_eq!(results[1], out_b, "batch[1] deve bater com individual");
+    }
+
+    #[test]
+    fn generate_batch_empty_prompts_returns_empty() {
+        let Some((model, tok)) = load() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let mut rng = SmallRng::seed_from_u64(0);
+        let results = model
+            .generate_batch(&tok, &[], 8, &Sampler::Greedy, &mut rng)
+            .unwrap();
+        assert!(results.is_empty());
     }
 }
