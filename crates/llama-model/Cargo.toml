@@ -8,6 +8,8 @@ thiserror.workspace = true
 gguf.workspace = true
 ggml-cpu.workspace = true
 llama-tokenizer.workspace = true
+llama-sampling.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true
