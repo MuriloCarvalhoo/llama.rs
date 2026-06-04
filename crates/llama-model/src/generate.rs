@@ -8,6 +8,40 @@ use crate::error::ModelError;
 use crate::model::Model;
 
 impl Model {
+    /// Gera até `n_tokens` chamando `on_token` a cada token decodificado individualmente.
+    /// Para em EOS ou quando `n_tokens` for atingido.
+    pub fn generate_streaming(
+        &self,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        n_tokens: usize,
+        sampler: &Sampler,
+        rng: &mut impl Rng,
+        on_token: &mut impl FnMut(&str),
+    ) -> Result<(), ModelError> {
+        let prompt_ids = tokenizer.encode(prompt, true);
+        let mut cache = self.new_cache();
+
+        let logits = self.forward(&prompt_ids, &mut cache)?;
+        let first_idx = sampler.sample(&logits, rng);
+        let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
+
+        let mut count = 0usize;
+        while count < n_tokens {
+            if next == self.config.eos_id {
+                break;
+            }
+            let piece = tokenizer.decode(&[next]);
+            on_token(&piece);
+            count += 1;
+            let logits = self.forward(&[next], &mut cache)?;
+            let idx = sampler.sample(&logits, rng);
+            next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+        }
+
+        Ok(())
+    }
+
     /// Gera até `n_tokens` usando a estratégia `sampler`.
     /// Retorna o texto gerado (sem o prompt), parando em EOS.
     pub fn generate(
@@ -81,6 +115,47 @@ mod generate_tests {
         let model = Model::load(&f, &bytes).ok()?;
         let tok = llama_tokenizer::Tokenizer::from_gguf(&f).ok()?;
         Some((model, tok))
+    }
+
+    #[test]
+    fn generate_streaming_calls_callback_for_each_token() {
+        let Some((model, tok)) = load() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut pieces: Vec<String> = Vec::new();
+        model
+            .generate_streaming(
+                &tok,
+                "Once upon a time",
+                8,
+                &Sampler::Greedy,
+                &mut rng,
+                &mut |piece| pieces.push(piece.to_owned()),
+            )
+            .unwrap();
+        assert!(
+            !pieces.is_empty(),
+            "callback deve ser chamado pelo menos uma vez"
+        );
+        assert!(pieces.len() <= 8, "no maximo 8 callbacks: {pieces:?}");
+    }
+
+    #[test]
+    fn generate_streaming_zero_tokens_calls_no_callback() {
+        let Some((model, tok)) = load() else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mut count = 0usize;
+        model
+            .generate_streaming(&tok, "Hello", 0, &Sampler::Greedy, &mut rng, &mut |_| {
+                count += 1
+            })
+            .unwrap();
+        assert_eq!(count, 0, "n_tokens=0 nao deve chamar o callback");
     }
 
     #[test]
