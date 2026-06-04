@@ -23,7 +23,9 @@ impl Tokenizer {
     }
 
     pub fn from_gguf(f: &GgufFile) -> Result<Self, TokenizerError> {
-        Ok(Self { vocab: Vocab::from_gguf(f)? })
+        Ok(Self {
+            vocab: Vocab::from_gguf(f)?,
+        })
     }
 
     /// Codifica `text` em ids. Com `add_bos`, prefixa o token BOS e um espaço

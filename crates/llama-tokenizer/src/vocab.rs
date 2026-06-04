@@ -35,7 +35,9 @@ impl Vocab {
         for (i, t) in tokens.iter().enumerate() {
             // Em colisão, o primeiro id vence (como o token_to_id do llama.cpp,
             // populado em ordem crescente sem sobrescrever).
-            token_to_id.entry(t.clone()).or_insert(i as u32);
+            if let Ok(id) = u32::try_from(i) {
+                token_to_id.entry(t.clone()).or_insert(id);
+            }
         }
         Vocab {
             tokens,
@@ -50,7 +52,9 @@ impl Vocab {
 
     /// Lê o vocab SPM dos metadados de um GGUF já parseado.
     pub fn from_gguf(f: &GgufFile) -> Result<Vocab, TokenizerError> {
-        let model = f.get("tokenizer.ggml.model")?.as_str("tokenizer.ggml.model")?;
+        let model = f
+            .get("tokenizer.ggml.model")?
+            .as_str("tokenizer.ggml.model")?;
         if model != "llama" {
             return Err(TokenizerError::UnsupportedModel(model.to_owned()));
         }
@@ -58,10 +62,14 @@ impl Vocab {
             .get("tokenizer.ggml.tokens")?
             .as_string_array("tokenizer.ggml.tokens")?
             .to_vec();
-        let scores: Vec<f32> =
-            f.get("tokenizer.ggml.scores")?.as_f32_array("tokenizer.ggml.scores")?.to_vec();
-        let token_types: Vec<i32> =
-            f.get("tokenizer.ggml.token_type")?.as_i32_array("tokenizer.ggml.token_type")?.to_vec();
+        let scores: Vec<f32> = f
+            .get("tokenizer.ggml.scores")?
+            .as_f32_array("tokenizer.ggml.scores")?
+            .to_vec();
+        let token_types: Vec<i32> = f
+            .get("tokenizer.ggml.token_type")?
+            .as_i32_array("tokenizer.ggml.token_type")?
+            .to_vec();
 
         if tokens.len() != scores.len() || tokens.len() != token_types.len() {
             return Err(TokenizerError::InconsistentVocab {
@@ -75,7 +83,14 @@ impl Vocab {
         let eos_id = f.get("tokenizer.ggml.eos_token_id")?.as_u32("eos")?;
         let unk_id = f.get("tokenizer.ggml.unknown_token_id")?.as_u32("unk")?;
 
-        Ok(Vocab::new(tokens, scores, token_types, bos_id, eos_id, unk_id))
+        Ok(Vocab::new(
+            tokens,
+            scores,
+            token_types,
+            bos_id,
+            eos_id,
+            unk_id,
+        ))
     }
 
     pub(crate) fn text_to_token(&self, text: &str) -> Option<u32> {
@@ -83,27 +98,27 @@ impl Vocab {
     }
 
     pub(crate) fn score(&self, id: u32) -> f32 {
-        self.scores.get(id as usize).copied().unwrap_or(f32::NEG_INFINITY)
+        self.scores
+            .get(id as usize)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY)
     }
 
     /// Byte → token. Tenta `<0xXX>` (hex maiúsculo), depois o byte como string
     /// de 1 caractere (espelha `llama_vocab::byte_to_token` para SPM).
     pub(crate) fn byte_to_token(&self, ch: u8) -> Option<u32> {
-        let buf = [
-            b'<',
-            b'0',
-            b'x',
-            HEX[(ch >> 4) as usize],
-            HEX[(ch & 0x0F) as usize],
-            b'>',
-        ];
+        let hi = HEX.get((ch >> 4) as usize).copied().unwrap_or(b'0');
+        let lo = HEX.get((ch & 0x0F) as usize).copied().unwrap_or(b'0');
+        let buf = [b'<', b'0', b'x', hi, lo, b'>'];
         // `buf` é sempre ASCII válido.
         let key = core::str::from_utf8(&buf).unwrap_or("<0x00>");
         if let Some(id) = self.token_to_id.get(key).copied() {
             return Some(id);
         }
         let single = [ch];
-        core::str::from_utf8(&single).ok().and_then(|s| self.token_to_id.get(s).copied())
+        core::str::from_utf8(&single)
+            .ok()
+            .and_then(|s| self.token_to_id.get(s).copied())
     }
 
     pub(crate) fn token_text(&self, id: u32) -> Option<&str> {

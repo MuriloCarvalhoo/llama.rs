@@ -7,17 +7,18 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::vocab::Vocab;
 
 /// Símbolo na cadeia: fatia `[start, start+len)` dos bytes normalizados.
+/// `prev`/`next` são índices na cadeia; `None` é o sentinela de fim (-1 no C++).
 struct Symbol {
     start: usize,
     len: usize,
-    prev: i32,
-    next: i32,
+    prev: Option<usize>,
+    next: Option<usize>,
 }
 
 /// Bigrama candidato a merge.
 struct Bigram {
-    left: i32,
-    right: i32,
+    left: usize,
+    right: usize,
     score: f32,
     size: usize,
 }
@@ -37,7 +38,9 @@ impl Ord for Bigram {
     /// "Maior" = maior score; empate → menor `left` (espelha o comparator do C++:
     /// `l < r` se `l.score < r.score || (== && l.left > r.left)`).
     fn cmp(&self, o: &Self) -> Ordering {
-        self.score.total_cmp(&o.score).then_with(|| o.left.cmp(&self.left))
+        self.score
+            .total_cmp(&o.score)
+            .then_with(|| o.left.cmp(&self.left))
     }
 }
 
@@ -59,83 +62,117 @@ pub(crate) fn tokenize_spm(vocab: &Vocab, text: &str) -> Vec<u32> {
 
     // 1. Divide em símbolos UTF-8.
     let mut offs = 0usize;
-    let mut index = 0i32;
-    while offs < bytes.len() {
-        let len = utf8_len(bytes[offs]).min(bytes.len() - offs);
-        let next = if offs + len == bytes.len() { -1 } else { index + 1 };
-        symbols.push(Symbol { start: offs, len, prev: index - 1, next });
+    let mut index = 0usize;
+    while let Some(&first) = bytes.get(offs) {
+        let len = utf8_len(first).min(bytes.len() - offs);
+        let next = if offs + len == bytes.len() {
+            None
+        } else {
+            Some(index + 1)
+        };
+        let prev = index.checked_sub(1);
+        symbols.push(Symbol {
+            start: offs,
+            len,
+            prev,
+            next,
+        });
         offs += len;
         index += 1;
     }
 
     let mut work: BinaryHeap<Bigram> = BinaryHeap::new();
-    let mut rev_merge: HashMap<(usize, usize), (i32, i32)> = HashMap::new();
+    let mut rev_merge: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
 
-    let try_add_bigram =
-        |work: &mut BinaryHeap<Bigram>,
-         rev_merge: &mut HashMap<(usize, usize), (i32, i32)>,
-         symbols: &[Symbol],
-         left: i32,
-         right: i32| {
-            if left == -1 || right == -1 {
-                return;
-            }
-            let l = &symbols[left as usize];
-            let r = &symbols[right as usize];
-            let start = l.start;
-            let size = l.len + r.len;
-            let Ok(text) = core::str::from_utf8(&bytes[start..start + size]) else {
-                return;
-            };
-            let Some(id) = vocab.text_to_token(text) else {
-                return;
-            };
-            work.push(Bigram { left, right, score: vocab.score(id), size });
-            rev_merge.insert((start, size), (left, right));
+    let try_add_bigram = |work: &mut BinaryHeap<Bigram>,
+                          rev_merge: &mut HashMap<(usize, usize), (usize, usize)>,
+                          symbols: &[Symbol],
+                          left: Option<usize>,
+                          right: Option<usize>| {
+        let (Some(left), Some(right)) = (left, right) else {
+            return;
         };
+        let (Some(l), Some(r)) = (symbols.get(left), symbols.get(right)) else {
+            return;
+        };
+        let start = l.start;
+        let size = l.len + r.len;
+        let Some(span) = bytes.get(start..start + size) else {
+            return;
+        };
+        let Ok(text) = core::str::from_utf8(span) else {
+            return;
+        };
+        let Some(id) = vocab.text_to_token(text) else {
+            return;
+        };
+        work.push(Bigram {
+            left,
+            right,
+            score: vocab.score(id),
+            size,
+        });
+        rev_merge.insert((start, size), (left, right));
+    };
 
     // 2. Semeia bigramas adjacentes.
-    for i in 1..symbols.len() as i32 {
-        try_add_bigram(&mut work, &mut rev_merge, &symbols, i - 1, i);
+    for i in 1..symbols.len() {
+        try_add_bigram(&mut work, &mut rev_merge, &symbols, Some(i - 1), Some(i));
     }
 
     // 3. Funde o par de maior score enquanto houver.
     while let Some(bigram) = work.pop() {
-        let (ln, rn) = {
-            let l = &symbols[bigram.left as usize];
-            let r = &symbols[bigram.right as usize];
-            (l.len, r.len)
+        let (Some(l), Some(r)) = (symbols.get(bigram.left), symbols.get(bigram.right)) else {
+            continue;
         };
+        let (ln, rn) = (l.len, r.len);
         if ln == 0 || rn == 0 || ln + rn != bigram.size {
             continue; // um dos símbolos já foi fundido
         }
         // funde right em left
-        let right_next = symbols[bigram.right as usize].next;
-        {
-            let l = &mut symbols[bigram.left as usize];
+        let right_next = r.next;
+        if let Some(l) = symbols.get_mut(bigram.left) {
             l.len += rn;
             l.next = right_next;
         }
-        symbols[bigram.right as usize].len = 0;
-        if right_next >= 0 {
-            symbols[right_next as usize].prev = bigram.left;
+        if let Some(r) = symbols.get_mut(bigram.right) {
+            r.len = 0;
         }
-        let left_prev = symbols[bigram.left as usize].prev;
-        let left_next = symbols[bigram.left as usize].next;
-        try_add_bigram(&mut work, &mut rev_merge, &symbols, left_prev, bigram.left);
-        try_add_bigram(&mut work, &mut rev_merge, &symbols, bigram.left, left_next);
+        if let Some(rn_idx) = right_next
+            && let Some(s) = symbols.get_mut(rn_idx)
+        {
+            s.prev = Some(bigram.left);
+        }
+        let (left_prev, left_next) = match symbols.get(bigram.left) {
+            Some(s) => (s.prev, s.next),
+            None => continue,
+        };
+        try_add_bigram(
+            &mut work,
+            &mut rev_merge,
+            &symbols,
+            left_prev,
+            Some(bigram.left),
+        );
+        try_add_bigram(
+            &mut work,
+            &mut rev_merge,
+            &symbols,
+            Some(bigram.left),
+            left_next,
+        );
     }
 
     // 4. Resegmenta a cadeia final.
     let mut output = Vec::new();
-    let mut i = 0i32;
-    while i != -1 && (i as usize) < symbols.len() {
-        let (start, len) = {
-            let s = &symbols[i as usize];
-            (s.start, s.len)
+    let mut cursor = Some(0usize);
+    while let Some(i) = cursor {
+        let Some(s) = symbols.get(i) else {
+            break;
         };
+        let (start, len, next) = (s.start, s.len, s.next);
         resegment(vocab, bytes, &symbols, &rev_merge, start, len, &mut output);
-        i = symbols[i as usize].next;
+        cursor = next;
     }
     output
 }
@@ -145,28 +182,33 @@ fn resegment(
     vocab: &Vocab,
     bytes: &[u8],
     symbols: &[Symbol],
-    rev_merge: &HashMap<(usize, usize), (i32, i32)>,
+    rev_merge: &HashMap<(usize, usize), (usize, usize)>,
     start: usize,
     len: usize,
     output: &mut Vec<u32>,
 ) {
-    if let Ok(text) = core::str::from_utf8(&bytes[start..start + len]) {
-        if let Some(id) = vocab.text_to_token(text) {
-            output.push(id);
-            return;
-        }
+    if let Some(span) = bytes.get(start..start + len)
+        && let Ok(text) = core::str::from_utf8(span)
+        && let Some(id) = vocab.text_to_token(text)
+    {
+        output.push(id);
+        return;
     }
     match rev_merge.get(&(start, len)) {
         Some(&(left, right)) => {
-            let l = &symbols[left as usize];
-            let r = &symbols[right as usize];
-            resegment(vocab, bytes, symbols, rev_merge, l.start, l.len, output);
-            resegment(vocab, bytes, symbols, rev_merge, r.start, r.len, output);
+            let (Some(l), Some(r)) = (symbols.get(left), symbols.get(right)) else {
+                return;
+            };
+            let (ls, ll, rs, rl) = (l.start, l.len, r.start, r.len);
+            resegment(vocab, bytes, symbols, rev_merge, ls, ll, output);
+            resegment(vocab, bytes, symbols, rev_merge, rs, rl, output);
         }
         None => {
             // byte-fallback: cada byte vira <0xXX> (ou byte cru).
             for j in 0..len {
-                if let Some(id) = vocab.byte_to_token(bytes[start + j]) {
+                if let Some(&b) = bytes.get(start + j)
+                    && let Some(id) = vocab.byte_to_token(b)
+                {
                     output.push(id);
                 }
             }

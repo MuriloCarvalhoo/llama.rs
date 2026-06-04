@@ -1,4 +1,5 @@
 //! Critério de aceite da fase: encode bit-exact vs o corpus do oráculo.
+#![allow(clippy::indexing_slicing, clippy::cast_possible_truncation)]
 use serde_json::Value;
 
 #[test]
@@ -19,12 +20,22 @@ fn encode_matches_oracle_corpus() {
     let mut failures = Vec::new();
     for case in corpus["cases"].as_array().unwrap() {
         let text = case["text"].as_str().unwrap();
-        let expected: Vec<u32> =
-            case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
         let got = tok.encode(text, true);
         if got != expected {
-            failures.push(format!("text={text:?}\n  esperado={expected:?}\n  obtido  ={got:?}"));
+            failures.push(format!(
+                "text={text:?}\n  esperado={expected:?}\n  obtido  ={got:?}"
+            ));
         }
     }
-    assert!(failures.is_empty(), "divergências:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "divergências:\n{}",
+        failures.join("\n")
+    );
 }

@@ -6,7 +6,9 @@ pub enum TokenizerError {
     Gguf(#[from] gguf::GgufError),
     #[error("modelo de tokenizer não suportado: {0:?} (suportado: \"llama\"/SPM)")]
     UnsupportedModel(String),
-    #[error("arrays do vocab com tamanhos inconsistentes: tokens={tokens}, scores={scores}, types={types}")]
+    #[error(
+        "arrays do vocab com tamanhos inconsistentes: tokens={tokens}, scores={scores}, types={types}"
+    )]
     InconsistentVocab {
         tokens: usize,
         scores: usize,
