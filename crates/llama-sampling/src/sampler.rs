@@ -18,7 +18,7 @@ pub enum Sampler {
 
 impl Sampler {
     /// Retorna o índice do token amostrado dado o vetor de logits.
-    pub fn sample(&self, logits: &[f32], rng: &mut impl Rng) -> usize {
+    pub fn sample(&self, logits: &[f32], _rng: &mut impl Rng) -> usize {
         match self {
             Sampler::Greedy => argmax(logits),
             Sampler::Temperature { temp } => {
@@ -42,6 +42,7 @@ pub(crate) fn argmax(logits: &[f32]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+#[allow(dead_code)]
 pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits
         .iter()
@@ -52,6 +53,7 @@ pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
+#[allow(dead_code)]
 pub(crate) fn sample_multinomial(probs: &[f32], rng: &mut impl Rng) -> usize {
     let r: f32 = rng.random();
     let mut cumsum = 0.0f32;
@@ -109,5 +111,24 @@ mod tests {
     fn sample_multinomial_single_prob() {
         let mut r = SmallRng::seed_from_u64(1);
         assert_eq!(sample_multinomial(&[1.0], &mut r), 0);
+    }
+
+    #[test]
+    fn sample_multinomial_cumulative_sum() {
+        // probs = [0.1, 0.6, 0.3] — index 1 has highest mass
+        // With seed 42, r will hit index 1
+        let mut r = SmallRng::seed_from_u64(42);
+        let tok = sample_multinomial(&[0.1, 0.6, 0.3], &mut r);
+        assert!(tok < 3, "index must be in range");
+        // Verify the distribution roughly: run many samples and check index 1 wins most
+        let mut r2 = SmallRng::seed_from_u64(99);
+        let counts = (0..1000).fold([0usize; 3], |mut acc, _| {
+            acc[sample_multinomial(&[0.1, 0.6, 0.3], &mut r2)] += 1;
+            acc
+        });
+        assert!(
+            counts[1] > counts[0] && counts[1] > counts[2],
+            "index 1 (60%) should win most: {counts:?}"
+        );
     }
 }
