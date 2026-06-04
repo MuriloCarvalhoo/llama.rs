@@ -143,10 +143,59 @@ fn dequant_q4_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     Ok(out)
 }
-fn dequant_q6_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    Err(DequantError::UnsupportedType(
-        "Q6_K (stub — implementado na Task 4)".to_owned(),
-    ))
+fn dequant_q6_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 210; // 128+64+16+2
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q6_K",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 256];
+
+    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+        let ql_full = &b[0..128];
+        let qh_full = &b[128..192];
+        let sc_full = &b[192..208]; // [i8; 16] stored as u8
+        let d_val = half::f16::from_bits(u16::from_le_bytes([b[208], b[209]])).to_f32();
+        let base = bi * 256;
+
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
+
+        for n in [0usize, 128] {
+            let ql = &ql_full[ql_off..ql_off + 64];
+            let qh = &qh_full[qh_off..qh_off + 32];
+            let sc = &sc_full[sc_off..sc_off + 8];
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = i32::from(((ql[l] & 0xF) | ((qh[l] & 3) << 4)).cast_signed()) - 32;
+                let q2 =
+                    i32::from(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)).cast_signed()) - 32;
+                let q3 = i32::from(((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)).cast_signed()) - 32;
+                let q4 =
+                    i32::from(((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)).cast_signed()) - 32;
+                let s0 = f32::from(sc[is].cast_signed());
+                let s2 = f32::from(sc[is + 2].cast_signed());
+                let s4 = f32::from(sc[is + 4].cast_signed());
+                let s6 = f32::from(sc[is + 6].cast_signed());
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    out[base + n + l] = d_val * s0 * q1 as f32;
+                    out[base + n + l + 32] = d_val * s2 * q2 as f32;
+                    out[base + n + l + 64] = d_val * s4 * q3 as f32;
+                    out[base + n + l + 96] = d_val * s6 * q4 as f32;
+                }
+            }
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -288,5 +337,75 @@ mod tests {
     #[test]
     fn q4_k_bad_size_returns_error() {
         assert!(dequant_to_f32(&[0u8; 143], GgmlType::Q4_K).is_err());
+    }
+
+    fn make_q6_k_block(d: f32, scales: &[i8; 16], ql: &[u8; 128], qh: &[u8; 64]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(210);
+        b.extend_from_slice(ql);
+        b.extend_from_slice(qh);
+        b.extend(scales.iter().map(|&s| s.cast_unsigned()));
+        b.extend_from_slice(&f16_bytes(d));
+        b
+    }
+
+    #[test]
+    fn q6_k_all_zero_ql_qh() {
+        // ql=zeros, qh=zeros → all 6-bit quants = 0-32 = -32
+        // d=1.0, scales=[1,0,1,0,1,0,1,0, 1,0,1,0,1,0,1,0]
+        // For l=0..15 (is=0): out=sc[0]*(-32)=-32; sc[2]*(-32)=-32; sc[4]*(-32)=-32; sc[6]*(-32)=-32
+        // For l=16..31(is=1): out=sc[1]*(-32)=0; sc[3]*(-32)=0; sc[5]*(-32)=0; sc[7]*(-32)=0
+        let scales: [i8; 16] = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
+        let ql = [0u8; 128];
+        let qh = [0u8; 64];
+        let block = make_q6_k_block(1.0, &scales, &ql, &qh);
+        let out = dequant_to_f32(&block, GgmlType::Q6_K).unwrap();
+        assert_eq!(out.len(), 256);
+        for chunk_base in [0usize, 128] {
+            for l in 0..16usize {
+                assert!(
+                    (out[chunk_base + l] - (-32.0)).abs() < 1e-4,
+                    "chunk={chunk_base} l={l} off=0"
+                );
+                assert!(
+                    (out[chunk_base + l + 32] - (-32.0)).abs() < 1e-4,
+                    "chunk={chunk_base} l={l} off=32"
+                );
+                assert!(
+                    (out[chunk_base + l + 64] - (-32.0)).abs() < 1e-4,
+                    "chunk={chunk_base} l={l} off=64"
+                );
+                assert!(
+                    (out[chunk_base + l + 96] - (-32.0)).abs() < 1e-4,
+                    "chunk={chunk_base} l={l} off=96"
+                );
+            }
+            for l in 16..32usize {
+                assert_eq!(
+                    out[chunk_base + l],
+                    0.0,
+                    "chunk={chunk_base} l={l} off=0 deve=0"
+                );
+                assert_eq!(
+                    out[chunk_base + l + 32],
+                    0.0,
+                    "chunk={chunk_base} l={l} off=32 deve=0"
+                );
+                assert_eq!(
+                    out[chunk_base + l + 64],
+                    0.0,
+                    "chunk={chunk_base} l={l} off=64 deve=0"
+                );
+                assert_eq!(
+                    out[chunk_base + l + 96],
+                    0.0,
+                    "chunk={chunk_base} l={l} off=96 deve=0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q6_k_bad_size_returns_error() {
+        assert!(dequant_to_f32(&[0u8; 209], GgmlType::Q6_K).is_err());
     }
 }
