@@ -169,42 +169,60 @@ impl MetadataValue {
     pub fn as_u32(&self, key: &str) -> Result<u32, GgufError> {
         match self {
             MetadataValue::U32(v) => Ok(*v),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "u32" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "u32",
+            }),
         }
     }
 
     pub fn as_f32(&self, key: &str) -> Result<f32, GgufError> {
         match self {
             MetadataValue::F32(v) => Ok(*v),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "f32" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "f32",
+            }),
         }
     }
 
     pub fn as_str(&self, key: &str) -> Result<&str, GgufError> {
         match self {
             MetadataValue::String(s) => Ok(s.as_str()),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "string" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "string",
+            }),
         }
     }
 
     pub fn as_string_array(&self, key: &str) -> Result<&[String], GgufError> {
         match self {
             MetadataValue::Array(MetadataArray::String(v)) => Ok(v),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "string[]" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "string[]",
+            }),
         }
     }
 
     pub fn as_f32_array(&self, key: &str) -> Result<&[f32], GgufError> {
         match self {
             MetadataValue::Array(MetadataArray::F32(v)) => Ok(v),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "f32[]" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "f32[]",
+            }),
         }
     }
 
     pub fn as_i32_array(&self, key: &str) -> Result<&[i32], GgufError> {
         match self {
             MetadataValue::Array(MetadataArray::I32(v)) => Ok(v),
-            _ => Err(GgufError::WrongType { key: key.into(), expected: "i32[]" }),
+            _ => Err(GgufError::WrongType {
+                key: key.into(),
+                expected: "i32[]",
+            }),
         }
     }
 
@@ -248,11 +266,29 @@ mod tests {
 
     #[test]
     fn block_layout_matches_ggml() {
-        assert_eq!((GgmlType::F32.block_size(), GgmlType::F32.type_size()), (1, 4));
-        assert_eq!((GgmlType::F16.block_size(), GgmlType::F16.type_size()), (1, 2));
-        assert_eq!((GgmlType::Q8_0.block_size(), GgmlType::Q8_0.type_size()), (32, 34));
-        assert_eq!((GgmlType::Q4_0.block_size(), GgmlType::Q4_0.type_size()), (32, 18));
-        assert_eq!((GgmlType::Q4_K.block_size(), GgmlType::Q4_K.type_size()), (256, 144));
-        assert_eq!((GgmlType::Q6_K.block_size(), GgmlType::Q6_K.type_size()), (256, 210));
+        assert_eq!(
+            (GgmlType::F32.block_size(), GgmlType::F32.type_size()),
+            (1, 4)
+        );
+        assert_eq!(
+            (GgmlType::F16.block_size(), GgmlType::F16.type_size()),
+            (1, 2)
+        );
+        assert_eq!(
+            (GgmlType::Q8_0.block_size(), GgmlType::Q8_0.type_size()),
+            (32, 34)
+        );
+        assert_eq!(
+            (GgmlType::Q4_0.block_size(), GgmlType::Q4_0.type_size()),
+            (32, 18)
+        );
+        assert_eq!(
+            (GgmlType::Q4_K.block_size(), GgmlType::Q4_K.type_size()),
+            (256, 144)
+        );
+        assert_eq!(
+            (GgmlType::Q6_K.block_size(), GgmlType::Q6_K.type_size()),
+            (256, 210)
+        );
     }
 }

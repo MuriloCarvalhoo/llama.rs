@@ -101,17 +101,29 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed, GgufError> {
         }
         let ggml_type = GgmlType::try_from(r.u32()?)?;
         let offset = r.u64()?;
-        tensors.push(crate::file::TensorInfo { name, dims, ggml_type, offset });
+        tensors.push(crate::file::TensorInfo {
+            name,
+            dims,
+            ggml_type,
+            offset,
+        });
     }
 
     let alignment = match metadata.get("general.alignment") {
-        Some(v) => usize::try_from(v.as_u32("general.alignment")?).map_err(|_| GgufError::Overflow)?,
+        Some(v) => {
+            usize::try_from(v.as_u32("general.alignment")?).map_err(|_| GgufError::Overflow)?
+        }
         None => 32,
     };
     let pos = r.position();
     let data_offset = align_up(pos, alignment)?;
 
-    Ok(Parsed { version, metadata, tensors, data_offset })
+    Ok(Parsed {
+        version,
+        metadata,
+        tensors,
+        data_offset,
+    })
 }
 
 fn align_up(pos: usize, alignment: usize) -> Result<usize, GgufError> {
@@ -128,6 +140,7 @@ fn align_up(pos: usize, alignment: usize) -> Result<usize, GgufError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
     use crate::file::GgufFile;
     use crate::test_support::GgufBuilder;
     use crate::types::GgmlType;
@@ -148,14 +161,25 @@ mod tests {
         let f = GgufFile::parse(&bytes).unwrap();
         assert_eq!(f.version, 3);
         assert_eq!(
-            f.metadata.get("general.architecture").unwrap().as_str("k").unwrap(),
+            f.metadata
+                .get("general.architecture")
+                .unwrap()
+                .as_str("k")
+                .unwrap(),
             "llama"
         );
         assert_eq!(
-            f.metadata.get("llama.block_count").unwrap().as_u32("k").unwrap(),
+            f.metadata
+                .get("llama.block_count")
+                .unwrap()
+                .as_u32("k")
+                .unwrap(),
             5
         );
-        assert_eq!(f.metadata.get("tokenizer.ggml.tokens").unwrap().array_len(), Some(3));
+        assert_eq!(
+            f.metadata.get("tokenizer.ggml.tokens").unwrap().array_len(),
+            Some(3)
+        );
     }
 
     #[test]

@@ -1,5 +1,10 @@
 //! Builder de bytes GGUF para testes. Compilado apenas com `cfg(test)`.
 #![cfg(test)]
+#![allow(
+    dead_code,
+    clippy::cast_possible_truncation,
+    clippy::manual_is_multiple_of
+)]
 
 /// Acumula bytes de um arquivo GGUF v3 little-endian.
 pub(crate) struct GgufBuilder {
@@ -11,7 +16,12 @@ pub(crate) struct GgufBuilder {
 
 impl GgufBuilder {
     pub fn new() -> Self {
-        Self { kv: Vec::new(), kv_count: 0, tensors: Vec::new(), tensor_count: 0 }
+        Self {
+            kv: Vec::new(),
+            kv_count: 0,
+            tensors: Vec::new(),
+            tensor_count: 0,
+        }
     }
 
     fn push_string(buf: &mut Vec<u8>, s: &str) {
@@ -51,7 +61,8 @@ impl GgufBuilder {
         Self::push_string(&mut self.kv, key);
         self.kv.extend_from_slice(&9u32.to_le_bytes());
         self.kv.extend_from_slice(&8u32.to_le_bytes());
-        self.kv.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        self.kv
+            .extend_from_slice(&(vals.len() as u64).to_le_bytes());
         for v in vals {
             Self::push_string(&mut self.kv, v);
         }
@@ -64,7 +75,8 @@ impl GgufBuilder {
         Self::push_string(&mut self.kv, key);
         self.kv.extend_from_slice(&9u32.to_le_bytes());
         self.kv.extend_from_slice(&6u32.to_le_bytes());
-        self.kv.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        self.kv
+            .extend_from_slice(&(vals.len() as u64).to_le_bytes());
         for v in vals {
             self.kv.extend_from_slice(&v.to_le_bytes());
         }
@@ -77,7 +89,8 @@ impl GgufBuilder {
         Self::push_string(&mut self.kv, key);
         self.kv.extend_from_slice(&9u32.to_le_bytes());
         self.kv.extend_from_slice(&5u32.to_le_bytes());
-        self.kv.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        self.kv
+            .extend_from_slice(&(vals.len() as u64).to_le_bytes());
         for v in vals {
             self.kv.extend_from_slice(&v.to_le_bytes());
         }
@@ -88,7 +101,8 @@ impl GgufBuilder {
     /// Adiciona um tensor info (sem dados). `ggml_type` é o id u32.
     pub fn tensor(mut self, name: &str, dims: &[u64], ggml_type: u32, offset: u64) -> Self {
         Self::push_string(&mut self.tensors, name);
-        self.tensors.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        self.tensors
+            .extend_from_slice(&(dims.len() as u32).to_le_bytes());
         for d in dims {
             self.tensors.extend_from_slice(&d.to_le_bytes());
         }

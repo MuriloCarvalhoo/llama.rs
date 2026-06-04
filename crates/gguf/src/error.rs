@@ -4,7 +4,9 @@
 /// toda condição inesperada vira erro, nunca panic.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum GgufError {
-    #[error("fim inesperado dos dados: precisava de {needed} bytes em offset {offset}, restam {available}")]
+    #[error(
+        "fim inesperado dos dados: precisava de {needed} bytes em offset {offset}, restam {available}"
+    )]
     UnexpectedEof {
         offset: usize,
         needed: usize,

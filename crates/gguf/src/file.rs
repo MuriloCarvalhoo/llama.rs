@@ -38,15 +38,13 @@ impl GgufFile {
 
     /// Atalho tipado para um KV obrigatório.
     pub fn get(&self, key: &str) -> Result<&MetadataValue, GgufError> {
-        self.metadata.get(key).ok_or_else(|| GgufError::MissingKey(key.into()))
+        self.metadata
+            .get(key)
+            .ok_or_else(|| GgufError::MissingKey(key.into()))
     }
 
     /// Bytes raw de um tensor (sem dequant). Slice sobre a seção de dados.
-    pub fn tensor_data<'a>(
-        &self,
-        bytes: &'a [u8],
-        t: &TensorInfo,
-    ) -> Result<&'a [u8], GgufError> {
+    pub fn tensor_data<'a>(&self, bytes: &'a [u8], t: &TensorInfo) -> Result<&'a [u8], GgufError> {
         let mut n_elements: u64 = 1;
         for &d in &t.dims {
             n_elements = n_elements.checked_mul(d).ok_or(GgufError::Overflow)?;
@@ -54,8 +52,10 @@ impl GgufFile {
         let block_size = t.ggml_type.block_size();
         let type_size = t.ggml_type.type_size();
         // n_elements deve ser múltiplo do block_size.
-        if block_size == 0 || n_elements % block_size != 0 {
-            return Err(GgufError::TensorOutOfBounds { name: t.name.clone() });
+        if block_size == 0 || !n_elements.is_multiple_of(block_size) {
+            return Err(GgufError::TensorOutOfBounds {
+                name: t.name.clone(),
+            });
         }
         let n_blocks = n_elements / block_size;
         let n_bytes = n_blocks.checked_mul(type_size).ok_or(GgufError::Overflow)?;
@@ -69,12 +69,15 @@ impl GgufFile {
 
         bytes
             .get(start..end)
-            .ok_or_else(|| GgufError::TensorOutOfBounds { name: t.name.clone() })
+            .ok_or_else(|| GgufError::TensorOutOfBounds {
+                name: t.name.clone(),
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
     use super::*;
     use crate::test_support::GgufBuilder;
 

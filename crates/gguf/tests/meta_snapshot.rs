@@ -1,4 +1,5 @@
 //! Confere a saída parseada contra o snapshot revisado refs/stories260k-meta.json.
+#![allow(clippy::indexing_slicing, clippy::cast_possible_truncation)]
 use serde_json::Value;
 
 #[test]
@@ -23,15 +24,26 @@ fn matches_reviewed_snapshot() {
                 assert!((got.as_f32(key).unwrap() - e).abs() < 1e-9, "{key}");
             }
             Value::Number(n) => {
-                assert_eq!(got.as_u32(key).unwrap() as u64, n.as_u64().unwrap(), "{key}")
+                assert_eq!(
+                    got.as_u32(key).unwrap() as u64,
+                    n.as_u64().unwrap(),
+                    "{key}"
+                )
             }
             _ => panic!("tipo inesperado no snapshot para {key}"),
         }
     }
 
     for (key, len) in snap["array_lengths"].as_object().unwrap() {
-        assert_eq!(f.get(key).unwrap().array_len(), Some(len.as_u64().unwrap() as usize), "{key}");
+        assert_eq!(
+            f.get(key).unwrap().array_len(),
+            Some(len.as_u64().unwrap() as usize),
+            "{key}"
+        );
     }
 
-    assert_eq!(f.tensors.len() as u64, snap["tensor_count"].as_u64().unwrap());
+    assert_eq!(
+        f.tensors.len() as u64,
+        snap["tensor_count"].as_u64().unwrap()
+    );
 }
