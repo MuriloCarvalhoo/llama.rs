@@ -3,7 +3,7 @@
 
 use gguf::GgufFile;
 
-use crate::attention::{attention, KvCache};
+use crate::attention::{KvCache, attention};
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
 use crate::ops::{argmax, embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm, swiglu};
@@ -50,8 +50,24 @@ impl Model {
             let mut k = matmul(&lw.attn_k, &attn_in, c.n_embd, kv_dim, n_tok);
             let v = matmul(&lw.attn_v, &attn_in, c.n_embd, kv_dim, n_tok);
 
-            rope_norm(&mut q, n_tok, c.n_head, c.head_dim, c.rope_dim, c.freq_base, pos0);
-            rope_norm(&mut k, n_tok, c.n_head_kv, c.head_dim, c.rope_dim, c.freq_base, pos0);
+            rope_norm(
+                &mut q,
+                n_tok,
+                c.n_head,
+                c.head_dim,
+                c.rope_dim,
+                c.freq_base,
+                pos0,
+            );
+            rope_norm(
+                &mut k,
+                n_tok,
+                c.n_head_kv,
+                c.head_dim,
+                c.rope_dim,
+                c.freq_base,
+                pos0,
+            );
 
             cache.append(l, &k, &v);
             let attn = attention(
@@ -133,7 +149,6 @@ mod tests {
         // embd sum == -3.354056
         let x = embedding_lookup(&m.weights.token_embd, &tokens, c.n_embd).unwrap();
         let embd_sum: f32 = x.iter().sum();
-        eprintln!("embd_sum={embd_sum}");
         assert!((embd_sum - (-3.354056)).abs() < 1e-2, "embd_sum={embd_sum}");
 
         // Qcur-0 pós-rope sum == 148.969818
@@ -141,9 +156,16 @@ mod tests {
         let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
         let attn_in = mul_rows(&normed, &lw.attn_norm, c.n_embd);
         let mut q = matmul(&lw.attn_q, &attn_in, c.n_embd, c.n_embd, n_tok);
-        rope_norm(&mut q, n_tok, c.n_head, c.head_dim, c.rope_dim, c.freq_base, 0);
+        rope_norm(
+            &mut q,
+            n_tok,
+            c.n_head,
+            c.head_dim,
+            c.rope_dim,
+            c.freq_base,
+            0,
+        );
         let q_sum: f32 = q.iter().sum();
-        eprintln!("q_sum={q_sum}");
-        assert!((q_sum - 148.969818).abs() < 1e-1, "q_sum={q_sum}");
+        assert!((q_sum - 148.969_82).abs() < 1e-1, "q_sum={q_sum}");
     }
 }
