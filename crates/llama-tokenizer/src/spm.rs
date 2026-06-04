@@ -229,7 +229,7 @@ mod tests {
             .collect();
         let scores = vec![0.0, 0.0, 0.0, 0.0, -3.0, -3.0, -3.0, -1.0, -0.5];
         let types = vec![2, 3, 3, 6, 1, 1, 1, 1, 1];
-        Vocab::new(tokens, scores, types, 1, 2, 0)
+        Vocab::new(tokens, scores, types, 1, 2, 0, vec![])
     }
 
     #[test]

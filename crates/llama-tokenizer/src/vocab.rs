@@ -19,6 +19,8 @@ pub struct Vocab {
     pub(crate) eos_id: u32,
     #[allow(dead_code)]
     pub(crate) unk_id: u32,
+    /// Pares de merge para BPE (índice = rank). Vazio em vocabs SPM.
+    pub(crate) merges: Vec<(u32, u32)>,
 }
 
 impl Vocab {
@@ -30,6 +32,7 @@ impl Vocab {
         bos_id: u32,
         eos_id: u32,
         unk_id: u32,
+        merges: Vec<(u32, u32)>,
     ) -> Vocab {
         let mut token_to_id = HashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
@@ -49,29 +52,49 @@ impl Vocab {
             bos_id,
             eos_id,
             unk_id,
+            merges,
         }
     }
 
-    /// Lê o vocab SPM dos metadados de um GGUF já parseado.
+    /// Constrói HashMap de rank de merge para BPE: (id_a, id_b) → rank (índice no array).
+    pub(crate) fn merge_ranks(&self) -> HashMap<(u32, u32), u32> {
+        self.merges
+            .iter()
+            .enumerate()
+            .map(|(rank, &pair)| {
+                let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+                (pair, rank)
+            })
+            .collect()
+    }
+
+    /// Lê o vocab (SPM ou BPE) dos metadados de um GGUF já parseado.
     pub fn from_gguf(f: &GgufFile) -> Result<Vocab, TokenizerError> {
         let model = f
             .get("tokenizer.ggml.model")?
             .as_str("tokenizer.ggml.model")?;
-        if model != "llama" {
-            return Err(TokenizerError::UnsupportedModel(model.to_owned()));
+
+        match model {
+            "llama" | "gpt2" => {}
+            other => return Err(TokenizerError::UnsupportedModel(other.to_owned())),
         }
+
         let tokens: Vec<String> = f
             .get("tokenizer.ggml.tokens")?
             .as_string_array("tokenizer.ggml.tokens")?
             .to_vec();
-        let scores: Vec<f32> = f
-            .get("tokenizer.ggml.scores")?
-            .as_f32_array("tokenizer.ggml.scores")?
-            .to_vec();
-        let token_types: Vec<i32> = f
-            .get("tokenizer.ggml.token_type")?
-            .as_i32_array("tokenizer.ggml.token_type")?
-            .to_vec();
+
+        // scores: obrigatório em SPM, ausente em BPE — default zeros
+        let scores: Vec<f32> = match f.metadata.get("tokenizer.ggml.scores") {
+            Some(v) => v.as_f32_array("tokenizer.ggml.scores")?.to_vec(),
+            None => vec![0.0; tokens.len()],
+        };
+
+        // token_type: presente em ambos, mas defensivamente opcional
+        let token_types: Vec<i32> = match f.metadata.get("tokenizer.ggml.token_type") {
+            Some(v) => v.as_i32_array("tokenizer.ggml.token_type")?.to_vec(),
+            None => vec![1; tokens.len()],
+        };
 
         if tokens.len() != scores.len() || tokens.len() != token_types.len() {
             return Err(TokenizerError::InconsistentVocab {
@@ -83,7 +106,41 @@ impl Vocab {
 
         let bos_id = f.get("tokenizer.ggml.bos_token_id")?.as_u32("bos")?;
         let eos_id = f.get("tokenizer.ggml.eos_token_id")?.as_u32("eos")?;
-        let unk_id = f.get("tokenizer.ggml.unknown_token_id")?.as_u32("unk")?;
+        // unk_id ausente em Qwen2 — default 0
+        let unk_id = match f.metadata.get("tokenizer.ggml.unknown_token_id") {
+            Some(v) => v.as_u32("unk")?,
+            None => 0,
+        };
+
+        // Merges BPE: presente apenas em model="gpt2"
+        let merges = if model == "gpt2" {
+            let merge_strings = f
+                .get("tokenizer.ggml.merges")?
+                .as_string_array("tokenizer.ggml.merges")?;
+
+            // token_to_id inline para resolver strings → IDs durante o parse
+            let mut token_to_id: HashMap<&str, u32> = HashMap::with_capacity(tokens.len());
+            for (i, t) in tokens.iter().enumerate() {
+                if let Ok(id) = u32::try_from(i) {
+                    token_to_id.insert(t.as_str(), id);
+                }
+            }
+
+            let mut result = Vec::with_capacity(merge_strings.len());
+            for s in merge_strings {
+                // formato: "a b" (dois tokens separados por exatamente um espaço)
+                if let Some(sp) = s.find(' ') {
+                    let a = &s[..sp];
+                    let b = &s[sp + 1..];
+                    if let (Some(&ia), Some(&ib)) = (token_to_id.get(a), token_to_id.get(b)) {
+                        result.push((ia, ib));
+                    }
+                }
+            }
+            result
+        } else {
+            Vec::new()
+        };
 
         Ok(Vocab::new(
             tokens,
@@ -92,6 +149,7 @@ impl Vocab {
             bos_id,
             eos_id,
             unk_id,
+            merges,
         ))
     }
 
@@ -140,7 +198,7 @@ mod tests {
             .collect();
         let scores = vec![0.0, 0.0, 0.0, 0.0, -1.0, -0.5];
         let token_types = vec![2, 3, 3, 6, 1, 1];
-        Vocab::new(tokens, scores, token_types, 1, 2, 0)
+        Vocab::new(tokens, scores, token_types, 1, 2, 0, vec![])
     }
 
     #[test]

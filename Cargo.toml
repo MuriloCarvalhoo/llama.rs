@@ -17,6 +17,7 @@ rand = "0.9"
 llama-sampling = { path = "crates/llama-sampling" }
 llama-model = { path = "crates/llama-model" }
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
