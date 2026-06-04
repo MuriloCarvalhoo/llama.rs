@@ -118,4 +118,39 @@ mod tests {
         let mut r = Reader::new(&bytes);
         assert!(r.gguf_string().is_err());
     }
+
+    #[test]
+    fn reads_all_scalar_widths_little_endian() {
+        // i8, u16, i16, i32, bool em sequência.
+        let bytes = [
+            0xFF, // i8 = -1
+            0x01, 0x02, // u16 = 0x0201
+            0xFF, 0xFF, // i16 = -1
+            0x04, 0x03, 0x02, 0x01, // i32 = 0x01020304
+            0x00, // bool = false
+            0x01, // u8 = 1
+        ];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.i8().unwrap(), -1);
+        assert_eq!(r.u16().unwrap(), 0x0201);
+        assert_eq!(r.i16().unwrap(), -1);
+        assert_eq!(r.i32().unwrap(), 0x0102_0304);
+        assert!(!r.bool().unwrap());
+        assert_eq!(r.u8().unwrap(), 1);
+        assert_eq!(r.position(), bytes.len());
+    }
+
+    #[test]
+    fn reads_64bit_and_float_scalars() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        bytes.extend_from_slice(&2.5f64.to_le_bytes());
+        bytes.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        bytes.extend_from_slice(&(-1i64).to_le_bytes());
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.f32().unwrap(), 1.5);
+        assert_eq!(r.f64().unwrap(), 2.5);
+        assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
+        assert_eq!(r.i64().unwrap(), -1);
+    }
 }

@@ -291,4 +291,72 @@ mod tests {
             (256, 210)
         );
     }
+
+    #[test]
+    fn all_type_ids_roundtrip_and_sizes() {
+        // (id, esperado block_size, esperado type_size) para todo o subconjunto ativo.
+        let cases: &[(u32, u64, u64)] = &[
+            (0, 1, 4),
+            (1, 1, 2),
+            (2, 32, 18),
+            (3, 32, 20),
+            (6, 32, 22),
+            (7, 32, 24),
+            (8, 32, 34),
+            (9, 32, 36),
+            (10, 256, 84),
+            (11, 256, 110),
+            (12, 256, 144),
+            (13, 256, 176),
+            (14, 256, 210),
+            (15, 256, 292),
+            (24, 1, 1),
+            (25, 1, 2),
+            (26, 1, 4),
+            (27, 1, 8),
+            (28, 1, 8),
+            (30, 1, 2),
+        ];
+        for &(id, bs, ts) in cases {
+            let t = GgmlType::try_from(id).unwrap();
+            assert_eq!(t.block_size(), bs, "block_size id {id}");
+            assert_eq!(t.type_size(), ts, "type_size id {id}");
+        }
+    }
+
+    #[test]
+    fn all_metadata_accessors_and_array_len() {
+        // Acessores de array tipados.
+        let strs = MetadataValue::Array(MetadataArray::String(vec!["a".into(), "b".into()]));
+        assert_eq!(strs.as_string_array("k").unwrap(), &["a", "b"]);
+        assert!(strs.as_f32_array("k").is_err());
+
+        let ints = MetadataValue::Array(MetadataArray::I32(vec![1, 2, 3]));
+        assert_eq!(ints.as_i32_array("k").unwrap(), &[1, 2, 3]);
+        assert!(ints.as_string_array("k").is_err());
+
+        // f32 escalar + caminho de erro.
+        let f = MetadataValue::F32(1.5);
+        assert_eq!(f.as_f32("k").unwrap(), 1.5);
+        assert!(f.as_u32("k").is_err());
+
+        // array_len em não-array é None.
+        assert_eq!(MetadataValue::U8(0).array_len(), None);
+
+        // len / is_empty em cada variante de MetadataArray.
+        assert_eq!(MetadataArray::U8(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::I8(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::U16(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::I16(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::U32(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::I32(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::F32(vec![1.0]).len(), 1);
+        assert_eq!(MetadataArray::Bool(vec![true]).len(), 1);
+        assert_eq!(MetadataArray::String(vec!["x".into()]).len(), 1);
+        assert_eq!(MetadataArray::U64(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::I64(vec![1]).len(), 1);
+        assert_eq!(MetadataArray::F64(vec![1.0]).len(), 1);
+        assert!(MetadataArray::U8(vec![]).is_empty());
+        assert!(!MetadataArray::U8(vec![1]).is_empty());
+    }
 }
