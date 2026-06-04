@@ -1,5 +1,4 @@
 //! Estratégias de amostragem: greedy, temperatura, top-k, top-p.
-#![allow(clippy::indexing_slicing)]
 
 use rand::Rng;
 
@@ -19,12 +18,14 @@ pub enum Sampler {
 impl Sampler {
     /// Retorna o índice do token amostrado dado o vetor de logits.
     pub fn sample(&self, logits: &[f32], rng: &mut impl Rng) -> usize {
+        debug_assert!(!logits.is_empty(), "logits slice must not be empty");
         match self {
             Sampler::Greedy => argmax(logits),
             Sampler::Temperature { temp } => {
                 if *temp == 0.0 {
                     return argmax(logits);
                 }
+                debug_assert!(*temp > 0.0, "temperature must be positive, got {temp}");
                 let scaled: Vec<f32> = logits.iter().map(|&l| l / temp).collect();
                 let probs = softmax(&scaled);
                 sample_multinomial(&probs, rng)
@@ -103,6 +104,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn softmax_with_negative_logits() {
         let probs = softmax(&[-1.0, -2.0, -3.0]);
         let sum: f32 = probs.iter().sum();
@@ -117,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn sample_multinomial_cumulative_sum() {
         // probs = [0.1, 0.6, 0.3] — index 1 has highest mass
         // With seed 42, r will hit index 1
@@ -154,6 +157,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn temperature_uniform_shows_variety() {
         // Equal logits + high temperature → all 3 indices appear in 300 samples
         let logits = vec![1.0_f32, 1.0, 1.0];
