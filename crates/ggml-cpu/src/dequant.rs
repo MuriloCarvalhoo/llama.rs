@@ -50,10 +50,24 @@ fn dequant_f16(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
         .collect())
 }
 
-fn dequant_q8_0(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    Err(DequantError::UnsupportedType(
-        "Q8_0 (stub — implementado na Task 1)".to_owned(),
-    ))
+fn dequant_q8_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 34; // 2 (f16) + 32 (i8)
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q8_0",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = Vec::with_capacity(n_blocks * 32);
+    for b in bytes.chunks_exact(BLOCK) {
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        for &q in &b[2..34] {
+            out.push(q.cast_signed() as f32 * d);
+        }
+    }
+    Ok(out)
 }
 fn dequant_q4_0(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     Err(DequantError::UnsupportedType(
@@ -99,5 +113,41 @@ mod tests {
     #[test]
     fn unsupported_type_returns_error() {
         assert!(dequant_to_f32(&[], GgmlType::Q2_K).is_err());
+    }
+
+    fn make_q8_0_block(d: f32, qs: &[i8; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(34);
+        b.extend_from_slice(&f16_bytes(d));
+        b.extend(qs.iter().map(|&q| q.cast_unsigned()));
+        b
+    }
+
+    #[test]
+    fn q8_0_single_block() {
+        // d=1.0; qs=[1, -1, 0×30] → out=[1.0, -1.0, 0×30]
+        let mut qs = [0i8; 32];
+        qs[0] = 1;
+        qs[1] = -1;
+        let block = make_q8_0_block(1.0, &qs);
+        let out = dequant_to_f32(&block, GgmlType::Q8_0).unwrap();
+        assert_eq!(out.len(), 32);
+        assert!((out[0] - 1.0).abs() < 1e-5, "out[0]={}", out[0]);
+        assert!((out[1] - (-1.0)).abs() < 1e-5, "out[1]={}", out[1]);
+        assert!(out[2..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q8_0_scale_applied() {
+        // d=2.0; qs=[3, 0×31] → out[0]=6.0
+        let mut qs = [0i8; 32];
+        qs[0] = 3;
+        let block = make_q8_0_block(2.0, &qs);
+        let out = dequant_to_f32(&block, GgmlType::Q8_0).unwrap();
+        assert!((out[0] - 6.0).abs() < 1e-4, "out[0]={}", out[0]);
+    }
+
+    #[test]
+    fn q8_0_bad_size_returns_error() {
+        assert!(dequant_to_f32(&[0u8; 33], GgmlType::Q8_0).is_err());
     }
 }
