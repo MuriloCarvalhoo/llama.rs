@@ -33,10 +33,12 @@ impl Vocab {
     ) -> Vocab {
         let mut token_to_id = HashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
-            // Em colisão, o primeiro id vence (como o token_to_id do llama.cpp,
-            // populado em ordem crescente sem sobrescrever).
+            // Em colisão, o último id vence — espelha `token_to_id[word] = i`
+            // do llama.cpp (llama-vocab.cpp:2404). Vocabs SPM válidos não têm
+            // duplicatas (upstream aborta via GGML_ASSERT), então é inerte na
+            // prática, mas mantemos a semântica idêntica por fidelidade 1:1.
             if let Ok(id) = u32::try_from(i) {
-                token_to_id.entry(t.clone()).or_insert(id);
+                token_to_id.insert(t.clone(), id);
             }
         }
         Vocab {
