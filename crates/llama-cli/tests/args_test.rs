@@ -47,3 +47,15 @@ fn rejects_missing_model() {
     let result = Args::try_parse_from(["llama-cli", "--prompt", "hello"]);
     assert!(result.is_err(), "should fail without --model");
 }
+
+#[test]
+fn timings_flag_default_false() {
+    let args = Args::try_parse_from(["llama-cli", "--model", "/tmp/m.gguf"]).unwrap();
+    assert!(!args.timings, "timings deve ser false por padrao");
+}
+
+#[test]
+fn timings_flag_enabled() {
+    let args = Args::try_parse_from(["llama-cli", "--model", "/tmp/m.gguf", "--timings"]).unwrap();
+    assert!(args.timings);
+}

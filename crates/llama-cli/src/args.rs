@@ -38,4 +38,8 @@ pub struct Args {
     /// Suprimir o prompt da saida
     #[arg(long)]
     pub no_display_prompt: bool,
+
+    /// Imprimir tempo de geracao (tokens/seg) ao final para stderr
+    #[arg(long)]
+    pub timings: bool,
 }
