@@ -1,85 +1,131 @@
-//! Materialização dos pesos f32 do GGUF em buffers próprios (sem `unsafe`).
+//! Pesos quantizados do GGUF armazenados em bytes raw; dequantizados sob demanda.
 
-use gguf::{GgmlType, GgufFile, TensorInfo};
+use ggml_cpu::dequant_to_f32;
+use gguf::{GgufFile, TensorInfo};
 
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
 
+/// Tensor raw: bytes tal como lidos do GGUF + tipo de dado para dequant.
+pub(crate) struct RawTensor {
+    pub bytes: Vec<u8>,
+    pub ty: gguf::GgmlType,
+}
+
+impl RawTensor {
+    /// Número de elementos (não de bytes).
+    pub fn n_elements(&self) -> usize {
+        let bs = self.ty.block_size() as usize;
+        let ts = self.ty.type_size() as usize;
+        if ts == 0 {
+            return 0;
+        }
+        (self.bytes.len() / ts) * bs
+    }
+
+    /// Bytes raw (footprint de RAM — quantizado).
+    pub fn memory_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Dequantiza para f32 (alocação sob demanda).
+    pub fn dequant_to_f32(&self) -> Result<Vec<f32>, ModelError> {
+        Ok(dequant_to_f32(&self.bytes, self.ty)?)
+    }
+}
+
 /// Pesos de uma camada transformer.
 pub(crate) struct LayerWeights {
-    pub attn_norm: Vec<f32>,
-    pub attn_q: Vec<f32>,
-    pub attn_k: Vec<f32>,
-    pub attn_v: Vec<f32>,
-    pub attn_output: Vec<f32>,
-    pub ffn_norm: Vec<f32>,
-    pub ffn_gate: Vec<f32>,
-    pub ffn_up: Vec<f32>,
-    pub ffn_down: Vec<f32>,
+    pub attn_norm: RawTensor,
+    pub attn_q: RawTensor,
+    pub attn_k: RawTensor,
+    pub attn_v: RawTensor,
+    pub attn_output: RawTensor,
+    pub ffn_norm: RawTensor,
+    pub ffn_gate: RawTensor,
+    pub ffn_up: RawTensor,
+    pub ffn_down: RawTensor,
 }
 
-/// Todos os pesos do modelo, em f32.
+/// Todos os pesos do modelo, em bytes raw.
 pub(crate) struct Weights {
-    pub token_embd: Vec<f32>,
+    pub token_embd: RawTensor,
     pub layers: Vec<LayerWeights>,
-    pub output_norm: Vec<f32>,
-    pub output: Vec<f32>,
+    pub output_norm: RawTensor,
+    pub output: RawTensor,
 }
 
-fn tensor_f32(f: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, ModelError> {
+fn tensor_raw(f: &GgufFile, bytes: &[u8], name: &str) -> Result<RawTensor, ModelError> {
     let info: &TensorInfo = f
         .tensors
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| ModelError::MissingTensor(name.to_owned()))?;
-    if info.ggml_type != GgmlType::F32 {
-        return Err(ModelError::NotF32(name.to_owned()));
-    }
     let raw = f.tensor_data(bytes, info)?;
-    raw.chunks_exact(4)
-        .map(|c| {
-            <[u8; 4]>::try_from(c)
-                .map(f32::from_le_bytes)
-                .map_err(|_| ModelError::NotF32(name.to_owned()))
-        })
-        .collect()
+    Ok(RawTensor {
+        bytes: raw.to_vec(),
+        ty: info.ggml_type,
+    })
 }
 
 impl Weights {
-    /// Lê todos os tensores f32 necessários. `bytes` é o arquivo GGUF inteiro.
+    /// Lê todos os tensores (qualquer tipo suportado pelo dispatcher de dequant).
     pub fn from_gguf(f: &GgufFile, bytes: &[u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for l in 0..cfg.n_layer {
             let p = |suffix: &str| format!("blk.{l}.{suffix}");
             layers.push(LayerWeights {
-                attn_norm: tensor_f32(f, bytes, &p("attn_norm.weight"))?,
-                attn_q: tensor_f32(f, bytes, &p("attn_q.weight"))?,
-                attn_k: tensor_f32(f, bytes, &p("attn_k.weight"))?,
-                attn_v: tensor_f32(f, bytes, &p("attn_v.weight"))?,
-                attn_output: tensor_f32(f, bytes, &p("attn_output.weight"))?,
-                ffn_norm: tensor_f32(f, bytes, &p("ffn_norm.weight"))?,
-                ffn_gate: tensor_f32(f, bytes, &p("ffn_gate.weight"))?,
-                ffn_up: tensor_f32(f, bytes, &p("ffn_up.weight"))?,
-                ffn_down: tensor_f32(f, bytes, &p("ffn_down.weight"))?,
+                attn_norm: tensor_raw(f, bytes, &p("attn_norm.weight"))?,
+                attn_q: tensor_raw(f, bytes, &p("attn_q.weight"))?,
+                attn_k: tensor_raw(f, bytes, &p("attn_k.weight"))?,
+                attn_v: tensor_raw(f, bytes, &p("attn_v.weight"))?,
+                attn_output: tensor_raw(f, bytes, &p("attn_output.weight"))?,
+                ffn_norm: tensor_raw(f, bytes, &p("ffn_norm.weight"))?,
+                ffn_gate: tensor_raw(f, bytes, &p("ffn_gate.weight"))?,
+                ffn_up: tensor_raw(f, bytes, &p("ffn_up.weight"))?,
+                ffn_down: tensor_raw(f, bytes, &p("ffn_down.weight"))?,
             });
         }
         Ok(Self {
-            token_embd: tensor_f32(f, bytes, "token_embd.weight")?,
+            token_embd: tensor_raw(f, bytes, "token_embd.weight")?,
             layers,
-            output_norm: tensor_f32(f, bytes, "output_norm.weight")?,
-            output: tensor_f32(f, bytes, "output.weight")?,
+            output_norm: tensor_raw(f, bytes, "output_norm.weight")?,
+            output: tensor_raw(f, bytes, "output.weight")?,
         })
+    }
+
+    /// Soma dos bytes raw de todos os tensores.
+    pub fn memory_bytes(&self) -> usize {
+        let layer_bytes: usize = self
+            .layers
+            .iter()
+            .map(|lw| {
+                lw.attn_norm.memory_bytes()
+                    + lw.attn_q.memory_bytes()
+                    + lw.attn_k.memory_bytes()
+                    + lw.attn_v.memory_bytes()
+                    + lw.attn_output.memory_bytes()
+                    + lw.ffn_norm.memory_bytes()
+                    + lw.ffn_gate.memory_bytes()
+                    + lw.ffn_up.memory_bytes()
+                    + lw.ffn_down.memory_bytes()
+            })
+            .sum();
+        self.token_embd.memory_bytes()
+            + layer_bytes
+            + self.output_norm.memory_bytes()
+            + self.output.memory_bytes()
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
     use super::*;
     use std::path::Path;
 
     #[test]
-    fn loads_all_weights_with_expected_sizes() {
+    fn loads_all_weights_with_expected_element_counts() {
         let Ok(bytes) = std::fs::read(Path::new("../../models/stories260K.gguf")) else {
             eprintln!("modelo ausente — pulando");
             return;
@@ -87,14 +133,17 @@ mod tests {
         let f = GgufFile::parse(&bytes).unwrap();
         let cfg = LlamaConfig::from_gguf(&f).unwrap();
         let w = Weights::from_gguf(&f, &bytes, &cfg).unwrap();
-        assert_eq!(w.token_embd.len(), cfg.vocab * cfg.n_embd); // 512*64
-        assert_eq!(w.output.len(), cfg.vocab * cfg.n_embd);
-        assert_eq!(w.output_norm.len(), cfg.n_embd);
+        assert_eq!(w.token_embd.n_elements(), cfg.vocab * cfg.n_embd);
+        assert_eq!(w.output.n_elements(), cfg.vocab * cfg.n_embd);
+        assert_eq!(w.output_norm.n_elements(), cfg.n_embd);
         assert_eq!(w.layers.len(), cfg.n_layer);
         let l0 = &w.layers[0];
-        assert_eq!(l0.attn_q.len(), cfg.n_embd * cfg.n_embd); // 64*64
-        assert_eq!(l0.attn_k.len(), cfg.n_embd * cfg.n_head_kv * cfg.head_dim); // 64*32
-        assert_eq!(l0.ffn_gate.len(), cfg.n_embd * cfg.n_ff); // 64*172
-        assert_eq!(l0.ffn_down.len(), cfg.n_ff * cfg.n_embd); // 172*64
+        assert_eq!(l0.attn_q.n_elements(), cfg.n_embd * cfg.n_embd);
+        assert_eq!(
+            l0.attn_k.n_elements(),
+            cfg.n_embd * cfg.n_head_kv * cfg.head_dim
+        );
+        assert_eq!(l0.ffn_gate.n_elements(), cfg.n_embd * cfg.n_ff);
+        assert_eq!(l0.ffn_down.n_elements(), cfg.n_ff * cfg.n_embd);
     }
 }

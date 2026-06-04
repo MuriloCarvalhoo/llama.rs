@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 gguf.workspace = true
+ggml-cpu.workspace = true
 llama-tokenizer.workspace = true
 
 [lints]

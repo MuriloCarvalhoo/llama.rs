@@ -1,5 +1,6 @@
 //! Erros do carregamento e da inferência do modelo Llama.
 
+use ggml_cpu::DequantError;
 use gguf::GgufError;
 use llama_tokenizer::TokenizerError;
 
@@ -12,8 +13,8 @@ pub enum ModelError {
     Tokenizer(#[from] TokenizerError),
     #[error("tensor ausente: {0}")]
     MissingTensor(String),
-    #[error("bytes do tensor {0} não são múltiplos de 4 (f32)")]
-    NotF32(String),
+    #[error("dequantização: {0}")]
+    Dequant(#[from] DequantError),
     #[error("config inconsistente: {0}")]
     Config(String),
     #[error("overflow de conversão numérica")]
