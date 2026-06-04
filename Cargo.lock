@@ -202,9 +202,17 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "llama-model"
 version = "0.1.0"
 dependencies = [
+ "ggml-cpu",
  "gguf",
  "llama-tokenizer",
  "thiserror",
+]
+
+[[package]]
+name = "llama-sampling"
+version = "0.1.0"
+dependencies = [
+ "rand",
 ]
 
 [[package]]
