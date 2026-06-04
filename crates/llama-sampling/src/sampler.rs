@@ -31,13 +31,54 @@ impl Sampler {
                 sample_multinomial(&probs, rng)
             }
             Sampler::TopK { k, temp } => {
-                todo!("implementado na Task 2: k={k} temp={temp}")
+                let indices = top_k_indices(logits, *k);
+                let reduced: Vec<f32> = indices
+                    .iter()
+                    .filter_map(|&i| logits.get(i).copied())
+                    .collect();
+                let sampler = Sampler::Temperature { temp: *temp };
+                let local_idx = sampler.sample(&reduced, rng);
+                indices.get(local_idx).copied().unwrap_or(0)
             }
             Sampler::TopP { p, temp } => {
-                todo!("implementado na Task 2: p={p} temp={temp}")
+                let probs_full = softmax(logits);
+                let indices = top_p_indices(&probs_full, *p);
+                let reduced: Vec<f32> = indices
+                    .iter()
+                    .filter_map(|&i| logits.get(i).copied())
+                    .collect();
+                let sampler = Sampler::Temperature { temp: *temp };
+                let local_idx = sampler.sample(&reduced, rng);
+                indices.get(local_idx).copied().unwrap_or(0)
             }
         }
     }
+}
+
+/// Returns indices of the top-k logits (by value), unordered.
+#[allow(clippy::indexing_slicing)]
+fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
+    let k = k.min(logits.len()).max(1);
+    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    // partial sort: move top-k to the front
+    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+    indexed[..k].iter().map(|(i, _)| *i).collect()
+}
+
+/// Returns indices whose cumulative probability (sorted desc) covers at least `p`.
+fn top_p_indices(probs: &[f32], p: f32) -> Vec<usize> {
+    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    let mut cumsum = 0.0_f32;
+    let mut result = Vec::new();
+    for (i, prob) in &indexed {
+        result.push(*i);
+        cumsum += prob;
+        if cumsum >= p {
+            break;
+        }
+    }
+    result
 }
 
 pub(crate) fn argmax(logits: &[f32]) -> usize {
@@ -170,6 +211,60 @@ mod tests {
         assert!(
             seen.iter().all(|&s| s),
             "all indices should appear with uniform logits at temp=1.0"
+        );
+    }
+
+    #[test]
+    fn top_k_restricts_to_k_tokens() {
+        // logits: index 0 = 10.0, index 1 = 9.0, index 2 = -100.0
+        // top-k=2 → only indices 0 and 1 are eligible
+        let logits = vec![10.0_f32, 9.0, -100.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::TopK { k: 2, temp: 1.0 };
+        for _ in 0..50 {
+            let result = sampler.sample(&logits, &mut rng);
+            assert!(result == 0 || result == 1, "top-k=2 must not pick index 2");
+        }
+    }
+
+    #[test]
+    fn top_k_k1_is_greedy() {
+        let logits = vec![1.0_f32, 5.0, 2.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::TopK { k: 1, temp: 1.0 };
+        assert_eq!(sampler.sample(&logits, &mut rng), 1);
+    }
+
+    #[test]
+    fn top_p_excludes_low_prob_tokens() {
+        // logits: index 0 = 10.0 (dominant), index 1 = -100.0, index 2 = -100.0
+        // After softmax, index 0 has ~1.0 prob → top-p=0.95 keeps only index 0
+        let logits = vec![10.0_f32, -100.0, -100.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::TopP { p: 0.95, temp: 1.0 };
+        for _ in 0..20 {
+            assert_eq!(
+                sampler.sample(&logits, &mut rng),
+                0,
+                "dominant token must always win"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn top_p_uniform_allows_all() {
+        // Equal logits + p=1.0 → all indices are eligible
+        let logits = vec![1.0_f32, 1.0, 1.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::TopP { p: 1.0, temp: 1.0 };
+        let mut seen = [false; 3];
+        for _ in 0..300 {
+            seen[sampler.sample(&logits, &mut rng)] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "all indices should be seen with p=1.0"
         );
     }
 }
