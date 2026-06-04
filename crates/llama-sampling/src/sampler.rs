@@ -38,6 +38,10 @@ impl Sampler {
                     .collect();
                 let sampler = Sampler::Temperature { temp: *temp };
                 let local_idx = sampler.sample(&reduced, rng);
+                debug_assert!(
+                    local_idx < indices.len(),
+                    "local_idx must be in bounds — sample() returns index within reduced slice of length indices.len()"
+                );
                 indices.get(local_idx).copied().unwrap_or(0)
             }
             Sampler::TopP { p, temp } => {
@@ -49,6 +53,10 @@ impl Sampler {
                     .collect();
                 let sampler = Sampler::Temperature { temp: *temp };
                 let local_idx = sampler.sample(&reduced, rng);
+                debug_assert!(
+                    local_idx < indices.len(),
+                    "local_idx must be in bounds — sample() returns index within reduced slice of length indices.len()"
+                );
                 indices.get(local_idx).copied().unwrap_or(0)
             }
         }
@@ -56,6 +64,7 @@ impl Sampler {
 }
 
 /// Returns indices of the top-k logits (by value), unordered.
+// SAFETY: k <= indexed.len() because of the .min(logits.len()) clamp below.
 #[allow(clippy::indexing_slicing)]
 fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
     let k = k.min(logits.len()).max(1);
