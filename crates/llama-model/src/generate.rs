@@ -20,14 +20,13 @@ impl Model {
 
         let mut next = self.forward_argmax(&prompt_ids, &mut cache)?;
         let mut generated = Vec::with_capacity(n_tokens);
-        generated.push(next);
 
         while generated.len() < n_tokens {
             if next == self.config.eos_id {
                 break;
             }
-            next = self.forward_argmax(&[next], &mut cache)?;
             generated.push(next);
+            next = self.forward_argmax(&[next], &mut cache)?;
         }
 
         Ok(tokenizer.decode(&generated))

@@ -149,7 +149,7 @@ mod tests {
         // embd sum == -3.354056
         let x = embedding_lookup(&m.weights.token_embd, &tokens, c.n_embd).unwrap();
         let embd_sum: f32 = x.iter().sum();
-        assert!((embd_sum - (-3.354056)).abs() < 1e-2, "embd_sum={embd_sum}");
+        assert!((embd_sum - (-3.354056)).abs() < 1e-4, "embd_sum={embd_sum}");
 
         // Qcur-0 pós-rope sum == 148.969818
         let lw = &m.weights.layers[0];
@@ -166,6 +166,6 @@ mod tests {
             0,
         );
         let q_sum: f32 = q.iter().sum();
-        assert!((q_sum - 148.969_82).abs() < 1e-1, "q_sum={q_sum}");
+        assert!((q_sum - 148.969_82).abs() < 1e-2, "q_sum={q_sum}");
     }
 }
