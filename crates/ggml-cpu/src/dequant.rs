@@ -20,7 +20,7 @@ pub fn dequant_to_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>, DequantErr
 }
 
 fn dequant_f32(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(DequantError::BadSize {
             ty: "F32",
             block_bytes: 4,
@@ -34,7 +34,7 @@ fn dequant_f32(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
 }
 
 fn dequant_f16(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(DequantError::BadSize {
             ty: "F16",
             block_bytes: 2,
@@ -51,19 +51,28 @@ fn dequant_f16(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
 }
 
 fn dequant_q8_0(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    todo!("implementado na Task 1")
+    Err(DequantError::UnsupportedType(
+        "Q8_0 (stub — implementado na Task 1)".to_owned(),
+    ))
 }
 fn dequant_q4_0(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    todo!("implementado na Task 2")
+    Err(DequantError::UnsupportedType(
+        "Q4_0 (stub — implementado na Task 2)".to_owned(),
+    ))
 }
 fn dequant_q4_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    todo!("implementado na Task 3")
+    Err(DequantError::UnsupportedType(
+        "Q4_K (stub — implementado na Task 3)".to_owned(),
+    ))
 }
 fn dequant_q6_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    todo!("implementado na Task 4")
+    Err(DequantError::UnsupportedType(
+        "Q6_K (stub — implementado na Task 4)".to_owned(),
+    ))
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
