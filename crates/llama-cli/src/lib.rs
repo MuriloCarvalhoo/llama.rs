@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-//! Biblioteca interna de `llama-cli`.
+//! Biblioteca auxiliar do `llama-cli`.
 
 pub mod args;
-pub mod runner;
+mod runner;
+
+pub use runner::generate_text;

@@ -6,18 +6,11 @@ use llama_cli::args::Args;
 
 #[test]
 fn parses_required_args() {
-    let args = Args::try_parse_from([
-        "llama-cli",
-        "--model",
-        "/tmp/model.gguf",
-        "--prompt",
-        "hello world",
-    ])
-    .unwrap();
+    let args = Args::try_parse_from(["llama-cli", "--model", "/tmp/model.gguf"]).unwrap();
     assert_eq!(args.model.to_str().unwrap(), "/tmp/model.gguf");
-    assert_eq!(args.prompt, "hello world");
-    assert_eq!(args.n_tokens, 128);
-    assert_eq!(args.sampler, "greedy");
+    assert_eq!(args.n_predict, 128);
+    assert!((args.temp - 0.8).abs() < 1e-6);
+    assert!(!args.no_display_prompt);
 }
 
 #[test]
@@ -30,8 +23,6 @@ fn parses_all_args() {
         "test",
         "-n",
         "32",
-        "--sampler",
-        "temperature",
         "--temp",
         "0.7",
         "--top-k",
@@ -40,14 +31,15 @@ fn parses_all_args() {
         "0.95",
         "--seed",
         "123",
+        "--no-display-prompt",
     ])
     .unwrap();
-    assert_eq!(args.n_tokens, 32);
-    assert_eq!(args.sampler, "temperature");
+    assert_eq!(args.n_predict, 32);
     assert!((args.temp - 0.7).abs() < 1e-6);
     assert_eq!(args.top_k, 20);
     assert!((args.top_p - 0.95).abs() < 1e-6);
     assert_eq!(args.seed, 123);
+    assert!(args.no_display_prompt);
 }
 
 #[test]

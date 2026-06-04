@@ -12,30 +12,30 @@ pub struct Args {
     pub model: PathBuf,
 
     /// Texto de prompt
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "")]
     pub prompt: String,
 
-    /// Número máximo de tokens a gerar
-    #[arg(short = 'n', long, default_value = "128")]
-    pub n_tokens: usize,
+    /// Numero maximo de tokens a gerar
+    #[arg(short = 'n', long, default_value_t = 128)]
+    pub n_predict: usize,
 
-    /// Estratégia de amostragem: greedy, temperature, topk, topp
-    #[arg(long, default_value = "greedy")]
-    pub sampler: String,
-
-    /// Temperatura (usada por temperature, topk, topp)
-    #[arg(long, default_value = "0.8")]
+    /// Temperatura de amostragem (0.0 = greedy deterministico)
+    #[arg(long, default_value_t = 0.8)]
     pub temp: f32,
 
-    /// K para top-k sampling
-    #[arg(long, default_value = "40")]
+    /// Top-K -- manter K candidatos antes de amostrar (0 = desabilitado)
+    #[arg(long, default_value_t = 40)]
     pub top_k: usize,
 
-    /// P para top-p (nucleus) sampling
-    #[arg(long, default_value = "0.9")]
+    /// Top-P / nucleus -- prob. acumulada minima (1.0 = desabilitado)
+    #[arg(long, default_value_t = 0.9)]
     pub top_p: f32,
 
-    /// Semente RNG (para reprodutibilidade)
-    #[arg(long, default_value = "42")]
+    /// Semente aleatoria para amostragem reproduzivel
+    #[arg(long, default_value_t = 42)]
     pub seed: u64,
+
+    /// Suprimir o prompt da saida
+    #[arg(long)]
+    pub no_display_prompt: bool,
 }
