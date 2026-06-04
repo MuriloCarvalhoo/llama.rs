@@ -93,10 +93,55 @@ fn dequant_q4_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     Ok(out)
 }
-fn dequant_q4_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    Err(DequantError::UnsupportedType(
-        "Q4_K (stub — implementado na Task 3)".to_owned(),
-    ))
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        (
+            (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4),
+            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+        )
+    }
+}
+
+fn dequant_q4_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 144; // 2+2+12+128
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q4_K",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 256];
+
+    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+        let d_val = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let min_val = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+        let scales = &b[4..16];
+        let qs = &b[16..144];
+        let base = bi * 256;
+        let mut qs_off = 0usize;
+        let mut is = 0usize;
+
+        for j_step in [0usize, 64, 128, 192] {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d_val * f32::from(sc1);
+            let m1f = min_val * f32::from(m1);
+            let d2 = d_val * f32::from(sc2);
+            let m2f = min_val * f32::from(m2);
+            for l in 0..32 {
+                let q = qs[qs_off + l];
+                out[base + j_step + l] = d1 * f32::from(q & 0xF) - m1f;
+                out[base + j_step + l + 32] = d2 * f32::from(q >> 4) - m2f;
+            }
+            qs_off += 32;
+            is += 2;
+        }
+    }
+    Ok(out)
 }
 fn dequant_q6_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     Err(DequantError::UnsupportedType(
@@ -199,5 +244,49 @@ mod tests {
     #[test]
     fn q4_0_bad_size_returns_error() {
         assert!(dequant_to_f32(&[0u8; 17], GgmlType::Q4_0).is_err());
+    }
+
+    fn make_q4_k_block(d: f32, dmin: f32, scales: &[u8; 12], qs: &[u8; 128]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(144);
+        b.extend_from_slice(&f16_bytes(d));
+        b.extend_from_slice(&f16_bytes(dmin));
+        b.extend_from_slice(scales);
+        b.extend_from_slice(qs);
+        b
+    }
+
+    #[test]
+    fn q4_k_two_active_sub_blocks() {
+        // d=1.0, dmin=1.0
+        // scales=[8, 4, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0]
+        //   is=0: get(0)→sc=8,mn=0; get(1)→sc=4,mn=0
+        //   is=2...: →sc=0,mn=0 (all zero)
+        // qs = [0x22 × 128]: nibbles both = 2
+        // out[0..32]   = 8*2-0 = 16.0
+        // out[32..64]  = 4*2-0 = 8.0
+        // out[64..256] = 0.0
+        let scales: [u8; 12] = [8, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let qs = [0x22u8; 128];
+        let block = make_q4_k_block(1.0, 1.0, &scales, &qs);
+        let out = dequant_to_f32(&block, GgmlType::Q4_K).unwrap();
+        assert_eq!(out.len(), 256);
+        for (i, &v) in out.iter().enumerate() {
+            let expected = if i < 32 {
+                16.0f32
+            } else if i < 64 {
+                8.0
+            } else {
+                0.0
+            };
+            assert!(
+                (v - expected).abs() < 1e-4,
+                "out[{i}]={v} esperado={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4_k_bad_size_returns_error() {
+        assert!(dequant_to_f32(&[0u8; 143], GgmlType::Q4_K).is_err());
     }
 }
