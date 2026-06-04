@@ -9,4 +9,5 @@ mod model;
 mod ops;
 mod weights;
 
+pub use config::LlamaConfig;
 pub use error::ModelError;
