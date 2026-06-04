@@ -61,6 +61,10 @@ pub(crate) struct LayerWeights {
     pub attn_q: RawTensor,
     pub attn_k: RawTensor,
     pub attn_v: RawTensor,
+    /// Bias de atenção Q/K/V — presente em Qwen2, ausente em Llama.
+    pub attn_q_bias: Option<RawTensor>,
+    pub attn_k_bias: Option<RawTensor>,
+    pub attn_v_bias: Option<RawTensor>,
     pub attn_output: RawTensor,
     pub ffn_norm: RawTensor,
     pub ffn_gate: RawTensor,
@@ -86,6 +90,16 @@ fn tensor_raw(f: &GgufFile, bytes: &[u8], name: &str) -> Result<RawTensor, Model
     Ok(RawTensor::new(raw.to_vec(), info.ggml_type))
 }
 
+fn tensor_raw_opt(f: &GgufFile, bytes: &[u8], name: &str) -> Result<Option<RawTensor>, ModelError> {
+    match f.tensors.iter().find(|t| t.name == name) {
+        Some(info) => {
+            let raw = f.tensor_data(bytes, info)?;
+            Ok(Some(RawTensor::new(raw.to_vec(), info.ggml_type)))
+        }
+        None => Ok(None),
+    }
+}
+
 impl Weights {
     /// Lê todos os tensores (qualquer tipo suportado pelo dispatcher de dequant).
     pub fn from_gguf(f: &GgufFile, bytes: &[u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
@@ -97,6 +111,9 @@ impl Weights {
                 attn_q: tensor_raw(f, bytes, &p("attn_q.weight"))?,
                 attn_k: tensor_raw(f, bytes, &p("attn_k.weight"))?,
                 attn_v: tensor_raw(f, bytes, &p("attn_v.weight"))?,
+                attn_q_bias: tensor_raw_opt(f, bytes, &p("attn_q.bias"))?,
+                attn_k_bias: tensor_raw_opt(f, bytes, &p("attn_k.bias"))?,
+                attn_v_bias: tensor_raw_opt(f, bytes, &p("attn_v.bias"))?,
                 attn_output: tensor_raw(f, bytes, &p("attn_output.weight"))?,
                 ffn_norm: tensor_raw(f, bytes, &p("ffn_norm.weight"))?,
                 ffn_gate: tensor_raw(f, bytes, &p("ffn_gate.weight"))?,
@@ -157,6 +174,41 @@ mod tests {
             ptr1, ptr2,
             "segunda chamada deve reusar a cache (mesmo ponteiro)"
         );
+    }
+
+    #[test]
+    fn qwen2_loads_attn_biases() {
+        let Ok(bytes) = std::fs::read(Path::new("../../models/qwen2.5-0.5b-instruct-q8_0.gguf"))
+        else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let f = GgufFile::parse(&bytes).unwrap();
+        let cfg = LlamaConfig::from_gguf(&f).unwrap();
+        let w = Weights::from_gguf(&f, &bytes, &cfg).unwrap();
+        let l0 = &w.layers[0];
+        assert!(l0.attn_q_bias.is_some(), "Qwen2 deve ter attn_q_bias");
+        assert!(l0.attn_k_bias.is_some(), "Qwen2 deve ter attn_k_bias");
+        assert!(l0.attn_v_bias.is_some(), "Qwen2 deve ter attn_v_bias");
+        assert_eq!(l0.attn_q_bias.as_ref().unwrap().n_elements(), cfg.n_embd);
+        assert_eq!(
+            l0.attn_k_bias.as_ref().unwrap().n_elements(),
+            cfg.n_head_kv * cfg.head_dim
+        );
+    }
+
+    #[test]
+    fn stories260k_has_no_attn_biases() {
+        let Ok(bytes) = std::fs::read(Path::new("../../models/stories260K.gguf")) else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let f = GgufFile::parse(&bytes).unwrap();
+        let cfg = LlamaConfig::from_gguf(&f).unwrap();
+        let w = Weights::from_gguf(&f, &bytes, &cfg).unwrap();
+        assert!(w.layers[0].attn_q_bias.is_none());
+        assert!(w.layers[0].attn_k_bias.is_none());
+        assert!(w.layers[0].attn_v_bias.is_none());
     }
 
     #[test]

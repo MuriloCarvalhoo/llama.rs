@@ -9,6 +9,16 @@ use crate::error::ModelError;
 use crate::ops::{argmax, embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm, swiglu};
 use crate::weights::Weights;
 
+/// Soma `bias` (shape `dim`) a cada linha de `x` (shape `n_tok × dim`).
+fn add_bias(x: &mut [f32], bias: &[f32], dim: usize, n_tok: usize) {
+    for t in 0..n_tok {
+        let row = &mut x[t * dim..(t + 1) * dim];
+        for (xi, &bi) in row.iter_mut().zip(bias.iter()) {
+            *xi += bi;
+        }
+    }
+}
+
 /// Modelo carregado: config + pesos raw (quantizados ou f32).
 pub struct Model {
     pub config: LlamaConfig,
@@ -93,7 +103,17 @@ impl Model {
 
             let mut q = matmul(attn_q_w, &attn_in, c.n_embd, c.n_embd, n_tok);
             let mut k = matmul(attn_k_w, &attn_in, c.n_embd, kv_dim, n_tok);
-            let v = matmul(attn_v_w, &attn_in, c.n_embd, kv_dim, n_tok);
+            let mut v = matmul(attn_v_w, &attn_in, c.n_embd, kv_dim, n_tok);
+
+            if let Some(b) = &lw.attn_q_bias {
+                add_bias(&mut q, b.dequant_to_f32()?, c.n_embd, n_tok);
+            }
+            if let Some(b) = &lw.attn_k_bias {
+                add_bias(&mut k, b.dequant_to_f32()?, kv_dim, n_tok);
+            }
+            if let Some(b) = &lw.attn_v_bias {
+                add_bias(&mut v, b.dequant_to_f32()?, kv_dim, n_tok);
+            }
 
             rope_norm(
                 &mut q,
@@ -207,6 +227,26 @@ mod tests {
         );
         let q_sum: f32 = q.iter().sum();
         assert!((q_sum - 148.969_82).abs() < 1e-1, "q_sum={q_sum}");
+    }
+
+    #[test]
+    fn qwen_forward_bos_does_not_panic() {
+        let Ok(bytes) = std::fs::read(Path::new("../../models/qwen2.5-0.5b-instruct-q8_0.gguf"))
+        else {
+            eprintln!("qwen ausente — pulando");
+            return;
+        };
+        let f = GgufFile::parse(&bytes).unwrap();
+        let cfg = LlamaConfig::from_gguf(&f).unwrap();
+        let m = Model::load_with_config(&f, &bytes, cfg).unwrap();
+        let mut cache = m.new_cache();
+        let result = m.forward_argmax(&[m.config.bos_id], &mut cache);
+        assert!(
+            result.is_ok(),
+            "forward qwen2 deve retornar Ok: {:?}",
+            result.err()
+        );
+        eprintln!("qwen2 forward BOS → token {}", result.unwrap());
     }
 
     #[test]

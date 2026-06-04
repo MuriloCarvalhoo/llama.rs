@@ -17,29 +17,8 @@ fn qwen_q8_0_loads_without_error() {
     };
     let f = GgufFile::parse(&bytes).expect("parse GGUF");
 
-    // Tenta LlamaConfig; divergências de hparams são registradas e o teste pula.
-    let cfg = match LlamaConfig::from_gguf(&f) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "qwen config falhou ({e}) — arquitetura divergente, pulando (esperado até Fase 7)"
-            );
-            return;
-        }
-    };
-
-    let model = match Model::load_with_config(&f, &bytes, cfg) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("qwen load falhou ({e}) — registrar e investigar");
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("não suportado"),
-                "tipo de quant não suportado detectado: {msg}"
-            );
-            return;
-        }
-    };
+    let cfg = LlamaConfig::from_gguf(&f).expect("qwen2 config deve carregar");
+    let model = Model::load_with_config(&f, &bytes, cfg).expect("qwen2 model deve carregar");
 
     let file_size = bytes.len();
     let mem = model.memory_bytes();
@@ -62,3 +41,6 @@ fn qwen_q8_0_loads_without_error() {
         mem as f64 / 1e6,
     );
 }
+
+// Inferência end-to-end requer tokenizador BPE (GPT2), ainda não suportado.
+// O teste de forward com token raw fica em model.rs (pub(crate)).
