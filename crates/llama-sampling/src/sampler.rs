@@ -18,11 +18,16 @@ pub enum Sampler {
 
 impl Sampler {
     /// Retorna o índice do token amostrado dado o vetor de logits.
-    pub fn sample(&self, logits: &[f32], _rng: &mut impl Rng) -> usize {
+    pub fn sample(&self, logits: &[f32], rng: &mut impl Rng) -> usize {
         match self {
             Sampler::Greedy => argmax(logits),
             Sampler::Temperature { temp } => {
-                todo!("implementado na Task 1: temp={temp}")
+                if *temp == 0.0 {
+                    return argmax(logits);
+                }
+                let scaled: Vec<f32> = logits.iter().map(|&l| l / temp).collect();
+                let probs = softmax(&scaled);
+                sample_multinomial(&probs, rng)
             }
             Sampler::TopK { k, temp } => {
                 todo!("implementado na Task 2: k={k} temp={temp}")
@@ -42,7 +47,6 @@ pub(crate) fn argmax(logits: &[f32]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
-#[allow(dead_code)]
 pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits
         .iter()
@@ -53,7 +57,6 @@ pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
-#[allow(dead_code)]
 pub(crate) fn sample_multinomial(probs: &[f32], rng: &mut impl Rng) -> usize {
     let r: f32 = rng.random();
     let mut cumsum = 0.0f32;
@@ -129,6 +132,40 @@ mod tests {
         assert!(
             counts[1] > counts[0] && counts[1] > counts[2],
             "index 1 (60%) should win most: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn temperature_zero_is_greedy() {
+        let logits = vec![1.0_f32, 5.0, 2.0];
+        let mut rng = SmallRng::seed_from_u64(42);
+        let sampler = Sampler::Temperature { temp: 0.0 };
+        assert_eq!(sampler.sample(&logits, &mut rng), 1);
+    }
+
+    #[test]
+    fn temperature_skewed_picks_dominant() {
+        // With very low temp, dominant logit (index 2 = 100.0) should win almost always
+        let logits = vec![0.0_f32, 0.0, 100.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::Temperature { temp: 0.1 };
+        let result = sampler.sample(&logits, &mut rng);
+        assert_eq!(result, 2, "dominant logit should win at low temperature");
+    }
+
+    #[test]
+    fn temperature_uniform_shows_variety() {
+        // Equal logits + high temperature → all 3 indices appear in 300 samples
+        let logits = vec![1.0_f32, 1.0, 1.0];
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = Sampler::Temperature { temp: 1.0 };
+        let mut seen = [false; 3];
+        for _ in 0..300 {
+            seen[sampler.sample(&logits, &mut rng)] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "all indices should appear with uniform logits at temp=1.0"
         );
     }
 }
