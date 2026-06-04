@@ -15,6 +15,14 @@ const CORPUS: &[&str] = &[
     "Hello world",
     "The quick brown fox jumps over the lazy dog",
     "Era uma vez uma menina",
+    "  leading spaces",
+    "trailing spaces   ",
+    "multiple    internal    spaces",
+    "café résumé naïve",
+    "Tab\tand\nnewline",
+    "MiXeD CaSe 123!?",
+    ".",
+    "123456789",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
