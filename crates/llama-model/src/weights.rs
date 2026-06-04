@@ -15,7 +15,9 @@ pub(crate) struct RawTensor {
 impl RawTensor {
     /// Número de elementos (não de bytes).
     pub fn n_elements(&self) -> usize {
+        #[allow(clippy::cast_possible_truncation)]
         let bs = self.ty.block_size() as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let ts = self.ty.type_size() as usize;
         if ts == 0 {
             return 0;
@@ -119,7 +121,7 @@ impl Weights {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use std::path::Path;

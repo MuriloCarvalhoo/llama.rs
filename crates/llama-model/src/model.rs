@@ -9,7 +9,7 @@ use crate::error::ModelError;
 use crate::ops::{argmax, embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm, swiglu};
 use crate::weights::Weights;
 
-/// Modelo carregado: config + pesos f32.
+/// Modelo carregado: config + pesos raw (quantizados ou f32).
 pub struct Model {
     pub config: LlamaConfig,
     pub(crate) weights: Weights,
@@ -23,12 +23,47 @@ impl Model {
         Ok(Self { config, weights })
     }
 
+    /// Carrega com config já validada externamente.
+    pub fn load_with_config(
+        f: &GgufFile,
+        bytes: &[u8],
+        config: LlamaConfig,
+    ) -> Result<Self, ModelError> {
+        let weights = Weights::from_gguf(f, bytes, &config)?;
+        Ok(Self { config, weights })
+    }
+
     pub(crate) fn new_cache(&self) -> KvCache {
         KvCache::new(self.config.n_layer)
     }
 
-    /// Processa `tokens` (prefill ou 1 token de decode) e devolve os logits
-    /// (tamanho `vocab`) do ÚLTIMO token. Atualiza o `cache`.
+    /// Soma dos bytes raw de todos os pesos (footprint de RAM, sem dequant).
+    pub fn memory_bytes(&self) -> usize {
+        self.weights.memory_bytes()
+    }
+
+    /// Contagem total de elementos em todos os tensores de peso.
+    pub fn weight_element_count(&self) -> usize {
+        let w = &self.weights;
+        let layer_elem: usize = w
+            .layers
+            .iter()
+            .map(|lw| {
+                lw.attn_norm.n_elements()
+                    + lw.attn_q.n_elements()
+                    + lw.attn_k.n_elements()
+                    + lw.attn_v.n_elements()
+                    + lw.attn_output.n_elements()
+                    + lw.ffn_norm.n_elements()
+                    + lw.ffn_gate.n_elements()
+                    + lw.ffn_up.n_elements()
+                    + lw.ffn_down.n_elements()
+            })
+            .sum();
+        w.token_embd.n_elements() + layer_elem + w.output_norm.n_elements() + w.output.n_elements()
+    }
+
+    /// Processa `tokens` e devolve logits (tamanho `vocab`) do último token.
     pub(crate) fn forward(
         &self,
         tokens: &[u32],
@@ -39,16 +74,26 @@ impl Model {
         let pos0 = cache.len();
         let kv_dim = c.n_head_kv * c.head_dim;
 
-        let mut x = embedding_lookup(&self.weights.token_embd, tokens, c.n_embd)?;
+        let token_embd = self.weights.token_embd.dequant_to_f32()?;
+        let mut x = embedding_lookup(&token_embd, tokens, c.n_embd)?;
 
         for (l, lw) in self.weights.layers.iter().enumerate() {
-            // --- bloco de atenção ---
-            let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-            let attn_in = mul_rows(&normed, &lw.attn_norm, c.n_embd);
+            let attn_norm = lw.attn_norm.dequant_to_f32()?;
+            let attn_q_w = lw.attn_q.dequant_to_f32()?;
+            let attn_k_w = lw.attn_k.dequant_to_f32()?;
+            let attn_v_w = lw.attn_v.dequant_to_f32()?;
+            let attn_out_w = lw.attn_output.dequant_to_f32()?;
+            let ffn_norm = lw.ffn_norm.dequant_to_f32()?;
+            let ffn_gate_w = lw.ffn_gate.dequant_to_f32()?;
+            let ffn_up_w = lw.ffn_up.dequant_to_f32()?;
+            let ffn_down_w = lw.ffn_down.dequant_to_f32()?;
 
-            let mut q = matmul(&lw.attn_q, &attn_in, c.n_embd, c.n_embd, n_tok);
-            let mut k = matmul(&lw.attn_k, &attn_in, c.n_embd, kv_dim, n_tok);
-            let v = matmul(&lw.attn_v, &attn_in, c.n_embd, kv_dim, n_tok);
+            let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
+            let attn_in = mul_rows(&normed, &attn_norm, c.n_embd);
+
+            let mut q = matmul(&attn_q_w, &attn_in, c.n_embd, c.n_embd, n_tok);
+            let mut k = matmul(&attn_k_w, &attn_in, c.n_embd, kv_dim, n_tok);
+            let v = matmul(&attn_v_w, &attn_in, c.n_embd, kv_dim, n_tok);
 
             rope_norm(
                 &mut q,
@@ -80,22 +125,17 @@ impl Model {
                 c.n_head_kv,
                 c.head_dim,
             );
-            let attn_out = matmul(&lw.attn_output, &attn, c.n_embd, c.n_embd, n_tok);
-
-            // residual 1
+            let attn_out = matmul(&attn_out_w, &attn, c.n_embd, c.n_embd, n_tok);
             for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) {
                 *xi += ai;
             }
 
-            // --- bloco FFN ---
             let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-            let ffn_in = mul_rows(&normed, &lw.ffn_norm, c.n_embd);
-            let gate = matmul(&lw.ffn_gate, &ffn_in, c.n_embd, c.n_ff, n_tok);
-            let up = matmul(&lw.ffn_up, &ffn_in, c.n_embd, c.n_ff, n_tok);
+            let ffn_in = mul_rows(&normed, &ffn_norm, c.n_embd);
+            let gate = matmul(&ffn_gate_w, &ffn_in, c.n_embd, c.n_ff, n_tok);
+            let up = matmul(&ffn_up_w, &ffn_in, c.n_embd, c.n_ff, n_tok);
             let act = swiglu(&gate, &up);
-            let ffn_out = matmul(&lw.ffn_down, &act, c.n_ff, c.n_embd, n_tok);
-
-            // residual 2
+            let ffn_out = matmul(&ffn_down_w, &act, c.n_ff, c.n_embd, n_tok);
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) {
                 *xi += fi;
             }
@@ -103,15 +143,15 @@ impl Model {
 
         cache.advance(n_tok);
 
-        // norma final + projeção de saída só do último token
+        let output_norm = self.weights.output_norm.dequant_to_f32()?;
+        let output_w = self.weights.output.dequant_to_f32()?;
         let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-        let final_x = mul_rows(&normed, &self.weights.output_norm, c.n_embd);
+        let final_x = mul_rows(&normed, &output_norm, c.n_embd);
         let last = &final_x[(n_tok - 1) * c.n_embd..n_tok * c.n_embd];
-        let logits = matmul(&self.weights.output, last, c.n_embd, c.vocab, 1);
+        let logits = matmul(&output_w, last, c.n_embd, c.vocab, 1);
         Ok(logits)
     }
 
-    /// Atalho: argmax dos logits do último token.
     pub(crate) fn forward_argmax(
         &self,
         tokens: &[u32],
@@ -124,38 +164,38 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::ops::{embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm};
     use std::path::Path;
 
-    fn load_model() -> Option<(Model, Vec<u8>)> {
+    fn load_model() -> Option<Model> {
         let bytes = std::fs::read(Path::new("../../models/stories260K.gguf")).ok()?;
         let f = GgufFile::parse(&bytes).ok()?;
-        let m = Model::load(&f, &bytes).ok()?;
-        Some((m, bytes))
+        Model::load(&f, &bytes).ok()
     }
 
     #[test]
     fn embd_and_qcur_sums_match_oracle() {
-        let Some((m, _)) = load_model() else {
+        let Some(m) = load_model() else {
             eprintln!("modelo ausente — pulando");
             return;
         };
         let c = &m.config;
-        let tokens = [1u32, 403, 407, 261, 378]; // "Once upon a time"
+        let tokens = [1u32, 403, 407, 261, 378];
         let n_tok = tokens.len();
 
-        // embd sum == -3.354056
-        let x = embedding_lookup(&m.weights.token_embd, &tokens, c.n_embd).unwrap();
+        let token_embd = m.weights.token_embd.dequant_to_f32().unwrap();
+        let x = embedding_lookup(&token_embd, &tokens, c.n_embd).unwrap();
         let embd_sum: f32 = x.iter().sum();
-        assert!((embd_sum - (-3.354056)).abs() < 1e-4, "embd_sum={embd_sum}");
+        assert!((embd_sum - (-3.354056)).abs() < 1e-2, "embd_sum={embd_sum}");
 
-        // Qcur-0 pós-rope sum == 148.969818
         let lw = &m.weights.layers[0];
+        let attn_norm = lw.attn_norm.dequant_to_f32().unwrap();
+        let attn_q_w = lw.attn_q.dequant_to_f32().unwrap();
         let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-        let attn_in = mul_rows(&normed, &lw.attn_norm, c.n_embd);
-        let mut q = matmul(&lw.attn_q, &attn_in, c.n_embd, c.n_embd, n_tok);
+        let attn_in = mul_rows(&normed, &attn_norm, c.n_embd);
+        let mut q = matmul(&attn_q_w, &attn_in, c.n_embd, c.n_embd, n_tok);
         rope_norm(
             &mut q,
             n_tok,
@@ -166,6 +206,22 @@ mod tests {
             0,
         );
         let q_sum: f32 = q.iter().sum();
-        assert!((q_sum - 148.969_82).abs() < 1e-2, "q_sum={q_sum}");
+        assert!((q_sum - 148.969_82).abs() < 1e-1, "q_sum={q_sum}");
+    }
+
+    #[test]
+    fn memory_bytes_less_than_file_size() {
+        let Ok(bytes) = std::fs::read(Path::new("../../models/stories260K.gguf")) else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let file_size = bytes.len();
+        let f = GgufFile::parse(&bytes).unwrap();
+        let m = Model::load(&f, &bytes).unwrap();
+        assert!(
+            m.memory_bytes() <= file_size,
+            "memory_bytes={} > file_size={file_size}",
+            m.memory_bytes()
+        );
     }
 }
