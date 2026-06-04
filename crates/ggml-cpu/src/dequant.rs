@@ -69,10 +69,29 @@ fn dequant_q8_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     Ok(out)
 }
-fn dequant_q4_0(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    Err(DequantError::UnsupportedType(
-        "Q4_0 (stub — implementado na Task 2)".to_owned(),
-    ))
+fn dequant_q4_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 18; // 2 (f16) + 16 (nibbles)
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q4_0",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 32];
+    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let base = bi * 32;
+        for j in 0..16 {
+            let q = b[2 + j];
+            let x0 = i32::from(q & 0x0F) - 8;
+            let x1 = i32::from(q >> 4) - 8;
+            out[base + j] = x0 as f32 * d;
+            out[base + j + 16] = x1 as f32 * d;
+        }
+    }
+    Ok(out)
 }
 fn dequant_q4_k(_bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     Err(DequantError::UnsupportedType(
@@ -149,5 +168,36 @@ mod tests {
     #[test]
     fn q8_0_bad_size_returns_error() {
         assert!(dequant_to_f32(&[0u8; 33], GgmlType::Q8_0).is_err());
+    }
+
+    fn make_q4_0_block(d: f32, qs: &[u8; 16]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(18);
+        b.extend_from_slice(&f16_bytes(d));
+        b.extend_from_slice(qs);
+        b
+    }
+
+    #[test]
+    fn q4_0_single_block() {
+        // d=1.0; qs[0]=0x89 → lower=9,x0=1 → out[0]=1.0; upper=8,x1=0; resto 0x88→zeros
+        let mut qs = [0x88u8; 16];
+        qs[0] = 0x89;
+        let block = make_q4_0_block(1.0, &qs);
+        let out = dequant_to_f32(&block, GgmlType::Q4_0).unwrap();
+        assert_eq!(out.len(), 32);
+        assert!((out[0] - 1.0).abs() < 1e-5, "out[0]={}", out[0]);
+        assert!(
+            out[1..16].iter().all(|&v| v == 0.0),
+            "out[1..16] deve ser zero"
+        );
+        assert!(
+            out[16..].iter().all(|&v| v == 0.0),
+            "out[16..] deve ser zero"
+        );
+    }
+
+    #[test]
+    fn q4_0_bad_size_returns_error() {
+        assert!(dequant_to_f32(&[0u8; 17], GgmlType::Q4_0).is_err());
     }
 }
