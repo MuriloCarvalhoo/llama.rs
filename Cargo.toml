@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["oracle", "crates/gguf", "crates/llama-tokenizer"]
+members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-model"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ thiserror = "2"
 serde_json = "1"
 proptest = "1"
 gguf = { path = "crates/gguf" }
+llama-tokenizer = { path = "crates/llama-tokenizer" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
