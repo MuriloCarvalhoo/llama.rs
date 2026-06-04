@@ -1,19 +1,32 @@
 //! Pesos quantizados do GGUF armazenados em bytes raw; dequantizados sob demanda.
 
-use ggml_cpu::dequant_to_f32;
+use std::cell::OnceCell;
+
+use ggml_cpu::dequant_to_f32 as dequant_impl;
 use gguf::{GgufFile, TensorInfo};
 
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
 
 /// Tensor raw: bytes tal como lidos do GGUF + tipo de dado para dequant.
+/// Primeira chamada a `dequant_to_f32` dequantiza e cacheia em memória;
+/// chamadas subsequentes retornam `&[f32]` sem realocar.
 pub(crate) struct RawTensor {
     pub bytes: Vec<u8>,
     pub ty: gguf::GgmlType,
+    f32_cache: OnceCell<Vec<f32>>,
 }
 
 impl RawTensor {
-    /// Número de elementos (não de bytes).
+    pub(crate) fn new(bytes: Vec<u8>, ty: gguf::GgmlType) -> Self {
+        Self {
+            bytes,
+            ty,
+            f32_cache: OnceCell::new(),
+        }
+    }
+
+    /// Número de elementos lógicos (não de bytes).
     pub fn n_elements(&self) -> usize {
         #[allow(clippy::cast_possible_truncation)]
         let bs = self.ty.block_size() as usize;
@@ -25,14 +38,20 @@ impl RawTensor {
         (self.bytes.len() / ts) * bs
     }
 
-    /// Bytes raw (footprint de RAM — quantizado).
+    /// Bytes raw (footprint de RAM — quantizado, sem dequant).
     pub fn memory_bytes(&self) -> usize {
         self.bytes.len()
     }
 
-    /// Dequantiza para f32 (alocação sob demanda).
-    pub fn dequant_to_f32(&self) -> Result<Vec<f32>, ModelError> {
-        Ok(dequant_to_f32(&self.bytes, self.ty)?)
+    /// Dequantiza para f32 e cacheia. Primeira chamada: O(n). Subsequentes: O(1).
+    pub fn dequant_to_f32(&self) -> Result<&[f32], ModelError> {
+        if let Some(cached) = self.f32_cache.get() {
+            return Ok(cached.as_slice());
+        }
+        let v = dequant_impl(&self.bytes, self.ty).map_err(ModelError::from)?;
+        let _ = self.f32_cache.set(v);
+        // SAFETY: we just set the value above; get() is guaranteed to return Some.
+        Ok(self.f32_cache.get().map_or(&[], Vec::as_slice))
     }
 }
 
@@ -64,10 +83,7 @@ fn tensor_raw(f: &GgufFile, bytes: &[u8], name: &str) -> Result<RawTensor, Model
         .find(|t| t.name == name)
         .ok_or_else(|| ModelError::MissingTensor(name.to_owned()))?;
     let raw = f.tensor_data(bytes, info)?;
-    Ok(RawTensor {
-        bytes: raw.to_vec(),
-        ty: info.ggml_type,
-    })
+    Ok(RawTensor::new(raw.to_vec(), info.ggml_type))
 }
 
 impl Weights {
@@ -125,6 +141,23 @@ impl Weights {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn dequant_cache_second_call_returns_same_pointer() {
+        let Ok(bytes) = std::fs::read(Path::new("../../models/stories260K.gguf")) else {
+            eprintln!("modelo ausente — pulando");
+            return;
+        };
+        let f = GgufFile::parse(&bytes).unwrap();
+        let cfg = LlamaConfig::from_gguf(&f).unwrap();
+        let w = Weights::from_gguf(&f, &bytes, &cfg).unwrap();
+        let ptr1 = w.token_embd.dequant_to_f32().unwrap().as_ptr();
+        let ptr2 = w.token_embd.dequant_to_f32().unwrap().as_ptr();
+        assert_eq!(
+            ptr1, ptr2,
+            "segunda chamada deve reusar a cache (mesmo ponteiro)"
+        );
+    }
 
     #[test]
     fn loads_all_weights_with_expected_element_counts() {
