@@ -11,6 +11,7 @@ llama-tokenizer.workspace = true
 llama-sampling.workspace = true
 rand.workspace = true
 rayon.workspace = true
+half.workspace = true
 
 [lints]
 workspace = true

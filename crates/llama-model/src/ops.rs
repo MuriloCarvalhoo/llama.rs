@@ -72,6 +72,63 @@ pub(crate) fn matmul(w: &[f32], x: &[f32], n_in: usize, n_out: usize, n_tok: usi
     out
 }
 
+/// MUL_MAT direto em bytes Q8_0 — sem expandir para f32.
+///
+/// Layout W: `n_out` linhas × `(n_in/32)` blocos × 34 bytes/bloco.
+/// Bloco: 2 bytes (f16 LE scale `d`) + 32 bytes (i8 quants).
+/// `n_in` deve ser múltiplo de 32 (garantido pelo formato GGUF).
+pub(crate) fn matmul_q8_0(
+    w: &[u8],
+    x: &[f32],
+    n_in: usize,
+    n_out: usize,
+    n_tok: usize,
+) -> Vec<f32> {
+    const Q: usize = 32;
+    const B: usize = 34;
+    debug_assert_eq!(n_in % Q, 0, "n_in deve ser múltiplo de 32");
+
+    let n_blocks = n_in / Q;
+    let row_bytes = n_blocks * B;
+    let mut out = vec![0.0f32; n_tok * n_out];
+
+    for t in 0..n_tok {
+        let x_row = &x[t * n_in..(t + 1) * n_in];
+        let o_row = &mut out[t * n_out..(t + 1) * n_out];
+
+        if n_out >= PAR_MIN_N_OUT {
+            o_row.par_iter_mut().enumerate().for_each(|(j, o)| {
+                *o = q8_0_dot(&w[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
+            });
+        } else {
+            for (j, o) in o_row.iter_mut().enumerate() {
+                *o = q8_0_dot(&w[j * row_bytes..(j + 1) * row_bytes], x_row, n_blocks);
+            }
+        }
+    }
+    out
+}
+
+#[inline]
+fn q8_0_dot(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
+    const Q: usize = 32;
+    const B: usize = 34;
+    let mut acc = 0.0f32;
+    for b in 0..n_blocks {
+        let blk = &w_row[b * B..(b + 1) * B];
+        let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+        let qs = &blk[2..34];
+        let x_blk = &x_row[b * Q..(b + 1) * Q];
+        let dot: f32 = qs
+            .iter()
+            .zip(x_blk.iter())
+            .map(|(&q, &xv)| q.cast_signed() as f32 * xv)
+            .sum();
+        acc += d * dot;
+    }
+    acc
+}
+
 /// RoPE NORM (arch llama): rotaciona pares (2i,2i+1) de cada head.
 /// `θ_i = pos * freq_base^(-2i/rope_dim)`, para i em 0..rope_dim/2.
 pub(crate) fn rope_norm(
@@ -236,5 +293,50 @@ mod tests {
     #[test]
     fn argmax_picks_first_max() {
         assert_eq!(argmax(&[0.1, 0.9, 0.9, 0.2]), 1);
+    }
+
+    #[test]
+    fn matmul_q8_0_matches_manual() {
+        // 2 rows × 1 block Q8_0 (n_in=32, n_out=2, n_tok=1)
+        // row 0: d=1.0, qs=[1,2,0×30] → dot(x) = 1×1 + 2×2 = 5 → out=5.0
+        // row 1: d=2.0, qs=[1,0×31]   → dot(x) = 1×1       = 1 → out=2.0
+        fn f16_le(v: f32) -> [u8; 2] {
+            half::f16::from_f32(v).to_bits().to_le_bytes()
+        }
+        let mut w = Vec::with_capacity(68);
+        w.extend_from_slice(&f16_le(1.0));
+        w.push(1u8);
+        w.push(2u8);
+        w.extend(std::iter::repeat(0u8).take(30));
+        w.extend_from_slice(&f16_le(2.0));
+        w.push(1u8);
+        w.extend(std::iter::repeat(0u8).take(31));
+
+        let x: Vec<f32> = (1..=32).map(|i| i as f32).collect();
+        let out = matmul_q8_0(&w, &x, 32, 2, 1);
+
+        assert!((out[0] - 5.0).abs() < 1e-4, "out[0]={}", out[0]);
+        assert!((out[1] - 2.0).abs() < 1e-4, "out[1]={}", out[1]);
+    }
+
+    #[test]
+    fn matmul_q8_0_two_tokens() {
+        // n_in=32, n_out=1, n_tok=2; d=1.0, qs=[1,0×31]
+        fn f16_le(v: f32) -> [u8; 2] {
+            half::f16::from_f32(v).to_bits().to_le_bytes()
+        }
+        let mut w = Vec::with_capacity(34);
+        w.extend_from_slice(&f16_le(1.0));
+        w.push(1u8);
+        w.extend(std::iter::repeat(0u8).take(31));
+
+        let mut x = vec![0.0f32; 64];
+        x[0] = 3.0; // token 0, dim 0
+        x[32] = 7.0; // token 1, dim 0
+
+        let out = matmul_q8_0(&w, &x, 32, 1, 2);
+
+        assert!((out[0] - 3.0).abs() < 1e-4, "t0={}", out[0]);
+        assert!((out[1] - 7.0).abs() < 1e-4, "t1={}", out[1]);
     }
 }
