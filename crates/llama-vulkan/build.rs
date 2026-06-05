@@ -28,6 +28,7 @@ fn main() {
         )
         .unwrap_or_else(|e| panic!("Falha ao compilar shader: {e}"));
 
-    std::fs::write(&spv_path, artifact.as_binary_u8()).unwrap();
+    std::fs::write(&spv_path, artifact.as_binary_u8())
+        .unwrap_or_else(|e| panic!("falha ao escrever {}: {e}", spv_path.display()));
     println!("cargo:rustc-env=Q8_0_MATVEC_SPV={}", spv_path.display());
 }

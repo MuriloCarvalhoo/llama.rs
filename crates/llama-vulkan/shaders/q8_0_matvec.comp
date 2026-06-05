@@ -5,6 +5,8 @@
 // Workgroup = um wave64 (64 lanes) computa UM elemento de saida (uma linha de W . x).
 // gfx906 (MI50) tem wave64 nativo; local_size_x=64 garante um workgroup = uma wave.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// AVISO: assume gl_SubgroupSize == 64 (wave64, gfx906/MI50).
+// Em hardware wave32 este shader produz resultado incorreto.
 
 // W: pesos Q8_0 row-major. Cada linha = n_blocks x 34 bytes (2 bytes f16 scale + 32 bytes i8).
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uint8_t w[]; } weight_buf;

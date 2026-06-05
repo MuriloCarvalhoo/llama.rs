@@ -10,5 +10,5 @@ pub use device::{VulkanContext, VulkanDevice};
 pub use dual_gpu::DualGpuMatmul;
 pub use model_gpu::GpuWeights;
 
-pub(crate) const Q8_0_MATVEC_SPV: &[u8] =
-    include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
+#[allow(dead_code)]
+pub(crate) const Q8_0_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
