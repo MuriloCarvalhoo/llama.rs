@@ -10,6 +10,7 @@ ggml-cpu.workspace = true
 llama-tokenizer.workspace = true
 llama-sampling.workspace = true
 rand.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true
