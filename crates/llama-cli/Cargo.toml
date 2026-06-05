@@ -15,6 +15,11 @@ llama-model.workspace = true
 llama-sampling.workspace = true
 rand.workspace = true
 clap = { version = "4", features = ["derive"] }
+rayon.workspace = true
+llama-vulkan = { path = "../llama-vulkan", optional = true }
+
+[features]
+gpu = ["llama-vulkan"]
 
 [lints]
 workspace = true

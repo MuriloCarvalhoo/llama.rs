@@ -42,4 +42,8 @@ pub struct Args {
     /// Imprimir tempo de geracao (tokens/seg) ao final para stderr
     #[arg(long)]
     pub timings: bool,
+
+    /// Habilita backend Vulkan dual-GPU (requer duas AMD MI50 e feature "gpu").
+    #[arg(long, default_value = "false")]
+    pub gpu: bool,
 }
