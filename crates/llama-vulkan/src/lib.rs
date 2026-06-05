@@ -1,4 +1,4 @@
-mod alloc;
+pub mod alloc;
 mod device;
 mod dual_gpu;
 mod matmul;

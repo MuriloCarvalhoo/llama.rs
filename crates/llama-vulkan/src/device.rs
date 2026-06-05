@@ -142,6 +142,11 @@ pub struct VulkanDevice {
 }
 
 impl VulkanDevice {
+    /// Retorna referencia ao `ash::Device` logico.
+    pub fn as_device(&self) -> &ash::Device {
+        &self.device
+    }
+
     pub fn create(ctx: &VulkanContext, phys: &VulkanPhysicalDevice) -> Result<Self, vk::Result> {
         let queue_priority = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo {
