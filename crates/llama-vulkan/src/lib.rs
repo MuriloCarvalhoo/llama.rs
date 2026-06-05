@@ -1,12 +1,12 @@
 pub mod alloc;
 mod device;
 mod dual_gpu;
-mod matmul;
+pub mod matmul;
 mod model_gpu;
-mod pipeline;
+pub(crate) mod pipeline;
 pub mod tensor;
 
-pub use device::{VulkanContext, VulkanDevice};
+pub use device::{VulkanContext, VulkanDevice, VulkanPhysicalDevice};
 pub use dual_gpu::DualGpuMatmul;
 pub use model_gpu::GpuWeights;
 

@@ -141,3 +141,49 @@ fn upload_tensor_q8_0_para_vram() {
     eprintln!("Upload OK: {}x{} Q8_0 ({} bytes)", n_out, n_in, bytes.len());
     tensor.destroy(dev.as_device());
 }
+
+#[test]
+fn matmul_gpu_matches_cpu_reference() {
+    let ctx = match VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        return;
+    }
+    let dev = VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    // n_in=32, n_out=4, n_blocks=1
+    // row 0: scale=1.0f16, qs[0]=1, resto 0 -> y[0] = 1.0 * 1 * x[0] = 5.0
+    // row 1: scale=2.0f16, qs[0]=1, resto 0 -> y[1] = 2.0 * 1 * x[0] = 10.0
+    let n_in = 32usize;
+    let n_out = 4usize;
+    let row_bytes = 1 * 34; // 1 bloco
+    let mut w_bytes = vec![0u8; n_out * row_bytes];
+
+    // Escala f16 em little-endian: 1.0 = 0x3C00
+    let f16_bytes_1_0: [u8; 2] = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+    let f16_bytes_2_0: [u8; 2] = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+    w_bytes[0..2].copy_from_slice(&f16_bytes_1_0);
+    w_bytes[2] = 1; // qs[0] = 1
+    w_bytes[row_bytes..row_bytes + 2].copy_from_slice(&f16_bytes_2_0);
+    w_bytes[row_bytes + 2] = 1; // qs[0] = 1
+
+    let x_f32 = vec![5.0f32; n_in];
+
+    use llama_vulkan::matmul::dispatch_q8_0_matvec;
+    let y = dispatch_q8_0_matvec(&ctx, &phys[0], &dev, &w_bytes, &x_f32, n_in, n_out)
+        .expect("matmul GPU falhou");
+
+    assert_eq!(y.len(), n_out);
+    assert!((y[0] - 5.0).abs() < 0.1, "y[0] esperado ~5.0, got {}", y[0]);
+    assert!(
+        (y[1] - 10.0).abs() < 0.1,
+        "y[1] esperado ~10.0, got {}",
+        y[1]
+    );
+    assert!(y[2].abs() < 0.1, "y[2] esperado ~0.0, got {}", y[2]);
+    assert!(y[3].abs() < 0.1, "y[3] esperado ~0.0, got {}", y[3]);
+    eprintln!("GPU matmul: y={:?}", y);
+}
