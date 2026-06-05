@@ -6,7 +6,7 @@ use gguf::GgufFile;
 use crate::attention::{KvCache, attention};
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
-use crate::ops::{argmax, embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm, swiglu};
+use crate::ops::{argmax, embedding_lookup, mul_rows, rmsnorm, rope_norm, swiglu};
 use crate::weights::Weights;
 
 /// Soma `bias` (shape `dim`) a cada linha de `x` (shape `n_tok × dim`).
@@ -91,21 +91,14 @@ impl Model {
 
         for (l, lw) in self.weights.layers.iter().enumerate() {
             let attn_norm = lw.attn_norm.dequant_to_f32()?;
-            let attn_q_w = lw.attn_q.dequant_to_f32()?;
-            let attn_k_w = lw.attn_k.dequant_to_f32()?;
-            let attn_v_w = lw.attn_v.dequant_to_f32()?;
-            let attn_out_w = lw.attn_output.dequant_to_f32()?;
             let ffn_norm = lw.ffn_norm.dequant_to_f32()?;
-            let ffn_gate_w = lw.ffn_gate.dequant_to_f32()?;
-            let ffn_up_w = lw.ffn_up.dequant_to_f32()?;
-            let ffn_down_w = lw.ffn_down.dequant_to_f32()?;
 
             let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
             let attn_in = mul_rows(&normed, attn_norm, c.n_embd);
 
-            let mut q = matmul(attn_q_w, &attn_in, c.n_embd, c.n_embd, n_tok);
-            let mut k = matmul(attn_k_w, &attn_in, c.n_embd, kv_dim, n_tok);
-            let mut v = matmul(attn_v_w, &attn_in, c.n_embd, kv_dim, n_tok);
+            let mut q = lw.attn_q.matmul_into(&attn_in, c.n_embd, c.n_embd, n_tok)?;
+            let mut k = lw.attn_k.matmul_into(&attn_in, c.n_embd, kv_dim, n_tok)?;
+            let mut v = lw.attn_v.matmul_into(&attn_in, c.n_embd, kv_dim, n_tok)?;
 
             if let Some(b) = &lw.attn_q_bias {
                 add_bias(&mut q, b.dequant_to_f32()?, c.n_embd, n_tok);
@@ -148,17 +141,19 @@ impl Model {
                 c.n_head_kv,
                 c.head_dim,
             );
-            let attn_out = matmul(attn_out_w, &attn, c.n_embd, c.n_embd, n_tok);
+            let attn_out = lw
+                .attn_output
+                .matmul_into(&attn, c.n_embd, c.n_embd, n_tok)?;
             for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) {
                 *xi += ai;
             }
 
             let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
             let ffn_in = mul_rows(&normed, ffn_norm, c.n_embd);
-            let gate = matmul(ffn_gate_w, &ffn_in, c.n_embd, c.n_ff, n_tok);
-            let up = matmul(ffn_up_w, &ffn_in, c.n_embd, c.n_ff, n_tok);
+            let gate = lw.ffn_gate.matmul_into(&ffn_in, c.n_embd, c.n_ff, n_tok)?;
+            let up = lw.ffn_up.matmul_into(&ffn_in, c.n_embd, c.n_ff, n_tok)?;
             let act = swiglu(&gate, &up);
-            let ffn_out = matmul(ffn_down_w, &act, c.n_ff, c.n_embd, n_tok);
+            let ffn_out = lw.ffn_down.matmul_into(&act, c.n_ff, c.n_embd, n_tok)?;
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) {
                 *xi += fi;
             }
@@ -167,11 +162,13 @@ impl Model {
         cache.advance(n_tok);
 
         let output_norm = self.weights.output_norm.dequant_to_f32()?;
-        let output_w = self.weights.output.dequant_to_f32()?;
         let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
         let final_x = mul_rows(&normed, output_norm, c.n_embd);
         let last = &final_x[(n_tok - 1) * c.n_embd..n_tok * c.n_embd];
-        let logits = matmul(output_w, last, c.n_embd, c.vocab, 1);
+        let logits = self
+            .weights
+            .output
+            .matmul_into(last, c.n_embd, c.vocab, 1)?;
         Ok(logits)
     }
 
