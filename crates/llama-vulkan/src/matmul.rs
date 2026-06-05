@@ -16,6 +16,18 @@ pub enum MatmulError {
     Vulkan(#[from] vk::Result),
 }
 
+/// Argumentos para `dispatch_inner`, agrupados para evitar `too_many_arguments`.
+pub(crate) struct DispatchArgs<'a> {
+    pub ctx: &'a VulkanContext,
+    pub phys: &'a VulkanPhysicalDevice,
+    pub dev: &'a VulkanDevice,
+    pub w_bytes: &'a [u8],
+    pub x_f32: &'a [f32],
+    pub n_in: usize,
+    pub row_offset: usize,
+    pub n_out_local: usize,
+}
+
 /// Executa Q8_0 matvec em GPU single-device.
 ///
 /// `w_bytes`: pesos Q8_0 row-major, n_out × (n_in/32 × 34) bytes.
@@ -30,28 +42,37 @@ pub fn dispatch_q8_0_matvec(
     n_in: usize,
     n_out: usize,
 ) -> Result<Vec<f32>, MatmulError> {
-    dispatch_inner(ctx, phys, dev, w_bytes, x_f32, n_in, n_out, 0, n_out)
+    dispatch_inner(DispatchArgs {
+        ctx,
+        phys,
+        dev,
+        w_bytes,
+        x_f32,
+        n_in,
+        row_offset: 0,
+        n_out_local: n_out,
+    })
 }
 
 /// Versão interna com row_offset para suporte a row-split (multi-GPU).
-pub(crate) fn dispatch_inner(
-    ctx: &VulkanContext,
-    phys: &VulkanPhysicalDevice,
-    dev: &VulkanDevice,
-    w_bytes: &[u8],
-    x_f32: &[f32],
-    n_in: usize,
-    _n_out_total: usize,
-    row_offset: usize,
-    n_out_local: usize,
-) -> Result<Vec<f32>, MatmulError> {
+pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulError> {
+    let DispatchArgs {
+        ctx,
+        phys,
+        dev,
+        w_bytes,
+        x_f32,
+        n_in,
+        row_offset,
+        n_out_local,
+    } = args;
     let d = &dev.device;
 
     // 1. Upload W (n_out_local linhas de pesos) via GpuTensor::upload_q8_0
     let w_tensor = GpuTensor::upload_q8_0(ctx, phys, dev, w_bytes, n_in, n_out_local)?;
 
     // 2. Upload X (activations f32) via staging → STORAGE_BUFFER
-    let x_size = (x_f32.len() * std::mem::size_of::<f32>()) as vk::DeviceSize;
+    let x_size = std::mem::size_of_val(x_f32) as vk::DeviceSize;
 
     let x_staging = create_buf(d, x_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
     let x_staging_mem = alloc_and_bind(ctx, phys, d, x_staging, true)?;

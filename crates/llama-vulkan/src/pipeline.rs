@@ -81,6 +81,7 @@ impl ComputePipeline {
         // 3. ShaderModule carregado do SPIR-V
         // Copia para Vec<u32> para garantir alinhamento a 4 bytes exigido por Vulkan.
         let spv = crate::Q8_0_MATVEC_SPV;
+        assert_eq!(spv.len() % 4, 0, "SPIR-V size deve ser multiplo de 4 bytes");
         let spv_u32: Vec<u32> = spv
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -94,11 +95,11 @@ impl ComputePipeline {
         let shader_module = unsafe { dev.create_shader_module(&shader_info, None)? };
 
         // 4. ComputePipelineCreateInfo → create_compute_pipelines
-        let entry_name = std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap();
+        let entry_point = c"main";
         let stage = vk::PipelineShaderStageCreateInfo {
             stage: vk::ShaderStageFlags::COMPUTE,
             module: shader_module,
-            p_name: entry_name.as_ptr(),
+            p_name: entry_point.as_ptr(),
             ..Default::default()
         };
         let pipeline_info = vk::ComputePipelineCreateInfo {
