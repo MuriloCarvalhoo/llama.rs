@@ -108,3 +108,36 @@ fn sub_allocator_chunks_independentes_para_tensores_grandes() {
 
     alloc.cleanup(dev.as_device());
 }
+
+#[test]
+fn upload_tensor_q8_0_para_vram() {
+    let ctx = match VulkanContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Vulkan nao disponivel: {e}");
+            return;
+        }
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        eprintln!("Nenhum device AMD -- pulando");
+        return;
+    }
+    let dev = VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    let n_out = 64usize;
+    let n_in = 128usize;
+    // Q8_0: cada bloco de 32 elementos = 2 bytes (scale f16) + 32 bytes (quants) = 34 bytes
+    let n_blocks = n_in / 32;
+    let row_bytes = n_blocks * 34;
+    let bytes: Vec<u8> = (0..n_out * row_bytes).map(|i| (i % 256) as u8).collect();
+
+    use llama_vulkan::tensor::GpuTensor;
+    let tensor =
+        GpuTensor::upload_q8_0(&ctx, &phys[0], &dev, &bytes, n_in, n_out).expect("upload falhou");
+    assert_eq!(tensor.n_out, n_out);
+    assert_eq!(tensor.n_in, n_in);
+    assert_eq!(tensor.size_bytes, bytes.len() as u64);
+    eprintln!("Upload OK: {}x{} Q8_0 ({} bytes)", n_out, n_in, bytes.len());
+    tensor.destroy(dev.as_device());
+}

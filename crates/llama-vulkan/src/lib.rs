@@ -4,7 +4,7 @@ mod dual_gpu;
 mod matmul;
 mod model_gpu;
 mod pipeline;
-mod tensor;
+pub mod tensor;
 
 pub use device::{VulkanContext, VulkanDevice};
 pub use dual_gpu::DualGpuMatmul;
