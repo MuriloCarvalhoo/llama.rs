@@ -63,7 +63,7 @@ impl GpuAllocator {
                     .property_flags
                     .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
             })
-            .ok_or(AllocError::NoMemoryType)? as u32;
+            .ok_or(AllocError::NoMemoryType)?;
 
         Ok(Self {
             chunks: Vec::new(),
