@@ -6,7 +6,9 @@ use gguf::GgufFile;
 use crate::attention::{KvCache, attention};
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
-use crate::ops::{argmax, embedding_lookup, mul_rows, rmsnorm, rope_norm, swiglu};
+use crate::ops::{
+    argmax, embedding_lookup, quantize_q8_0_split, rmsnorm_and_scale, rope_norm, swiglu,
+};
 use crate::weights::Weights;
 
 /// Soma `bias` (shape `dim`) a cada linha de `x` (shape `n_tok × dim`).
@@ -23,6 +25,10 @@ fn add_bias(x: &mut [f32], bias: &[f32], dim: usize, n_tok: usize) {
 pub struct Model {
     pub config: LlamaConfig,
     pub(crate) weights: Weights,
+    /// Otimização 3 — tabela de frequências RoPE pré-computada.
+    /// `freq_table[i] = freq_base^(-2i/rope_dim)` para i em 0..rope_dim/2.
+    /// Elimina `powf` no loop interno da RoPE.
+    pub(crate) freq_table: Vec<f32>,
 }
 
 impl Model {
@@ -30,7 +36,12 @@ impl Model {
     pub fn load(f: &GgufFile, bytes: &[u8]) -> Result<Self, ModelError> {
         let config = LlamaConfig::from_gguf(f)?;
         let weights = Weights::from_gguf(f, bytes, &config)?;
-        Ok(Self { config, weights })
+        let freq_table = build_freq_table(config.freq_base, config.rope_dim);
+        Ok(Self {
+            config,
+            weights,
+            freq_table,
+        })
     }
 
     /// Carrega com config já validada externamente.
@@ -40,7 +51,12 @@ impl Model {
         config: LlamaConfig,
     ) -> Result<Self, ModelError> {
         let weights = Weights::from_gguf(f, bytes, &config)?;
-        Ok(Self { config, weights })
+        let freq_table = build_freq_table(config.freq_base, config.rope_dim);
+        Ok(Self {
+            config,
+            weights,
+            freq_table,
+        })
     }
 
     pub(crate) fn new_cache(&self) -> KvCache {
@@ -93,12 +109,75 @@ impl Model {
             let attn_norm = lw.attn_norm.dequant_to_f32()?;
             let ffn_norm = lw.ffn_norm.dequant_to_f32()?;
 
-            let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-            let attn_in = mul_rows(&normed, attn_norm, c.n_embd);
+            // Otimização 5 — rmsnorm + mul_rows fundidos em um único passe
+            let attn_in = rmsnorm_and_scale(&x, attn_norm, c.n_embd, c.rms_eps);
 
-            let mut q = lw.attn_q.matmul_into(&attn_in, c.n_embd, c.n_embd, n_tok)?;
-            let mut k = lw.attn_k.matmul_into(&attn_in, c.n_embd, kv_dim, n_tok)?;
-            let mut v = lw.attn_v.matmul_into(&attn_in, c.n_embd, kv_dim, n_tok)?;
+            // Otimização 3 — pré-quantizar attn_in uma vez; reusar para Q, K, V.
+            // Otimização 4 — para modelos grandes (n_embd>=512) e decode (n_tok=1):
+            //   Q/K/V são independentes → rayon::join. Para modelos pequenos, o overhead
+            //   do rayon supera o ganho (stories260K n_embd=64 → serial).
+            let (mut q, mut k, mut v) = if n_tok == 1 && c.n_embd >= 512 {
+                let attn_in_q8 = quantize_q8_0_split(&attn_in, c.n_embd, n_tok);
+                let ((q_res, k_res), v_res) = rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                lw.attn_q.matmul_into_with_q8(
+                                    &attn_in_q8,
+                                    &attn_in,
+                                    c.n_embd,
+                                    c.n_embd,
+                                    n_tok,
+                                )
+                            },
+                            || {
+                                lw.attn_k.matmul_into_with_q8(
+                                    &attn_in_q8,
+                                    &attn_in,
+                                    c.n_embd,
+                                    kv_dim,
+                                    n_tok,
+                                )
+                            },
+                        )
+                    },
+                    || {
+                        lw.attn_v.matmul_into_with_q8(
+                            &attn_in_q8,
+                            &attn_in,
+                            c.n_embd,
+                            kv_dim,
+                            n_tok,
+                        )
+                    },
+                );
+                (q_res?, k_res?, v_res?)
+            } else {
+                // Prefill: serial com q8 pré-quantizado
+                let attn_in_q8 = quantize_q8_0_split(&attn_in, c.n_embd, n_tok);
+                let q = lw.attn_q.matmul_into_with_q8(
+                    &attn_in_q8,
+                    &attn_in,
+                    c.n_embd,
+                    c.n_embd,
+                    n_tok,
+                )?;
+                let k = lw.attn_k.matmul_into_with_q8(
+                    &attn_in_q8,
+                    &attn_in,
+                    c.n_embd,
+                    kv_dim,
+                    n_tok,
+                )?;
+                let v = lw.attn_v.matmul_into_with_q8(
+                    &attn_in_q8,
+                    &attn_in,
+                    c.n_embd,
+                    kv_dim,
+                    n_tok,
+                )?;
+                (q, k, v)
+            };
 
             if let Some(b) = &lw.attn_q_bias {
                 add_bias(&mut q, b.dequant_to_f32()?, c.n_embd, n_tok);
@@ -110,13 +189,14 @@ impl Model {
                 add_bias(&mut v, b.dequant_to_f32()?, kv_dim, n_tok);
             }
 
+            // Otimização 3 — rope_norm com tabela de frequências pré-computada
             rope_norm(
                 &mut q,
                 n_tok,
                 c.n_head,
                 c.head_dim,
                 c.rope_dim,
-                c.freq_base,
+                &self.freq_table,
                 pos0,
             );
             rope_norm(
@@ -125,7 +205,7 @@ impl Model {
                 c.n_head_kv,
                 c.head_dim,
                 c.rope_dim,
-                c.freq_base,
+                &self.freq_table,
                 pos0,
             );
 
@@ -148,10 +228,19 @@ impl Model {
                 *xi += ai;
             }
 
-            let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-            let ffn_in = mul_rows(&normed, ffn_norm, c.n_embd);
-            let gate = lw.ffn_gate.matmul_into(&ffn_in, c.n_embd, c.n_ff, n_tok)?;
-            let up = lw.ffn_up.matmul_into(&ffn_in, c.n_embd, c.n_ff, n_tok)?;
+            // Otimização 5 — rmsnorm + mul_rows fundidos em um único passe
+            let ffn_in = rmsnorm_and_scale(&x, ffn_norm, c.n_embd, c.rms_eps);
+
+            // Pré-quantizar ffn_in uma vez; reusar para gate e up (sequencial para evitar
+            // contenção de largura de banda: dois matmuls de 4.6MB em paralelo causam
+            // interleaving pelos workers rayon → cache thrashing e pressão dupla de DRAM).
+            let ffn_in_q8 = quantize_q8_0_split(&ffn_in, c.n_embd, n_tok);
+            let gate = lw
+                .ffn_gate
+                .matmul_into_with_q8(&ffn_in_q8, &ffn_in, c.n_embd, c.n_ff, n_tok)?;
+            let up = lw
+                .ffn_up
+                .matmul_into_with_q8(&ffn_in_q8, &ffn_in, c.n_embd, c.n_ff, n_tok)?;
             let act = swiglu(&gate, &up);
             let ffn_out = lw.ffn_down.matmul_into(&act, c.n_ff, c.n_embd, n_tok)?;
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) {
@@ -162,8 +251,8 @@ impl Model {
         cache.advance(n_tok);
 
         let output_norm = self.weights.output_norm.dequant_to_f32()?;
-        let normed = rmsnorm(&x, c.n_embd, c.rms_eps);
-        let final_x = mul_rows(&normed, output_norm, c.n_embd);
+        // Otimização 5 — output norm + scale fundidos
+        let final_x = rmsnorm_and_scale(&x, output_norm, c.n_embd, c.rms_eps);
         let last = &final_x[(n_tok - 1) * c.n_embd..n_tok * c.n_embd];
         let logits = self
             .weights
@@ -198,6 +287,13 @@ impl Model {
             .map(|(tokens, cache)| self.forward(tokens, cache))
             .collect()
     }
+}
+
+/// Constrói a tabela de frequências RoPE: `freq_base^(-2i/rope_dim)` para i em 0..rope_dim/2.
+fn build_freq_table(freq_base: f32, rope_dim: usize) -> Vec<f32> {
+    (0..rope_dim / 2)
+        .map(|i| freq_base.powf(-2.0 * i as f32 / rope_dim as f32))
+        .collect()
 }
 
 #[cfg(test)]
@@ -240,7 +336,7 @@ mod tests {
             c.n_head,
             c.head_dim,
             c.rope_dim,
-            c.freq_base,
+            &m.freq_table,
             0,
         );
         let q_sum: f32 = q.iter().sum();

@@ -393,6 +393,7 @@ dependencies = [
  "llama-model",
  "llama-sampling",
  "llama-tokenizer",
+ "llama-vulkan",
  "rand",
  "rayon",
  "thiserror",

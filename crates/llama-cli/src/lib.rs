@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 //! Biblioteca auxiliar do `llama-cli`.
 
 pub mod args;

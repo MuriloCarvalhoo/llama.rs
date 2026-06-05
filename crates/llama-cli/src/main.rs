@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 use std::io::{self, Write};
 

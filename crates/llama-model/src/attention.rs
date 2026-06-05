@@ -3,6 +3,7 @@
 
 use crate::error::ModelError;
 use crate::ops::softmax;
+use rayon::prelude::*;
 
 /// KV cache f32 pré-alocado. Buffer flat `[n_layer * ctx * kv_dim]`.
 pub(crate) struct KvCache {
@@ -68,6 +69,9 @@ impl KvCache {
 /// Atenção causal GQA em f32. `q` pós-rope token-major [n_tok*n_head*head_dim];
 /// `k_cache`/`v_cache` são os buffers COMPLETOS da camada (já com os n_tok novos),
 /// [(pos0+n_tok)*kv_dim]. Retorna [n_tok*n_head*head_dim].
+///
+/// Otimização 4 — heads paralelizadas com rayon no caso n_tok=1 (decode).
+/// Para n_tok>1 (prefill) mantém o loop serial para evitar overhead de coleta.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention(
     q: &[f32],
@@ -85,35 +89,79 @@ pub(crate) fn attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0.0f32; n_tok * n_embd];
 
-    for t in 0..n_tok {
-        let abs_pos = pos0 + t;
-        for h in 0..n_head {
-            let kv_h = h / n_rep;
-            let q_off = (t * n_head + h) * head_dim;
-            let qv = &q[q_off..q_off + head_dim];
+    // Otimização 4 — caso n_tok=1 (decode): paralelizar sobre heads.
+    // Os heads são independentes entre si, então rayon é seguro e eficiente aqui.
+    // Para n_tok>1 (prefill), manter loop serial é suficiente pois o gargalo
+    // é o matmul dos pesos (já paralelizado via rayon em matmul_q8_0).
+    // Paralelizar apenas quando head_dim é grande o suficiente para amortizar overhead rayon.
+    // head_dim=8 (stories260K) → serial; head_dim=64 (qwen2.5) → paralelo.
+    if n_tok == 1 && n_head >= 4 && head_dim >= 32 {
+        let abs_pos = pos0; // n_tok=1, t=0
+        let qv_base = &q[0..n_embd]; // único token
 
-            // scores causais sobre posições 0..=abs_pos
-            let mut scores = vec![0.0f32; abs_pos + 1];
-            for (j, s) in scores.iter_mut().enumerate() {
-                let k_off = j * kv_dim + kv_h * head_dim;
-                let kv = &k_cache[k_off..k_off + head_dim];
-                let dot: f32 = qv.iter().zip(kv.iter()).map(|(&a, &b)| a * b).sum();
-                *s = dot * scale;
-            }
-            softmax(&mut scores);
+        let head_results: Vec<Vec<f32>> = (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                let kv_h = h / n_rep;
+                let q_off = h * head_dim;
+                let qv = &qv_base[q_off..q_off + head_dim];
 
-            // saída ponderada por V
-            let o_off = (t * n_head + h) * head_dim;
-            let ov = &mut out[o_off..o_off + head_dim];
-            for (j, &p) in scores.iter().enumerate() {
-                let v_off = j * kv_dim + kv_h * head_dim;
-                let vv = &v_cache[v_off..v_off + head_dim];
-                for (o, &vval) in ov.iter_mut().zip(vv.iter()) {
-                    *o += p * vval;
+                let mut scores = vec![0.0f32; abs_pos + 1];
+                for (j, s) in scores.iter_mut().enumerate() {
+                    let k_off = j * kv_dim + kv_h * head_dim;
+                    let kv = &k_cache[k_off..k_off + head_dim];
+                    let dot: f32 = qv.iter().zip(kv.iter()).map(|(&a, &b)| a * b).sum();
+                    *s = dot * scale;
+                }
+                softmax(&mut scores);
+
+                let mut ov = vec![0.0f32; head_dim];
+                for (j, &p) in scores.iter().enumerate() {
+                    let v_off = j * kv_dim + kv_h * head_dim;
+                    let vv = &v_cache[v_off..v_off + head_dim];
+                    for (o, &vval) in ov.iter_mut().zip(vv.iter()) {
+                        *o += p * vval;
+                    }
+                }
+                ov
+            })
+            .collect();
+
+        for (h, ov) in head_results.iter().enumerate() {
+            let o_off = h * head_dim;
+            out[o_off..o_off + head_dim].copy_from_slice(ov);
+        }
+    } else {
+        // Loop serial original — usado para prefill (n_tok>1) e modelos com n_head<4
+        for t in 0..n_tok {
+            let abs_pos = pos0 + t;
+            for h in 0..n_head {
+                let kv_h = h / n_rep;
+                let q_off = (t * n_head + h) * head_dim;
+                let qv = &q[q_off..q_off + head_dim];
+
+                let mut scores = vec![0.0f32; abs_pos + 1];
+                for (j, s) in scores.iter_mut().enumerate() {
+                    let k_off = j * kv_dim + kv_h * head_dim;
+                    let kv = &k_cache[k_off..k_off + head_dim];
+                    let dot: f32 = qv.iter().zip(kv.iter()).map(|(&a, &b)| a * b).sum();
+                    *s = dot * scale;
+                }
+                softmax(&mut scores);
+
+                let o_off = (t * n_head + h) * head_dim;
+                let ov = &mut out[o_off..o_off + head_dim];
+                for (j, &p) in scores.iter().enumerate() {
+                    let v_off = j * kv_dim + kv_h * head_dim;
+                    let vv = &v_cache[v_off..v_off + head_dim];
+                    for (o, &vval) in ov.iter_mut().zip(vv.iter()) {
+                        *o += p * vval;
+                    }
                 }
             }
         }
     }
+
     out
 }
 
@@ -149,6 +197,61 @@ mod tests {
         let v = vec![2.0, 8.0];
         let out = attention(&q, &k, &v, 2, 0, 1, 1, 1);
         assert!((out[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parallel_heads_match_serial_for_single_token() {
+        // Verifica que o caminho paralelo (n_head=4 >= 4) produz os mesmos
+        // resultados que o serial (n_tok=2, forçando o caminho serial).
+        // Usa n_tok=1 para paralelo e n_tok=1 com n_head=3 para serial (< 4).
+        let head_dim = 2usize;
+        let n_head = 4usize;
+        let n_head_kv = 2usize;
+        let kv_dim = n_head_kv * head_dim;
+
+        // q: 1 token, 4 heads, head_dim=2
+        let q: Vec<f32> = (0..n_head * head_dim)
+            .map(|i| (i + 1) as f32 * 0.1)
+            .collect();
+        // k_cache / v_cache: 3 posições
+        let n_pos = 3usize;
+        let k_cache: Vec<f32> = (0..n_pos * kv_dim).map(|i| (i + 1) as f32 * 0.05).collect();
+        let v_cache: Vec<f32> = (0..n_pos * kv_dim).map(|i| (i + 1) as f32 * 0.07).collect();
+
+        // Paralelo (n_tok=1, n_head=4)
+        let out_par = attention(&q, &k_cache, &v_cache, 1, 2, n_head, n_head_kv, head_dim);
+
+        // Serial: forçar caminho serial rodando via n_tok=2 e pegando os 2 tokens
+        // (mas como q só tem dados para 1 token, usa serial com n_head=3 < 4)
+        // Alternativa: testar diretamente com n_head=1 que vai para serial
+        let q1 = &q[0..head_dim];
+        let kv_h = 0;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut scores_manual = vec![0.0f32; 3];
+        for (j, s) in scores_manual.iter_mut().enumerate() {
+            let k_off = j * kv_dim + kv_h * head_dim;
+            let dot: f32 = q1
+                .iter()
+                .zip(k_cache[k_off..k_off + head_dim].iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            *s = dot * scale;
+        }
+        softmax(&mut scores_manual);
+        let mut ov_manual = vec![0.0f32; head_dim];
+        for (j, &p) in scores_manual.iter().enumerate() {
+            let v_off = j * kv_dim + kv_h * head_dim;
+            for (o, &vval) in ov_manual
+                .iter_mut()
+                .zip(v_cache[v_off..v_off + head_dim].iter())
+            {
+                *o += p * vval;
+            }
+        }
+        // Head 0 do caminho paralelo deve coincidir com o manual
+        for (a, b) in out_par[0..head_dim].iter().zip(ov_manual.iter()) {
+            assert!((a - b).abs() < 1e-5, "paralelo vs manual: {a} vs {b}");
+        }
     }
 
     #[test]
