@@ -230,16 +230,27 @@ pub(crate) fn one_shot_copy(
         p_command_buffers: &cmd,
         ..Default::default()
     };
+
+    // SAFETY: queue, fence e submit_info sao validos.
+    let submit_res = unsafe { dev.queue_submit(queue, &[submit_info], fence) };
+
+    // So espera se o submit teve sucesso; caso contrario a fence nunca foi sinalizada.
+    // SAFETY: fence foi criada por nos; timeout u64::MAX garante espera completa.
+    let wait_res = if submit_res.is_ok() {
+        unsafe { dev.wait_for_fences(&[fence], true, u64::MAX) }
+    } else {
+        Ok(())
+    };
+
+    // Cleanup garantido em todos os paths (sucesso ou erro).
     unsafe {
-        // SAFETY: queue, fence e submit_info sao validos.
-        dev.queue_submit(queue, &[submit_info], fence)?;
-        // SAFETY: fence foi criada por nos; timeout u64::MAX garante espera completa.
-        dev.wait_for_fences(&[fence], true, u64::MAX)?;
-        // SAFETY: fence foi sinalizada e nao sera mais usada.
+        // SAFETY: fence foi criada por nos nesta funcao e nao sera mais usada.
         dev.destroy_fence(fence, None);
-        // SAFETY: cmd foi alocado de pool pelo mesmo device.
+        // SAFETY: cmd foi alocado de pool pelo mesmo device nesta funcao.
         dev.free_command_buffers(pool, &[cmd]);
     }
 
+    submit_res?;
+    wait_res?;
     Ok(())
 }
