@@ -49,15 +49,25 @@ pub(crate) fn mul_rows(x: &[f32], weight: &[f32], dim: usize) -> Vec<f32> {
 
 /// MUL_MAT: `W{in,out}` (out linhas de comprimento in) × `x` token-major [n_tok*in].
 /// Saída token-major [n_tok*out]: `out[t*out+j] = Σ_i W[j*in+i] * x[t*in+i]`.
+/// Threshold below which rayon thread-pool overhead exceeds benefit.
+const PAR_MIN_N_OUT: usize = 512;
+
 pub(crate) fn matmul(w: &[f32], x: &[f32], n_in: usize, n_out: usize, n_tok: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n_tok * n_out];
     for t in 0..n_tok {
         let xrow = &x[t * n_in..(t + 1) * n_in];
         let orow = &mut out[t * n_out..(t + 1) * n_out];
-        orow.par_iter_mut().enumerate().for_each(|(j, o)| {
-            let wrow = &w[j * n_in..(j + 1) * n_in];
-            *o = wrow.iter().zip(xrow.iter()).map(|(&a, &b)| a * b).sum();
-        });
+        if n_out >= PAR_MIN_N_OUT {
+            orow.par_iter_mut().enumerate().for_each(|(j, o)| {
+                let wrow = &w[j * n_in..(j + 1) * n_in];
+                *o = wrow.iter().zip(xrow.iter()).map(|(&a, &b)| a * b).sum();
+            });
+        } else {
+            for (j, o) in orow.iter_mut().enumerate() {
+                let wrow = &w[j * n_in..(j + 1) * n_in];
+                *o = wrow.iter().zip(xrow.iter()).map(|(&a, &b)| a * b).sum();
+            }
+        }
     }
     out
 }
