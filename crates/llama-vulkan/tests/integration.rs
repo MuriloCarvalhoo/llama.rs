@@ -1,7 +1,7 @@
 //! Testes de integracao Vulkan -- exigem duas MI50 reais.
 //! Pulam automaticamente se nenhum device Vulkan AMD estiver disponivel.
 
-use llama_vulkan::{VulkanContext, VulkanDevice};
+use llama_vulkan::{GpuWeights, VulkanContext, VulkanDevice};
 
 #[test]
 fn detects_at_least_one_amd_device() {
@@ -234,4 +234,26 @@ fn dual_gpu_row_split_matches_single_gpu() {
         "max_diff={max_diff} excede tolerancia 0.01"
     );
     eprintln!("Dual GPU row-split OK -- {n_out} saidas corretas, max_diff={max_diff}");
+}
+
+#[test]
+fn gpu_weights_upload_synthetic() {
+    let ctx = match VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("Nenhum device AMD -- pulando");
+        return;
+    }
+
+    let weights = GpuWeights::upload_synthetic(&ctx, 24, 896).expect("upload_synthetic falhou");
+
+    assert_eq!(weights.n_layers_loaded, 24);
+    assert!(weights.vram_bytes > 0, "deve ter alocado VRAM");
+    eprintln!(
+        "GpuWeights OK: {} layers, {} MB VRAM",
+        weights.n_layers_loaded,
+        weights.vram_bytes / 1024 / 1024
+    );
 }
