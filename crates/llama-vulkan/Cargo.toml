@@ -1,0 +1,16 @@
+[package]
+name = "llama-vulkan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ash = "0.38"
+half = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+
+[build-dependencies]
+shaderc = "0.8"
+
+[lints.rust]
+unsafe_code = "allow"

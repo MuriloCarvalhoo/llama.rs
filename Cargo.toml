@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli"]
+members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli", "crates/llama-vulkan"]
 
 [workspace.package]
 edition = "2024"

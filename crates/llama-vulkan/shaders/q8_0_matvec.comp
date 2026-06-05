@@ -1,0 +1,59 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+// Workgroup = um wave64 (64 lanes) computa UM elemento de saida (uma linha de W . x).
+// gfx906 (MI50) tem wave64 nativo; local_size_x=64 garante um workgroup = uma wave.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// W: pesos Q8_0 row-major. Cada linha = n_blocks x 34 bytes (2 bytes f16 scale + 32 bytes i8).
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint8_t w[]; } weight_buf;
+// X: ativacoes f32. Tamanho: n_in floats.
+layout(set = 0, binding = 1) readonly buffer ActBuf   { float   x[]; } act_buf;
+// Y: saida f32. Tamanho: n_out floats.
+layout(set = 0, binding = 2) writeonly buffer OutBuf  { float   y[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;       // dimensao de entrada (multiplo de 32)
+    uint n_out;      // dimensao de saida
+    uint row_offset; // para row-split: GPU1 comeca em row_offset
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x + pc.row_offset;
+    uint lane = gl_LocalInvocationID.x; // 0..63
+
+    if (row >= pc.row_offset + gl_NumWorkGroups.x) return;
+
+    uint n_blocks  = pc.n_in / 32u;
+    uint row_bytes = n_blocks * 34u;
+
+    float acc = 0.0;
+
+    // Cada lane processa blocos em stride de 64 (um wave completo).
+    for (uint b = lane; b < n_blocks; b += 64u) {
+        uint boff = row * row_bytes + b * 34u;
+
+        // Carrega escala f16 (2 bytes little-endian) e converte para f32.
+        uint d_lo = uint(weight_buf.w[boff]);
+        uint d_hi = uint(weight_buf.w[boff + 1u]);
+        float d = unpackHalf2x16((d_hi << 8u) | d_lo).x;
+
+        // Produto escalar: 32 pares i8 x f32.
+        float dot = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            int qi = int(int8_t(weight_buf.w[boff + 2u + i]));
+            float xi = act_buf.x[b * 32u + i];
+            dot += float(qi) * xi;
+        }
+        acc += d * dot;
+    }
+
+    // Reducao wave64 via subgroupAdd.
+    acc = subgroupAdd(acc);
+
+    // Apenas a lane 0 de cada subgroup escreve.
+    if (gl_SubgroupInvocationID == 0u) {
+        out_buf.y[row] = acc;
+    }
+}
