@@ -5,6 +5,8 @@ use std::cell::OnceCell;
 use ggml_cpu::dequant_to_f32 as dequant_impl;
 use gguf::{GgufFile, TensorInfo};
 
+use crate::ops::{matmul, matmul_q8_0};
+
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
 
@@ -52,6 +54,23 @@ impl RawTensor {
         let _ = self.f32_cache.set(v);
         // SAFETY: we just set the value above; get() is guaranteed to return Some.
         Ok(self.f32_cache.get().map_or(&[], Vec::as_slice))
+    }
+
+    /// Matmul otimizado por tipo de quantização.
+    /// - Q8_0: produto escalar direto em i8 (sem alocar buffer f32)
+    /// - outros: dequant → f32 → matmul
+    pub(crate) fn matmul_into(
+        &self,
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        n_tok: usize,
+    ) -> Result<Vec<f32>, ModelError> {
+        if self.ty == gguf::GgmlType::Q8_0 {
+            Ok(matmul_q8_0(&self.bytes, x, n_in, n_out, n_tok))
+        } else {
+            Ok(matmul(self.dequant_to_f32()?, x, n_in, n_out, n_tok))
+        }
     }
 }
 
