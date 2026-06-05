@@ -2,6 +2,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::error::ModelError;
+use rayon::prelude::*;
 
 /// GET_ROWS: para cada token, copia a linha de `embd` ({vocab, n_embd}).
 /// Saída token-major [n_tok * n_embd].
@@ -51,12 +52,12 @@ pub(crate) fn mul_rows(x: &[f32], weight: &[f32], dim: usize) -> Vec<f32> {
 pub(crate) fn matmul(w: &[f32], x: &[f32], n_in: usize, n_out: usize, n_tok: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n_tok * n_out];
     for t in 0..n_tok {
-        let xrow = &x[t * n_in..t * n_in + n_in];
-        let orow = &mut out[t * n_out..t * n_out + n_out];
-        for (j, o) in orow.iter_mut().enumerate() {
-            let wrow = &w[j * n_in..j * n_in + n_in];
+        let xrow = &x[t * n_in..(t + 1) * n_in];
+        let orow = &mut out[t * n_out..(t + 1) * n_out];
+        orow.par_iter_mut().enumerate().for_each(|(j, o)| {
+            let wrow = &w[j * n_in..(j + 1) * n_in];
             *o = wrow.iter().zip(xrow.iter()).map(|(&a, &b)| a * b).sum();
-        }
+        });
     }
     out
 }
