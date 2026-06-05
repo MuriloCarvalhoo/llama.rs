@@ -187,3 +187,51 @@ fn matmul_gpu_matches_cpu_reference() {
     assert!(y[3].abs() < 0.1, "y[3] esperado ~0.0, got {}", y[3]);
     eprintln!("GPU matmul: y={:?}", y);
 }
+
+#[test]
+fn dual_gpu_row_split_matches_single_gpu() {
+    let ctx = match VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.len() < 2 {
+        eprintln!("Menos de 2 GPUs -- pulando");
+        return;
+    }
+
+    let n_in = 896usize; // n_embd do Qwen2.5-0.5B
+    let n_out = 896usize;
+    let n_blocks = n_in / 32;
+    let row_bytes = n_blocks * 34;
+
+    let w_bytes: Vec<u8> = (0..n_out * row_bytes)
+        .map(|i| (i.wrapping_mul(31) % 255) as u8)
+        .collect();
+    let x_f32: Vec<f32> = (0..n_in).map(|i| (i as f32) * 0.001).collect();
+
+    // Single GPU reference
+    let dev0 = VulkanDevice::create(&ctx, &phys[0]).unwrap();
+    use llama_vulkan::matmul::dispatch_q8_0_matvec;
+    let y_single =
+        dispatch_q8_0_matvec(&ctx, &phys[0], &dev0, &w_bytes, &x_f32, n_in, n_out).unwrap();
+
+    // Dual GPU
+    use llama_vulkan::DualGpuMatmul;
+    let dual = DualGpuMatmul::new(&ctx).expect("DualGpuMatmul::new falhou");
+    let y_dual = dual
+        .matvec_q8_0(&w_bytes, &x_f32, n_in, n_out)
+        .expect("dual falhou");
+
+    assert_eq!(y_dual.len(), n_out);
+    let max_diff = y_dual
+        .iter()
+        .zip(y_single.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 0.01,
+        "max_diff={max_diff} excede tolerancia 0.01"
+    );
+    eprintln!("Dual GPU row-split OK -- {n_out} saidas corretas, max_diff={max_diff}");
+}
