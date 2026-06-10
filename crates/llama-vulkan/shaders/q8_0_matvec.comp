@@ -22,10 +22,13 @@ layout(push_constant) uniform PC {
 } pc;
 
 void main() {
-    uint row = gl_WorkGroupID.x + pc.row_offset;
+    // Indice LOCAL: o lado host fatia os pesos por GPU (w1 = &w[split..]) e dimensiona
+    // o buffer de saida como n_out_local. Indexar pelo offset global causa acesso OOB
+    // (leituras->0, escritas descartadas) na GPU1. pc.row_offset fica vestigial.
+    uint row = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x; // 0..63
 
-    if (row >= pc.row_offset + gl_NumWorkGroups.x) return;
+    if (row >= gl_NumWorkGroups.x) return;
 
     uint n_blocks  = pc.n_in / 32u;
     uint row_bytes = n_blocks * 34u;
