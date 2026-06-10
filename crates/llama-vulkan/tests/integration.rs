@@ -257,3 +257,168 @@ fn gpu_weights_upload_synthetic() {
         weights.vram_bytes / 1024 / 1024
     );
 }
+
+#[test]
+fn forward_gpu_real_matches_f32_cpu_reference() {
+    use std::path::Path;
+    let model_path = Path::new("../../models/qwen2.5-0.5b-instruct-q8_0.gguf");
+    let Ok(bytes) = std::fs::read(model_path) else {
+        eprintln!("qwen ausente — pulando");
+        return;
+    };
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Vulkan indisponível: {e} — pulando");
+            return;
+        }
+    };
+    if ctx.amd_compute_devices().len() < 2 {
+        eprintln!("Menos de 2 MI50 — pulando");
+        return;
+    }
+
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
+    let model = llama_model::Model::load_with_config(&f, &bytes, cfg.clone()).unwrap();
+    let w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+    let backend = llama_vulkan::DualGpuBackend::new(&ctx).expect("backend falhou");
+
+    // Referência CPU do MESMO algoritmo da GPU (ativações f32, sem quantização).
+    // Isola "a GPU computa o decode corretamente" de "quantização de ativação muda o
+    // argmax". A GPU (wave64 subgroupAdd) e esta referência (soma sequencial) diferem
+    // apenas na ordem de soma f32 (~1e-5) — o token decodificado deve ser idêntico.
+    struct CpuF32ActMatmul;
+    impl llama_model::GpuMatmul for CpuF32ActMatmul {
+        fn matvec_q8_0(
+            &self,
+            w_bytes: &[u8],
+            x: &[f32],
+            n_in: usize,
+            n_out: usize,
+        ) -> Result<Vec<f32>, llama_model::ModelError> {
+            Ok(cpu_ref_q8_0_f32act(w_bytes, x, n_in, n_out))
+        }
+    }
+
+    let prompt = [cfg.bos_id];
+    let gpu_tok = model.decode_one_gpu_owned(&prompt, &backend, &w).unwrap();
+    let ref_tok = model
+        .decode_one_gpu_owned(&prompt, &CpuF32ActMatmul, &w)
+        .unwrap();
+    // Token do caminho CPU quantizado (ativações Q8_0) — informativo: pode diferir, pois
+    // é uma aproximação distinta (mais perdas) que a via f32 da GPU.
+    let cpu_quant_tok = model.decode_one_cpu_owned(&prompt).unwrap();
+
+    eprintln!(
+        "Forward GPU real: gpu_tok={gpu_tok} ref_f32_tok={ref_tok} cpu_quant_tok={cpu_quant_tok}"
+    );
+    assert_eq!(
+        gpu_tok, ref_tok,
+        "GPU deve igualar a referência CPU do mesmo algoritmo (ativações f32)"
+    );
+}
+
+// Referência CPU do matvec Q8_0 com ativações f32 (mesmo algoritmo do shader GPU).
+fn cpu_ref_q8_0_f32act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
+    let n_blocks = n_in / 32;
+    let row_bytes = n_blocks * 34;
+    let mut y = vec![0f32; n_out];
+    for row in 0..n_out {
+        let mut acc = 0f32;
+        for b in 0..n_blocks {
+            let off = row * row_bytes + b * 34;
+            let scale = half::f16::from_le_bytes([w[off], w[off + 1]]).to_f32();
+            let mut dot = 0f32;
+            for i in 0..32 {
+                let q = w[off + 2 + i] as i8 as f32;
+                dot += q * x[b * 32 + i];
+            }
+            acc += scale * dot;
+        }
+        y[row] = acc;
+    }
+    y
+}
+
+#[test]
+fn gpu_matvec_large_n_out_matches_cpu_ref() {
+    // Regressão do bug de row-split OOB: com n_out grande (vocab=151936) a GPU1
+    // retornava 0 por indexar pesos/saída pelo offset global. Guarda contra reintrodução.
+    use llama_model::GpuMatmul;
+    use std::path::Path;
+    let Ok(bytes) = std::fs::read(Path::new("../../models/qwen2.5-0.5b-instruct-q8_0.gguf")) else {
+        eprintln!("qwen ausente — pulando");
+        return;
+    };
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if ctx.amd_compute_devices().len() < 2 {
+        return;
+    }
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
+    let w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+    let backend = llama_vulkan::DualGpuBackend::new(&ctx).unwrap();
+
+    // Probe 1: output projection — n_in=n_embd=896, n_out=vocab=151936
+    let x1: Vec<f32> = (0..cfg.n_embd)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let gpu1 = backend
+        .matvec_q8_0(&w.output, &x1, cfg.n_embd, cfg.vocab)
+        .unwrap();
+    let cpu1 = cpu_ref_q8_0_f32act(&w.output, &x1, cfg.n_embd, cfg.vocab);
+    let mut maxdiff1 = 0f32;
+    let mut argi1 = 0usize;
+    for (i, (a, b)) in gpu1.iter().zip(cpu1.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > maxdiff1 {
+            maxdiff1 = d;
+            argi1 = i;
+        }
+    }
+    eprintln!(
+        "[P1 output {}x{}] maxdiff={maxdiff1:.4} @row {argi1} (gpu={} cpu={})",
+        cfg.vocab, cfg.n_embd, gpu1[argi1], cpu1[argi1]
+    );
+    eprintln!(
+        "[P1] gpu[0..3]={:?} cpu[0..3]={:?}",
+        &gpu1[0..3],
+        &cpu1[0..3]
+    );
+    assert!(
+        maxdiff1 < 0.01,
+        "regressão row-split OOB: GPU diverge da referência em n_out={} (maxdiff={maxdiff1} @row {argi1}, gpu={} cpu={})",
+        cfg.vocab,
+        gpu1[argi1],
+        cpu1[argi1]
+    );
+
+    // Probe 2: ffn_down — n_in=n_ff=4864, n_out=n_embd=896
+    let x2: Vec<f32> = (0..cfg.n_ff)
+        .map(|i| ((i % 5) as f32) * 0.05 - 0.1)
+        .collect();
+    let gpu2 = backend
+        .matvec_q8_0(&w.layers[0].ffn_down, &x2, cfg.n_ff, cfg.n_embd)
+        .unwrap();
+    let cpu2 = cpu_ref_q8_0_f32act(&w.layers[0].ffn_down, &x2, cfg.n_ff, cfg.n_embd);
+    let mut maxdiff2 = 0f32;
+    for (a, b) in gpu2.iter().zip(cpu2.iter()) {
+        maxdiff2 = maxdiff2.max((a - b).abs());
+    }
+    eprintln!(
+        "[P2 ffn_down {}x{}] maxdiff={maxdiff2:.4} gpu[0..3]={:?} cpu[0..3]={:?}",
+        cfg.n_embd,
+        cfg.n_ff,
+        &gpu2[0..3],
+        &cpu2[0..3]
+    );
+    assert!(
+        maxdiff2 < 0.01,
+        "GPU diverge da referência em ffn_down (n_in={}, maxdiff={maxdiff2})",
+        cfg.n_ff
+    );
+}

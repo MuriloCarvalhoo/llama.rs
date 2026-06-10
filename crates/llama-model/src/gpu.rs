@@ -123,6 +123,29 @@ impl Model {
         Ok(())
     }
 
+    /// Decode de 1 passo na CPU (prefill incluso). Cache criado internamente.
+    pub fn decode_one_cpu_owned(&self, prompt: &[u32]) -> Result<u32, ModelError> {
+        let mut cache = self.new_cache();
+        let logits = self.forward(prompt, &mut cache)?;
+        u32::try_from(crate::ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
+    }
+
+    /// Prefill na CPU + 1 decode na GPU. Cache criado internamente.
+    pub fn decode_one_gpu_owned(
+        &self,
+        prompt: &[u32],
+        gpu: &dyn GpuMatmul,
+        w: &GpuRawWeights,
+    ) -> Result<u32, ModelError> {
+        let mut cache = self.new_cache();
+        let _ = self.forward(prompt, &mut cache)?;
+        let last = *prompt
+            .last()
+            .ok_or_else(|| ModelError::Gpu("prompt vazio".into()))?;
+        let logits = self.forward_gpu(&[last], &mut cache, gpu, w)?;
+        u32::try_from(crate::ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
+    }
+
     /// Forward de **decode** (n_tok=1) com os 8 matmuls na GPU.
     /// RMSNorm/RoPE/attention/SwiGLU/bias permanecem na CPU.
     pub(crate) fn forward_gpu(

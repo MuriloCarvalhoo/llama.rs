@@ -8,6 +8,10 @@ ash = "0.38"
 half = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
+llama-model = { workspace = true, features = ["gpu"] }
+
+[dev-dependencies]
+gguf = { workspace = true }
 
 [build-dependencies]
 shaderc = "0.8"
