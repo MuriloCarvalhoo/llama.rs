@@ -149,38 +149,6 @@ pub fn run_generate(
     // local do node 0 (acesso ~10 ns para as threads do socket 0).
     init_numa_before_load();
 
-    if args.gpu {
-        #[cfg(feature = "gpu")]
-        {
-            use llama_vulkan::VulkanContext;
-            match VulkanContext::new() {
-                Ok(ctx) => {
-                    let devs = ctx.amd_compute_devices();
-                    if devs.len() >= 2 {
-                        eprintln!(
-                            "[GPU] {} + {} detectados -- backend Vulkan reconhecido",
-                            devs[0].name(),
-                            devs[1].name()
-                        );
-                        eprintln!(
-                            "[GPU] AVISO: matmuls ainda em CPU -- substituicao GPU e fase futura"
-                        );
-                    } else {
-                        eprintln!(
-                            "[GPU] {} device(s) AMD detectado(s) (< 2) -- fallback CPU",
-                            devs.len()
-                        );
-                    }
-                }
-                Err(e) => eprintln!("[GPU] Vulkan indisponivel ({e}) -- fallback CPU"),
-            }
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            eprintln!("[GPU] Build sem feature 'gpu' -- recompile com: cargo build --features gpu");
-        }
-    }
-
     let bytes = std::fs::read(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
     let model = Model::load(&f, &bytes)?;
@@ -208,20 +176,76 @@ pub fn run_generate(
     let mut n_tokens = 0usize;
     let mut start: Option<Instant> = None;
 
-    model.generate_streaming(
-        &tokenizer,
-        &args.prompt,
-        args.n_predict,
-        &sampler,
-        &mut rng,
-        &mut |piece| {
-            if start.is_none() {
-                start = Some(Instant::now());
+    #[cfg(feature = "gpu")]
+    let used_gpu = if args.gpu {
+        use llama_vulkan::{DualGpuBackend, VulkanContext};
+        match VulkanContext::new() {
+            Ok(ctx) if ctx.amd_compute_devices().len() >= 2 => {
+                let devs = ctx.amd_compute_devices();
+                eprintln!(
+                    "[GPU] {} + {} — decode na GPU",
+                    devs[0].name(),
+                    devs[1].name()
+                );
+                let gpu_w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config)?;
+                let backend = DualGpuBackend::new(&ctx)?;
+                model.generate_streaming_gpu(
+                    &tokenizer,
+                    &args.prompt,
+                    args.n_predict,
+                    &sampler,
+                    &mut rng,
+                    &backend,
+                    &gpu_w,
+                    &mut |piece| {
+                        if start.is_none() {
+                            start = Some(Instant::now());
+                        }
+                        on_token(piece);
+                        n_tokens += 1;
+                    },
+                )?;
+                true
             }
-            on_token(piece);
-            n_tokens += 1;
-        },
-    )?;
+            Ok(ctx) => {
+                eprintln!(
+                    "[GPU] {} device(s) AMD (<2) — fallback CPU",
+                    ctx.amd_compute_devices().len()
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("[GPU] Vulkan indisponivel ({e}) — fallback CPU");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    #[cfg(not(feature = "gpu"))]
+    let used_gpu = {
+        if args.gpu {
+            eprintln!("[GPU] Build sem feature 'gpu' -- recompile com: cargo build --features gpu");
+        }
+        false
+    };
+
+    if !used_gpu {
+        model.generate_streaming(
+            &tokenizer,
+            &args.prompt,
+            args.n_predict,
+            &sampler,
+            &mut rng,
+            &mut |piece| {
+                if start.is_none() {
+                    start = Some(Instant::now());
+                }
+                on_token(piece);
+                n_tokens += 1;
+            },
+        )?;
+    }
 
     let elapsed_secs = start.map_or(0.0, |t| t.elapsed().as_secs_f64());
     #[allow(clippy::cast_precision_loss)]

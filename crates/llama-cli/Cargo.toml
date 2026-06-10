@@ -19,7 +19,7 @@ rayon.workspace = true
 llama-vulkan = { path = "../llama-vulkan", optional = true }
 
 [features]
-gpu = ["llama-vulkan"]
+gpu = ["llama-vulkan", "llama-model/gpu"]
 
 [lints]
 workspace = true
