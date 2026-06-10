@@ -76,6 +76,104 @@ impl GpuRawWeights {
     }
 }
 
+#[cfg(feature = "gpu")]
+use crate::attention::{KvCache, attention};
+#[cfg(feature = "gpu")]
+use crate::model::Model;
+#[cfg(feature = "gpu")]
+use crate::ops::{embedding_lookup, rmsnorm_and_scale, rope_norm, swiglu};
+
+#[cfg(feature = "gpu")]
+impl Model {
+    /// Forward de **decode** (n_tok=1) com os 8 matmuls na GPU.
+    /// RMSNorm/RoPE/attention/SwiGLU/bias permanecem na CPU.
+    pub(crate) fn forward_gpu(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        gpu: &dyn GpuMatmul,
+        w: &GpuRawWeights,
+    ) -> Result<Vec<f32>, ModelError> {
+        let c = &self.config;
+        if tokens.len() != 1 {
+            return Err(ModelError::Gpu(format!(
+                "forward_gpu exige n_tok=1 (decode), recebeu {}",
+                tokens.len()
+            )));
+        }
+        let n_tok = 1usize;
+        let pos0 = cache.len();
+        let kv_dim = c.n_head_kv * c.head_dim;
+
+        let token_embd = self.token_embd_f32()?;
+        let mut x = embedding_lookup(token_embd, tokens, c.n_embd)?;
+
+        for (l, gw) in w.layers.iter().enumerate() {
+            let (attn_norm, ffn_norm) = self.layer_norms_f32(l)?;
+            let attn_in = rmsnorm_and_scale(&x, attn_norm, c.n_embd, c.rms_eps);
+
+            let mut q = gpu.matvec_q8_0(&gw.attn_q, &attn_in, c.n_embd, c.n_embd)?;
+            let mut k = gpu.matvec_q8_0(&gw.attn_k, &attn_in, c.n_embd, kv_dim)?;
+            let mut v = gpu.matvec_q8_0(&gw.attn_v, &attn_in, c.n_embd, kv_dim)?;
+
+            self.add_layer_biases(l, &mut q, &mut k, &mut v, kv_dim, n_tok)?;
+
+            rope_norm(
+                &mut q,
+                n_tok,
+                c.n_head,
+                c.head_dim,
+                c.rope_dim,
+                &self.freq_table,
+                pos0,
+            );
+            rope_norm(
+                &mut k,
+                n_tok,
+                c.n_head_kv,
+                c.head_dim,
+                c.rope_dim,
+                &self.freq_table,
+                pos0,
+            );
+
+            cache.append(l, &k, &v)?;
+            let total_len = pos0 + n_tok;
+            let attn = attention(
+                &q,
+                cache.k_slice(l, total_len),
+                cache.v_slice(l, total_len),
+                n_tok,
+                pos0,
+                c.n_head,
+                c.n_head_kv,
+                c.head_dim,
+            );
+            let attn_out = gpu.matvec_q8_0(&gw.attn_output, &attn, c.n_embd, c.n_embd)?;
+            for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) {
+                *xi += ai;
+            }
+
+            let ffn_in = rmsnorm_and_scale(&x, ffn_norm, c.n_embd, c.rms_eps);
+            let gate = gpu.matvec_q8_0(&gw.ffn_gate, &ffn_in, c.n_embd, c.n_ff)?;
+            let up = gpu.matvec_q8_0(&gw.ffn_up, &ffn_in, c.n_embd, c.n_ff)?;
+            let act = swiglu(&gate, &up);
+            let ffn_out = gpu.matvec_q8_0(&gw.ffn_down, &act, c.n_ff, c.n_embd)?;
+            for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) {
+                *xi += fi;
+            }
+        }
+
+        cache.advance(n_tok);
+
+        let output_norm = self.output_norm_f32()?;
+        let final_x = rmsnorm_and_scale(&x, output_norm, c.n_embd, c.rms_eps);
+        let last = &final_x[..c.n_embd];
+        let logits = gpu.matvec_q8_0(&w.output, last, c.n_embd, c.vocab)?;
+        Ok(logits)
+    }
+}
+
 /// Multiplicação matriz-vetor Q8_0 executada na GPU.
 ///
 /// `w_bytes`: pesos Q8_0 row-major, `n_out × (n_in/32 × 34)` bytes.
@@ -105,6 +203,54 @@ mod tests {
         let f = GgufFile::parse(&bytes).ok()?;
         let cfg = LlamaConfig::from_gguf(&f).ok()?;
         Some((bytes, f, cfg))
+    }
+
+    /// Mock que roda a matemática Q8_0 na CPU (mesmas funções quantize_q8_0_split +
+    /// matmul_q8_0_actq). Note: o `forward` da CPU usa pesos *repacked* (block_q8_0x8),
+    /// cuja ordem de soma difere ligeiramente — por isso a comparação usa tolerância
+    /// (~1e-3), não igualdade exata.
+    struct CpuMockMatmul;
+    impl GpuMatmul for CpuMockMatmul {
+        fn matvec_q8_0(
+            &self,
+            w_bytes: &[u8],
+            x: &[f32],
+            n_in: usize,
+            n_out: usize,
+        ) -> Result<Vec<f32>, ModelError> {
+            let x_q8 = crate::ops::quantize_q8_0_split(x, n_in, 1);
+            Ok(crate::ops::matmul_q8_0_actq(w_bytes, &x_q8, n_in, n_out, 1))
+        }
+    }
+
+    #[test]
+    fn forward_gpu_mock_identico_a_forward_cpu() {
+        let Some((bytes, f, cfg)) = load_qwen() else {
+            eprintln!("qwen ausente — pulando");
+            return;
+        };
+        let model = crate::model::Model::load_with_config(&f, &bytes, cfg.clone()).unwrap();
+        let w = GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+        let mock = CpuMockMatmul;
+
+        let mut c_cpu = model.new_cache();
+        let mut c_gpu = model.new_cache();
+        let prompt = [cfg.bos_id, 9707u32];
+        let _ = model.forward(&prompt, &mut c_cpu).unwrap();
+        let _ = model.forward(&prompt, &mut c_gpu).unwrap();
+        let next = cfg.bos_id;
+
+        let logits_cpu = model.forward(&[next], &mut c_cpu).unwrap();
+        let logits_gpu = model.forward_gpu(&[next], &mut c_gpu, &mock, &w).unwrap();
+
+        assert_eq!(logits_cpu.len(), logits_gpu.len());
+        for (i, (a, b)) in logits_cpu.iter().zip(logits_gpu.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "logit[{i}]: cpu={a} gpu={b}");
+        }
+        eprintln!(
+            "forward_gpu(mock) == forward CPU — {} logits",
+            logits_gpu.len()
+        );
     }
 
     #[test]

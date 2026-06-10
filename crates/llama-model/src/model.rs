@@ -270,6 +270,48 @@ impl Model {
         u32::try_from(argmax(&logits)).map_err(|_| ModelError::Overflow)
     }
 
+    #[cfg(feature = "gpu")]
+    pub(crate) fn token_embd_f32(&self) -> Result<&[f32], ModelError> {
+        self.weights.token_embd.dequant_to_f32()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn layer_norms_f32(&self, l: usize) -> Result<(&[f32], &[f32]), ModelError> {
+        let lw = &self.weights.layers[l];
+        Ok((
+            lw.attn_norm.dequant_to_f32()?,
+            lw.ffn_norm.dequant_to_f32()?,
+        ))
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn output_norm_f32(&self) -> Result<&[f32], ModelError> {
+        self.weights.output_norm.dequant_to_f32()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn add_layer_biases(
+        &self,
+        l: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        kv_dim: usize,
+        n_tok: usize,
+    ) -> Result<(), ModelError> {
+        let lw = &self.weights.layers[l];
+        if let Some(b) = &lw.attn_q_bias {
+            add_bias(q, b.dequant_to_f32()?, self.config.n_embd, n_tok);
+        }
+        if let Some(b) = &lw.attn_k_bias {
+            add_bias(k, b.dequant_to_f32()?, kv_dim, n_tok);
+        }
+        if let Some(b) = &lw.attn_v_bias {
+            add_bias(v, b.dequant_to_f32()?, kv_dim, n_tok);
+        }
+        Ok(())
+    }
+
     /// Processa um batch de sequências independentes, cada uma com seu próprio cache.
     /// Retorna um vetor de logits (tamanho `vocab`) por sequência.
     /// `batch` e `caches` devem ter o mesmo comprimento.
