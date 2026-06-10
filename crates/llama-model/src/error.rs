@@ -23,4 +23,6 @@ pub enum ModelError {
     ContextOverflow(usize, usize),
     #[error("batch e caches com tamanhos diferentes: {0} vs {1}")]
     BatchMismatch(usize, usize),
+    #[error("erro no backend GPU: {0}")]
+    Gpu(String),
 }

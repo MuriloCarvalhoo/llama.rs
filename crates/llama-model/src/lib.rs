@@ -5,6 +5,8 @@ mod attention;
 mod config;
 mod error;
 mod generate;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod model;
 mod ops;
 pub(crate) mod spin_pool;
@@ -12,6 +14,8 @@ mod weights;
 
 pub use config::LlamaConfig;
 pub use error::ModelError;
+#[cfg(feature = "gpu")]
+pub use gpu::GpuMatmul;
 pub use model::Model;
 
 /// Inicializa o spin pool com `n_workers` threads em background, pinados aos `cpus` fornecidos.
