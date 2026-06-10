@@ -85,6 +85,44 @@ use crate::ops::{embedding_lookup, rmsnorm_and_scale, rope_norm, swiglu};
 
 #[cfg(feature = "gpu")]
 impl Model {
+    /// Igual a `generate_streaming`, mas o **decode** roda na GPU via `gpu`.
+    /// O **prefill** do prompt (n_tok>1) permanece na CPU (shader é matvec).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_gpu(
+        &self,
+        tokenizer: &llama_tokenizer::Tokenizer,
+        prompt: &str,
+        n_tokens: usize,
+        sampler: &llama_sampling::Sampler,
+        rng: &mut impl rand::Rng,
+        gpu: &dyn GpuMatmul,
+        w: &GpuRawWeights,
+        on_token: &mut impl FnMut(&str),
+    ) -> Result<(), ModelError> {
+        let prompt_ids = tokenizer.encode(prompt, true);
+        let mut cache = self.new_cache();
+
+        // Prefill na CPU.
+        let logits = self.forward(&prompt_ids, &mut cache)?;
+        let first_idx = sampler.sample(&logits, rng);
+        let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
+
+        let mut count = 0usize;
+        while count < n_tokens {
+            if next == self.config.eos_id {
+                break;
+            }
+            let piece = tokenizer.decode(&[next]);
+            on_token(&piece);
+            count += 1;
+            // Decode na GPU.
+            let logits = self.forward_gpu(&[next], &mut cache, gpu, w)?;
+            let idx = sampler.sample(&logits, rng);
+            next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+        }
+        Ok(())
+    }
+
     /// Forward de **decode** (n_tok=1) com os 8 matmuls na GPU.
     /// RMSNorm/RoPE/attention/SwiGLU/bias permanecem na CPU.
     pub(crate) fn forward_gpu(
@@ -251,6 +289,51 @@ mod tests {
             "forward_gpu(mock) == forward CPU — {} logits",
             logits_gpu.len()
         );
+    }
+
+    fn make_greedy_sampler() -> llama_sampling::Sampler {
+        llama_sampling::Sampler::Greedy
+    }
+
+    #[test]
+    fn generate_streaming_gpu_mock_igual_a_cpu() {
+        use llama_tokenizer::Tokenizer;
+        use rand::{SeedableRng, rngs::SmallRng};
+
+        let Some((bytes, f, cfg)) = load_qwen() else {
+            eprintln!("qwen ausente — pulando");
+            return;
+        };
+        let model = crate::model::Model::load_with_config(&f, &bytes, cfg.clone()).unwrap();
+        let tok = Tokenizer::from_gguf(&f).unwrap();
+        let w = GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+        let sampler = make_greedy_sampler();
+
+        let mut cpu_out = String::new();
+        let mut r1 = SmallRng::seed_from_u64(0);
+        model
+            .generate_streaming(&tok, "Hello", 8, &sampler, &mut r1, &mut |p| {
+                cpu_out.push_str(p)
+            })
+            .unwrap();
+
+        let mut gpu_out = String::new();
+        let mut r2 = SmallRng::seed_from_u64(0);
+        model
+            .generate_streaming_gpu(
+                &tok,
+                "Hello",
+                8,
+                &sampler,
+                &mut r2,
+                &CpuMockMatmul,
+                &w,
+                &mut |p| gpu_out.push_str(p),
+            )
+            .unwrap();
+
+        assert_eq!(cpu_out, gpu_out, "saída GPU(mock) deve igualar CPU");
+        eprintln!("generate_streaming_gpu(mock) == CPU: {gpu_out:?}");
     }
 
     #[test]
