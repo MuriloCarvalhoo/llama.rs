@@ -15,7 +15,7 @@ mod weights;
 pub use config::LlamaConfig;
 pub use error::ModelError;
 #[cfg(feature = "gpu")]
-pub use gpu::GpuMatmul;
+pub use gpu::{GpuLayerRaw, GpuMatmul, GpuRawWeights};
 pub use model::Model;
 
 /// Inicializa o spin pool com `n_workers` threads em background, pinados aos `cpus` fornecidos.
