@@ -746,3 +746,35 @@ fn resident_fwd_attention_igual_cpu() {
         assert!((a - b).abs() < 1e-3, "attn[{i}]: cpu={a} gpu={b}");
     }
 }
+
+// ─── Fase 8.1C Task 11: ResidentForward logits == CPU (gate de correctude E2E) ─
+
+#[test]
+fn resident_forward_logits_iguais_a_cpu_qwen() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let path = "../../models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("modelo ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let model = llama_model::Model::load(&f, &bytes).unwrap();
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config).unwrap();
+    let aux = model.gpu_aux_weights().unwrap();
+    let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux).unwrap();
+
+    let prompt: [u32; 2] = [model.config.bos_id, 9707];
+    let cpu = model.decode_one_cpu_owned(&prompt).unwrap();
+    let gpu = model
+        .decode_one_gpu_resident_owned(&prompt, &backend)
+        .unwrap();
+    assert_eq!(cpu, gpu, "argmax do decode GPU-resident deve igualar CPU");
+}

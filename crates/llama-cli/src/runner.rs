@@ -177,7 +177,43 @@ pub fn run_generate(
     let mut start: Option<Instant> = None;
 
     #[cfg(feature = "gpu")]
-    let used_gpu = if args.gpu_single {
+    let used_gpu = if args.gpu_resident {
+        use llama_vulkan::{ResidentForward, VulkanContext};
+        match VulkanContext::new() {
+            Ok(ctx) if !ctx.amd_compute_devices().is_empty() => {
+                let dev0 = ctx.amd_compute_devices()[0].name().to_owned();
+                eprintln!("[GPU] {dev0} — decode 100% na GPU (resident-fwd)");
+                let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config)?;
+                let aux = model.gpu_aux_weights()?;
+                let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux)
+                    .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
+                model.generate_streaming_gpu_resident(
+                    &tokenizer,
+                    &args.prompt,
+                    args.n_predict,
+                    &sampler,
+                    &mut rng,
+                    &backend,
+                    &mut |piece| {
+                        if start.is_none() {
+                            start = Some(Instant::now());
+                        }
+                        on_token(piece);
+                        n_tokens += 1;
+                    },
+                )?;
+                true
+            }
+            Ok(_) => {
+                eprintln!("[GPU] nenhum device AMD — fallback CPU");
+                false
+            }
+            Err(e) => {
+                eprintln!("[GPU] Vulkan indisponivel ({e}) — fallback CPU");
+                false
+            }
+        }
+    } else if args.gpu_single {
         use llama_vulkan::{ResidentGpu, VulkanContext};
         match VulkanContext::new() {
             Ok(ctx) if !ctx.amd_compute_devices().is_empty() => {
@@ -259,7 +295,7 @@ pub fn run_generate(
     };
     #[cfg(not(feature = "gpu"))]
     let used_gpu = {
-        if args.gpu || args.gpu_single {
+        if args.gpu || args.gpu_single || args.gpu_resident {
             eprintln!("[GPU] Build sem feature 'gpu' -- recompile com: cargo build --features gpu");
         }
         false

@@ -50,4 +50,8 @@ pub struct Args {
     /// Backend Vulkan single-GPU com pesos residentes (Fase 8.1A). Requer feature "gpu".
     #[arg(long, default_value = "false")]
     pub gpu_single: bool,
+
+    /// Backend Vulkan com decode 100% na GPU (Fase 1C). Requer feature "gpu".
+    #[arg(long = "gpu-resident", default_value_t = false)]
+    pub gpu_resident: bool,
 }
