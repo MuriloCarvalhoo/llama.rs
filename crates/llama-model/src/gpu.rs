@@ -76,6 +76,33 @@ impl GpuRawWeights {
     }
 }
 
+/// Pesos auxiliares f32 que o decode GPU-resident precisa (norm/bias/freq/embd).
+/// `token_embd` é emprestado do Model (grande); o resto é copiado (pequeno).
+pub struct GpuAuxWeights<'a> {
+    pub token_embd: &'a [f32], // [vocab * n_embd]
+    pub layers: Vec<AuxLayer>,
+    pub output_norm: Vec<f32>, // [n_embd]
+    pub freq_table: Vec<f32>,  // [rope_dim/2]
+}
+
+/// Pesos auxiliares f32 por camada.
+pub struct AuxLayer {
+    pub attn_norm: Vec<f32>,      // [n_embd]
+    pub ffn_norm: Vec<f32>,       // [n_embd]
+    pub q_bias: Option<Vec<f32>>, // [n_embd]
+    pub k_bias: Option<Vec<f32>>, // [kv_dim]
+    pub v_bias: Option<Vec<f32>>, // [kv_dim]
+}
+
+/// Decode 100% na GPU: a stack inteira do token roda na GPU, KV-cache residente.
+/// Implementado por `llama_vulkan::ResidentForward`.
+pub trait GpuResidentDecode {
+    /// Decode de 1 token na posição absoluta `pos` (0-based). Retorna os logits ([vocab]).
+    fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, ModelError>;
+    /// Zera o comprimento do KV-cache interno (início de nova sequência).
+    fn reset(&self);
+}
+
 #[cfg(feature = "gpu")]
 use crate::attention::{KvCache, attention};
 #[cfg(feature = "gpu")]
@@ -143,6 +170,97 @@ impl Model {
             .last()
             .ok_or_else(|| ModelError::Gpu("prompt vazio".into()))?;
         let logits = self.forward_gpu(&[last], &mut cache, gpu, w)?;
+        u32::try_from(crate::ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
+    }
+
+    /// Coleta os pesos auxiliares f32 para o backend GPU-resident.
+    pub fn gpu_aux_weights(&self) -> Result<GpuAuxWeights<'_>, ModelError> {
+        let token_embd = self.token_embd_f32()?;
+        let output_norm = self.output_norm_f32()?.to_vec();
+        let freq_table = self.freq_table.clone();
+        let mut layers = Vec::with_capacity(self.config.n_layer);
+        for l in 0..self.config.n_layer {
+            let (attn_norm, ffn_norm) = self.layer_norms_f32(l)?;
+            let attn_norm = attn_norm.to_vec();
+            let ffn_norm = ffn_norm.to_vec();
+            let lw = &self.weights.layers[l];
+            let bias =
+                |b: &Option<crate::weights::RawTensor>| -> Result<Option<Vec<f32>>, ModelError> {
+                    match b {
+                        Some(t) => Ok(Some(t.dequant_to_f32()?.to_vec())),
+                        None => Ok(None),
+                    }
+                };
+            layers.push(AuxLayer {
+                attn_norm,
+                ffn_norm,
+                q_bias: bias(&lw.attn_q_bias)?,
+                k_bias: bias(&lw.attn_k_bias)?,
+                v_bias: bias(&lw.attn_v_bias)?,
+            });
+        }
+        Ok(GpuAuxWeights {
+            token_embd,
+            layers,
+            output_norm,
+            freq_table,
+        })
+    }
+
+    /// Igual a `generate_streaming_gpu`, mas o token inteiro (prefill incluído) roda na
+    /// GPU via `gpu` (KV-cache residente). Os logits só voltam ao host para o sampler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_gpu_resident(
+        &self,
+        tokenizer: &llama_tokenizer::Tokenizer,
+        prompt: &str,
+        n_tokens: usize,
+        sampler: &llama_sampling::Sampler,
+        rng: &mut impl rand::Rng,
+        gpu: &dyn GpuResidentDecode,
+        on_token: &mut impl FnMut(&str),
+    ) -> Result<(), ModelError> {
+        let prompt_ids = tokenizer.encode(prompt, true);
+        if prompt_ids.is_empty() {
+            return Err(ModelError::Gpu("prompt vazio".into()));
+        }
+        gpu.reset();
+
+        let mut logits = Vec::new();
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            logits = gpu.decode(t, pos)?;
+        }
+        let first_idx = sampler.sample(&logits, rng);
+        let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
+        let mut pos = prompt_ids.len();
+
+        let mut count = 0usize;
+        while count < n_tokens {
+            if next == self.config.eos_id {
+                break;
+            }
+            let piece = tokenizer.decode(&[next]);
+            on_token(&piece);
+            count += 1;
+            let logits = gpu.decode(next, pos)?;
+            pos += 1;
+            let idx = sampler.sample(&logits, rng);
+            next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Prefill + 1 decode 100% na GPU; argmax dos logits. Para teste de paridade vs CPU.
+    pub fn decode_one_gpu_resident_owned(
+        &self,
+        prompt: &[u32],
+        gpu: &dyn GpuResidentDecode,
+    ) -> Result<u32, ModelError> {
+        gpu.reset();
+        let mut logits = Vec::new();
+        for (pos, &t) in prompt.iter().enumerate() {
+            logits = gpu.decode(t, pos)?;
+        }
         u32::try_from(crate::ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
     }
 
