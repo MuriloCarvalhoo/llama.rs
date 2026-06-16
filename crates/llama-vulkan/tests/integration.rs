@@ -630,3 +630,51 @@ fn resident_fwd_add_igual_cpu() {
         assert!((a - b).abs() < 1e-5, "add[{i}]: cpu={a} gpu={b}");
     }
 }
+
+// ─── Fase 8.1C Task 6: rope GPU == CPU ───────────────────────────────────────
+
+#[test]
+fn resident_fwd_rope_igual_cpu() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n_head = 14usize;
+    let head_dim = 64usize;
+    let rope_dim = 64usize;
+    let pos = 5usize;
+    let freq_base = 1_000_000.0f32;
+    let freq: Vec<f32> = (0..rope_dim / 2)
+        .map(|i| freq_base.powf(-2.0 * i as f32 / rope_dim as f32))
+        .collect();
+    let mut x: Vec<f32> = (0..n_head * head_dim)
+        .map(|i| ((i % 17) as f32) * 0.1 - 0.7)
+        .collect();
+
+    let mut cpu = x.clone();
+    for h in 0..n_head {
+        let base = h * head_dim;
+        for i in 0..rope_dim / 2 {
+            let theta = pos as f32 * freq[i];
+            let (s, c) = theta.sin_cos();
+            let a = cpu[base + 2 * i];
+            let b = cpu[base + 2 * i + 1];
+            cpu[base + 2 * i] = a * c - b * s;
+            cpu[base + 2 * i + 1] = a * s + b * c;
+        }
+    }
+
+    let gpu = fwd
+        .dbg_rope(&mut x, n_head, head_dim, rope_dim, &freq, pos)
+        .unwrap();
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-4, "rope[{i}]: cpu={a} gpu={b}");
+    }
+}

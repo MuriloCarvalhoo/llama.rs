@@ -1,3 +1,23 @@
 #version 450
 layout(local_size_x = 64) in;
-void main() {}
+layout(set = 0, binding = 0) buffer XBuf { float x[]; } xb;        // inout
+layout(set = 0, binding = 1) readonly buffer FBuf { float f[]; } fb; // freq_table[rope_dim/2]
+layout(push_constant) uniform PC {
+    uint n_head; uint head_dim; uint rope_dim; float pos;
+} pc;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_rope = pc.rope_dim / 2u;
+    uint total = pc.n_head * half_rope;
+    if (idx >= total) return;
+    uint h = idx / half_rope;
+    uint i = idx % half_rope;
+    uint base = h * pc.head_dim;
+    float theta = pc.pos * fb.f[i];
+    float s = sin(theta);
+    float c = cos(theta);
+    float a = xb.x[base + 2u * i];
+    float b = xb.x[base + 2u * i + 1u];
+    xb.x[base + 2u * i]      = a * c - b * s;
+    xb.x[base + 2u * i + 1u] = a * s + b * c;
+}

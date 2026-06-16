@@ -452,6 +452,61 @@ impl<'ctx> ResidentForward<'ctx> {
         ob.destroy(d);
         Ok(out)
     }
+
+    /// Diagnóstico: roda o shader rope in-place sobre `x` e devolve o resultado ao host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_rope(
+        &self,
+        x: &mut [f32],
+        n_head: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        freq: &[f32],
+        pos: usize,
+    ) -> Result<Vec<f32>, MatmulError> {
+        #[repr(C)]
+        struct P {
+            n_head: u32,
+            head_dim: u32,
+            rope_dim: u32,
+            pos: f32,
+        }
+        let d = &self.dev.device;
+        let xb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(x) as vk::DeviceSize,
+        )?;
+        let fb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(freq) as vk::DeviceSize,
+        )?;
+        self.upload_f32(&xb, x)?;
+        self.upload_f32(&fb, freq)?;
+        let set = self.alloc_set(&self.rope)?;
+        let push = P {
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            rope_dim: rope_dim as u32,
+            pos: pos as f32,
+        };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 16) };
+        let pairs = n_head * (rope_dim / 2);
+        self.dispatch1(
+            &self.rope,
+            set,
+            &[(xb.buffer, 0, xb.size), (fb.buffer, 0, fb.size)],
+            pb,
+            Self::groups_for(pairs),
+        )?;
+        let out = self.readback(&xb, x.len())?;
+        xb.destroy(d);
+        fb.destroy(d);
+        Ok(out)
+    }
 }
 
 impl Drop for ResidentForward<'_> {
