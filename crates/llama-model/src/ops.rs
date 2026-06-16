@@ -155,12 +155,12 @@ fn q8_0_dot_avx2(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
     // SAFETY: intrinsics protegidos por #[target_feature(enable = "avx2,fma")];
     // caller garante AVX2+FMA disponíveis em runtime (via is_x86_feature_detected!).
     // Ponteiros gerados a partir de slices válidos com bounds verificados pelo loop.
-    let mut acc = unsafe { _mm256_setzero_ps() };
+    let mut acc = _mm256_setzero_ps();
 
     for b in 0..n_blocks {
         let bw = b * B;
         let d_bits = u16::from_le_bytes([w_row[bw], w_row[bw + 1]]);
-        let d = unsafe { _mm256_set1_ps(half::f16::from_bits(d_bits).to_f32()) };
+        let d = _mm256_set1_ps(half::f16::from_bits(d_bits).to_f32());
 
         let qs = unsafe { w_row.as_ptr().add(bw + 2) };
         let xb = unsafe { x_row.as_ptr().add(b * Q) };
@@ -175,16 +175,16 @@ fn q8_0_dot_avx2(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
         let x2 = unsafe { _mm256_loadu_ps(xb.add(16)) };
         let x3 = unsafe { _mm256_loadu_ps(xb.add(24)) };
 
-        let s0 = unsafe { _mm256_mul_ps(_mm256_cvtepi32_ps(q0), x0) };
-        let s1 = unsafe { _mm256_mul_ps(_mm256_cvtepi32_ps(q1), x1) };
-        let s2 = unsafe { _mm256_mul_ps(_mm256_cvtepi32_ps(q2), x2) };
-        let s3 = unsafe { _mm256_mul_ps(_mm256_cvtepi32_ps(q3), x3) };
+        let s0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q0), x0);
+        let s1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1), x1);
+        let s2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2), x2);
+        let s3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3), x3);
 
-        let sum = unsafe { _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)) };
-        acc = unsafe { _mm256_fmadd_ps(d, sum, acc) };
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+        acc = _mm256_fmadd_ps(d, sum, acc);
     }
 
-    unsafe { hsum_f32_avx(acc) }
+    hsum_f32_avx(acc)
 }
 
 /// Kernel AVX2 explícito para Q8_0 × Q8_0.
@@ -198,8 +198,8 @@ fn q8_0_q8_0_dot_avx2(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
     const B: usize = 34;
 
     // SAFETY: intrinsics protegidos por #[target_feature]; slices têm n_blocks × 34 bytes.
-    let mut acc = unsafe { _mm256_setzero_ps() };
-    let ones = unsafe { _mm256_set1_epi16(1) };
+    let mut acc = _mm256_setzero_ps();
+    let ones = _mm256_set1_epi16(1);
 
     for b in 0..n_blocks {
         let boff = b * B;
@@ -228,7 +228,7 @@ fn q8_0_q8_0_dot_avx2(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
         }
     }
 
-    unsafe { hsum_f32_avx(acc) }
+    hsum_f32_avx(acc)
 }
 
 /// Redução horizontal: 8 floats AVX → 1 f32.
@@ -238,15 +238,13 @@ fn q8_0_q8_0_dot_avx2(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
 fn hsum_f32_avx(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     // SAFETY: veja q8_0_dot_avx2.
-    unsafe {
-        let hi128 = _mm256_extractf128_ps(v, 1);
-        let lo128 = _mm256_castps256_ps128(v);
-        let sum128 = _mm_add_ps(lo128, hi128);
-        let hi64 = _mm_movehl_ps(sum128, sum128);
-        let sum64 = _mm_add_ps(sum128, hi64);
-        let hi32 = _mm_shuffle_ps(sum64, sum64, 0x1);
-        _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
-    }
+    let hi128 = _mm256_extractf128_ps(v, 1);
+    let lo128 = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo128, hi128);
+    let hi64 = _mm_movehl_ps(sum128, sum128);
+    let sum64 = _mm_add_ps(sum128, hi64);
+    let hi32 = _mm_shuffle_ps(sum64, sum64, 0x1);
+    _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
 }
 
 /// Otimização 1 — produto escalar Q8_0 × f32 com dispatch AVX2/fallback scalar.
@@ -287,59 +285,61 @@ fn q8_0_dot_scalar(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_q8_0_avx2(x: &[f32]) -> Vec<u8> {
-    use std::arch::x86_64::*;
-    const Q: usize = 32;
-    const B: usize = 34;
-    let n_blocks = x.len() / Q;
-    let capacity = n_blocks * B;
-    let mut out = Vec::with_capacity(capacity);
-    // abs mask: zera o bit de sinal sem branch
-    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFi32));
-    // permutação para corrigir cross-lane ordering após packs: dwords [0,4,1,5,2,6,3,7]
-    let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-    let base_ptr: *mut u8 = out.as_mut_ptr();
-    for b in 0..n_blocks {
-        let p = x.as_ptr().add(b * Q);
-        let v0 = _mm256_loadu_ps(p);
-        let v1 = _mm256_loadu_ps(p.add(8));
-        let v2 = _mm256_loadu_ps(p.add(16));
-        let v3 = _mm256_loadu_ps(p.add(24));
-        // max abs via árvore de reduções
-        let max01 = _mm256_max_ps(_mm256_and_ps(v0, abs_mask), _mm256_and_ps(v1, abs_mask));
-        let max23 = _mm256_max_ps(_mm256_and_ps(v2, abs_mask), _mm256_and_ps(v3, abs_mask));
-        let max4 = _mm256_max_ps(max01, max23);
-        let hi = _mm256_extractf128_ps(max4, 1);
-        let lo = _mm256_castps256_ps128(max4);
-        let m = _mm_max_ps(hi, lo);
-        let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x4E)); // swap pairs [2,3,0,1]
-        let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x01)); // lane0 ← max(lane0, lane1)
-        let max_abs = _mm_cvtss_f32(m);
-        // escala
-        let d = if max_abs > 0.0 {
-            max_abs / 127.0_f32
-        } else {
-            0.0_f32
-        };
-        let d_inv = if d > 0.0 { 1.0_f32 / d } else { 0.0_f32 };
-        let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
-        // quantiza: multiply + round-to-nearest (MXCSR default) + convert to i32
-        let inv_v = _mm256_set1_ps(d_inv);
-        let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, inv_v));
-        let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, inv_v));
-        let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, inv_v));
-        let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, inv_v));
-        // i32→i16→i8 com saturação; corrige cross-lane com permutevar
-        let q01 = _mm256_packs_epi32(q0, q1);
-        let q23 = _mm256_packs_epi32(q2, q3);
-        let bytes32 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(q01, q23), perm);
-        // escreve diretamente no buffer pré-alocado
-        let dst = base_ptr.add(b * B);
-        std::ptr::copy_nonoverlapping(d_bits.as_ptr(), dst, 2);
-        _mm256_storeu_si256(dst.add(2) as *mut __m256i, bytes32);
+    unsafe {
+        use std::arch::x86_64::*;
+        const Q: usize = 32;
+        const B: usize = 34;
+        let n_blocks = x.len() / Q;
+        let capacity = n_blocks * B;
+        let mut out = Vec::with_capacity(capacity);
+        // abs mask: zera o bit de sinal sem branch
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFi32));
+        // permutação para corrigir cross-lane ordering após packs: dwords [0,4,1,5,2,6,3,7]
+        let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let base_ptr: *mut u8 = out.as_mut_ptr();
+        for b in 0..n_blocks {
+            let p = x.as_ptr().add(b * Q);
+            let v0 = _mm256_loadu_ps(p);
+            let v1 = _mm256_loadu_ps(p.add(8));
+            let v2 = _mm256_loadu_ps(p.add(16));
+            let v3 = _mm256_loadu_ps(p.add(24));
+            // max abs via árvore de reduções
+            let max01 = _mm256_max_ps(_mm256_and_ps(v0, abs_mask), _mm256_and_ps(v1, abs_mask));
+            let max23 = _mm256_max_ps(_mm256_and_ps(v2, abs_mask), _mm256_and_ps(v3, abs_mask));
+            let max4 = _mm256_max_ps(max01, max23);
+            let hi = _mm256_extractf128_ps(max4, 1);
+            let lo = _mm256_castps256_ps128(max4);
+            let m = _mm_max_ps(hi, lo);
+            let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x4E)); // swap pairs [2,3,0,1]
+            let m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x01)); // lane0 ← max(lane0, lane1)
+            let max_abs = _mm_cvtss_f32(m);
+            // escala
+            let d = if max_abs > 0.0 {
+                max_abs / 127.0_f32
+            } else {
+                0.0_f32
+            };
+            let d_inv = if d > 0.0 { 1.0_f32 / d } else { 0.0_f32 };
+            let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
+            // quantiza: multiply + round-to-nearest (MXCSR default) + convert to i32
+            let inv_v = _mm256_set1_ps(d_inv);
+            let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, inv_v));
+            let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, inv_v));
+            let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, inv_v));
+            let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, inv_v));
+            // i32→i16→i8 com saturação; corrige cross-lane com permutevar
+            let q01 = _mm256_packs_epi32(q0, q1);
+            let q23 = _mm256_packs_epi32(q2, q3);
+            let bytes32 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(q01, q23), perm);
+            // escreve diretamente no buffer pré-alocado
+            let dst = base_ptr.add(b * B);
+            std::ptr::copy_nonoverlapping(d_bits.as_ptr(), dst, 2);
+            _mm256_storeu_si256(dst.add(2) as *mut __m256i, bytes32);
+        }
+        // SAFETY: capacity bytes foram escritos acima
+        out.set_len(capacity);
+        out
     }
-    // SAFETY: capacity bytes foram escritos acima
-    out.set_len(capacity);
-    out
 }
 
 /// Otimização 2a — quantiza um vetor f32 para Q8_0.
@@ -408,68 +408,74 @@ unsafe fn q8_0_q8_0_dot_4rows_avx2(
     x_ptr: *const u8,
     n_blocks: usize,
 ) -> [f32; 4] {
-    use std::arch::x86_64::*;
-    const B: usize = 34;
+    unsafe {
+        use std::arch::x86_64::*;
+        const B: usize = 34;
 
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-    let w1 = w_ptr.add(row_bytes);
-    let w2 = w_ptr.add(2 * row_bytes);
-    let w3 = w_ptr.add(3 * row_bytes);
+        let w1 = w_ptr.add(row_bytes);
+        let w2 = w_ptr.add(2 * row_bytes);
+        let w3 = w_ptr.add(3 * row_bytes);
 
-    let ones = _mm256_set1_epi16(1);
-    // Pré-busca para esconder latência: o loop tem apenas 28 iterações (n_in=896),
-    // o que é curto demais para o hardware prefetcher aprender o padrão a tempo.
-    const PF: usize = 1; // distância de pré-busca em blocos
-    const PF_BYTES: usize = PF * B;
+        let ones = _mm256_set1_epi16(1);
+        // Pré-busca para esconder latência: o loop tem apenas 28 iterações (n_in=896),
+        // o que é curto demais para o hardware prefetcher aprender o padrão a tempo.
+        const PF: usize = 1; // distância de pré-busca em blocos
+        const PF_BYTES: usize = PF * B;
 
-    for b in 0..n_blocks {
-        let boff = b * B;
+        for b in 0..n_blocks {
+            let boff = b * B;
 
-        // Software prefetch — carrega dados de w_ptr..w3 no L2 para a iteração b+PF.
-        if boff + PF_BYTES < n_blocks * B {
-            let next = boff + PF_BYTES;
-            _mm_prefetch(w_ptr.add(next) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w1.add(next) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w2.add(next) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w3.add(next) as *const i8, _MM_HINT_T1);
+            // Software prefetch — carrega dados de w_ptr..w3 no L2 para a iteração b+PF.
+            if boff + PF_BYTES < n_blocks * B {
+                let next = boff + PF_BYTES;
+                _mm_prefetch(w_ptr.add(next) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w1.add(next) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w2.add(next) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w3.add(next) as *const i8, _MM_HINT_T1);
+            }
+
+            // Carrega bloco x uma única vez — dx e qx ficam em registradores para as 4 linhas.
+            let dx =
+                half::f16::from_bits(u16::from_le_bytes([*x_ptr.add(boff), *x_ptr.add(boff + 1)]))
+                    .to_f32();
+            let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
+
+            // Macro maddubs: abs(qw)×sign(qx,qw) → i16 pares → i32; 4 instr. vs 7 (cvtepi8×4+madd×2+add).
+            macro_rules! dot_row {
+                ($acc:ident, $wp:expr) => {{
+                    let dw = half::f16::from_bits(u16::from_le_bytes([
+                        *$wp.add(boff),
+                        *$wp.add(boff + 1),
+                    ]))
+                    .to_f32();
+                    let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
+                    let sum_i32 = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
+                        ones,
+                    );
+                    $acc =
+                        _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
+                }};
+            }
+
+            dot_row!(acc0, w_ptr);
+            dot_row!(acc1, w1);
+            dot_row!(acc2, w2);
+            dot_row!(acc3, w3);
         }
 
-        // Carrega bloco x uma única vez — dx e qx ficam em registradores para as 4 linhas.
-        let dx = half::f16::from_bits(u16::from_le_bytes([*x_ptr.add(boff), *x_ptr.add(boff + 1)]))
-            .to_f32();
-        let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
-
-        // Macro maddubs: abs(qw)×sign(qx,qw) → i16 pares → i32; 4 instr. vs 7 (cvtepi8×4+madd×2+add).
-        macro_rules! dot_row {
-            ($acc:ident, $wp:expr) => {{
-                let dw =
-                    half::f16::from_bits(u16::from_le_bytes([*$wp.add(boff), *$wp.add(boff + 1)]))
-                        .to_f32();
-                let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
-                let sum_i32 = _mm256_madd_epi16(
-                    _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                    ones,
-                );
-                $acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-            }};
-        }
-
-        dot_row!(acc0, w_ptr);
-        dot_row!(acc1, w1);
-        dot_row!(acc2, w2);
-        dot_row!(acc3, w3);
+        [
+            hsum_f32_avx(acc0),
+            hsum_f32_avx(acc1),
+            hsum_f32_avx(acc2),
+            hsum_f32_avx(acc3),
+        ]
     }
-
-    [
-        hsum_f32_avx(acc0),
-        hsum_f32_avx(acc1),
-        hsum_f32_avx(acc2),
-        hsum_f32_avx(acc3),
-    ]
 }
 
 /// Kernel 8 linhas com F16C: converte escala f16→f32 em 1 instrução (vs ~10 no software),
@@ -482,86 +488,89 @@ unsafe fn q8_0_q8_0_dot_8rows_avx2_f16c(
     x_ptr: *const u8,
     n_blocks: usize,
 ) -> [f32; 8] {
-    use std::arch::x86_64::*;
-    const B: usize = 34;
+    unsafe {
+        use std::arch::x86_64::*;
+        const B: usize = 34;
 
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
-    let mut acc4 = _mm256_setzero_ps();
-    let mut acc5 = _mm256_setzero_ps();
-    let mut acc6 = _mm256_setzero_ps();
-    let mut acc7 = _mm256_setzero_ps();
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut acc4 = _mm256_setzero_ps();
+        let mut acc5 = _mm256_setzero_ps();
+        let mut acc6 = _mm256_setzero_ps();
+        let mut acc7 = _mm256_setzero_ps();
 
-    let w1 = w_ptr.add(row_bytes);
-    let w2 = w_ptr.add(2 * row_bytes);
-    let w3 = w_ptr.add(3 * row_bytes);
-    let w4 = w_ptr.add(4 * row_bytes);
-    let w5 = w_ptr.add(5 * row_bytes);
-    let w6 = w_ptr.add(6 * row_bytes);
-    let w7 = w_ptr.add(7 * row_bytes);
+        let w1 = w_ptr.add(row_bytes);
+        let w2 = w_ptr.add(2 * row_bytes);
+        let w3 = w_ptr.add(3 * row_bytes);
+        let w4 = w_ptr.add(4 * row_bytes);
+        let w5 = w_ptr.add(5 * row_bytes);
+        let w6 = w_ptr.add(6 * row_bytes);
+        let w7 = w_ptr.add(7 * row_bytes);
 
-    let ones = _mm256_set1_epi16(1);
-    const PF: usize = 2;
-    const PF_BYTES: usize = PF * B;
+        let ones = _mm256_set1_epi16(1);
+        const PF: usize = 2;
+        const PF_BYTES: usize = PF * B;
 
-    for b in 0..n_blocks {
-        let boff = b * B;
-        if boff + PF_BYTES < n_blocks * B {
-            let nxt = boff + PF_BYTES;
-            _mm_prefetch(w_ptr.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w1.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w2.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w3.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w4.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w5.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w6.add(nxt) as *const i8, _MM_HINT_T1);
-            _mm_prefetch(w7.add(nxt) as *const i8, _MM_HINT_T1);
+        for b in 0..n_blocks {
+            let boff = b * B;
+            if boff + PF_BYTES < n_blocks * B {
+                let nxt = boff + PF_BYTES;
+                _mm_prefetch(w_ptr.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w1.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w2.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w3.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w4.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w5.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w6.add(nxt) as *const i8, _MM_HINT_T1);
+                _mm_prefetch(w7.add(nxt) as *const i8, _MM_HINT_T1);
+            }
+
+            // F16C: carrega f16 em 1 instrução vcvtph2ps ao invés de ~10 instruções software.
+            macro_rules! f16c {
+                ($p:expr) => {{
+                    let bits = (*($p).add(boff) as i32) | ((*($p).add(boff + 1) as i32) << 8);
+                    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)))
+                }};
+            }
+            let dx = f16c!(x_ptr);
+            let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
+
+            macro_rules! dot_row {
+                ($acc:ident, $wp:expr) => {{
+                    let dw = f16c!($wp);
+                    let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
+                    let sum_i32 = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
+                        ones,
+                    );
+                    $acc =
+                        _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
+                }};
+            }
+
+            dot_row!(acc0, w_ptr);
+            dot_row!(acc1, w1);
+            dot_row!(acc2, w2);
+            dot_row!(acc3, w3);
+            dot_row!(acc4, w4);
+            dot_row!(acc5, w5);
+            dot_row!(acc6, w6);
+            dot_row!(acc7, w7);
         }
 
-        // F16C: carrega f16 em 1 instrução vcvtph2ps ao invés de ~10 instruções software.
-        macro_rules! f16c {
-            ($p:expr) => {{
-                let bits = (*($p).add(boff) as i32) | ((*($p).add(boff + 1) as i32) << 8);
-                _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)))
-            }};
-        }
-        let dx = f16c!(x_ptr);
-        let qx = _mm256_loadu_si256(x_ptr.add(boff + 2) as *const __m256i);
-
-        macro_rules! dot_row {
-            ($acc:ident, $wp:expr) => {{
-                let dw = f16c!($wp);
-                let qw = _mm256_loadu_si256($wp.add(boff + 2) as *const __m256i);
-                let sum_i32 = _mm256_madd_epi16(
-                    _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                    ones,
-                );
-                $acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-            }};
-        }
-
-        dot_row!(acc0, w_ptr);
-        dot_row!(acc1, w1);
-        dot_row!(acc2, w2);
-        dot_row!(acc3, w3);
-        dot_row!(acc4, w4);
-        dot_row!(acc5, w5);
-        dot_row!(acc6, w6);
-        dot_row!(acc7, w7);
+        [
+            hsum_f32_avx(acc0),
+            hsum_f32_avx(acc1),
+            hsum_f32_avx(acc2),
+            hsum_f32_avx(acc3),
+            hsum_f32_avx(acc4),
+            hsum_f32_avx(acc5),
+            hsum_f32_avx(acc6),
+            hsum_f32_avx(acc7),
+        ]
     }
-
-    [
-        hsum_f32_avx(acc0),
-        hsum_f32_avx(acc1),
-        hsum_f32_avx(acc2),
-        hsum_f32_avx(acc3),
-        hsum_f32_avx(acc4),
-        hsum_f32_avx(acc5),
-        hsum_f32_avx(acc6),
-        hsum_f32_avx(acc7),
-    ]
 }
 
 /// Recompacta pesos Q8_0 de row-major para block_q8_0x8.
@@ -612,76 +621,80 @@ unsafe fn q8_0_q8_0_dot_8rows_repacked_f16c(
     x_ptr: *const u8,
     n_blocks: usize,
 ) -> [f32; 8] {
-    use std::arch::x86_64::*;
-    const XB: usize = 34;
-    const PB: usize = 272;
+    unsafe {
+        use std::arch::x86_64::*;
+        const XB: usize = 34;
+        const PB: usize = 272;
 
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
-    let mut acc4 = _mm256_setzero_ps();
-    let mut acc5 = _mm256_setzero_ps();
-    let mut acc6 = _mm256_setzero_ps();
-    let mut acc7 = _mm256_setzero_ps();
-    let ones = _mm256_set1_epi16(1);
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut acc4 = _mm256_setzero_ps();
+        let mut acc5 = _mm256_setzero_ps();
+        let mut acc6 = _mm256_setzero_ps();
+        let mut acc7 = _mm256_setzero_ps();
+        let ones = _mm256_set1_epi16(1);
 
-    for b in 0..n_blocks {
-        let boff = b * PB;
-        let x_boff = b * XB;
-        // Prefetch próximo bloco (272 bytes = 4-5 cache lines)
-        if b + 2 < n_blocks {
-            let nxt = (b + 2) * PB;
-            _mm_prefetch(packed_ptr.add(nxt) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(packed_ptr.add(nxt + 64) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(packed_ptr.add(nxt + 128) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(packed_ptr.add(nxt + 192) as *const i8, _MM_HINT_T0);
+        for b in 0..n_blocks {
+            let boff = b * PB;
+            let x_boff = b * XB;
+            // Prefetch próximo bloco (272 bytes = 4-5 cache lines)
+            if b + 2 < n_blocks {
+                let nxt = (b + 2) * PB;
+                _mm_prefetch(packed_ptr.add(nxt) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(packed_ptr.add(nxt + 64) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(packed_ptr.add(nxt + 128) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(packed_ptr.add(nxt + 192) as *const i8, _MM_HINT_T0);
+            }
+            // Escala x via F16C
+            let dx_bits = (*x_ptr.add(x_boff) as i32) | ((*x_ptr.add(x_boff + 1) as i32) << 8);
+            let dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(dx_bits)));
+            let qx = _mm256_loadu_si256(x_ptr.add(x_boff + 2) as *const __m256i);
+            // Carrega 8 escalas f16 em 1 load de 128 bits → 2 × _mm_cvtph_ps
+            let sc128 = _mm_loadu_si128(packed_ptr.add(boff) as *const __m128i);
+            let dw_lo = _mm_cvtph_ps(sc128);
+            let dw_hi = _mm_cvtph_ps(_mm_srli_si128(sc128, 8));
+            let d0 = _mm_cvtss_f32(dw_lo);
+            let d1 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0x55));
+            let d2 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xAA));
+            let d3 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xFF));
+            let d4 = _mm_cvtss_f32(dw_hi);
+            let d5 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0x55));
+            let d6 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xAA));
+            let d7 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xFF));
+            macro_rules! dot_row {
+                ($acc:ident, $j:expr, $d:expr) => {{
+                    let qw =
+                        _mm256_loadu_si256(packed_ptr.add(boff + 16 + $j * 32) as *const __m256i);
+                    let sum_i32 = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
+                        ones,
+                    );
+                    $acc =
+                        _mm256_fmadd_ps(_mm256_set1_ps($d * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
+                }};
+            }
+            dot_row!(acc0, 0, d0);
+            dot_row!(acc1, 1, d1);
+            dot_row!(acc2, 2, d2);
+            dot_row!(acc3, 3, d3);
+            dot_row!(acc4, 4, d4);
+            dot_row!(acc5, 5, d5);
+            dot_row!(acc6, 6, d6);
+            dot_row!(acc7, 7, d7);
         }
-        // Escala x via F16C
-        let dx_bits = (*x_ptr.add(x_boff) as i32) | ((*x_ptr.add(x_boff + 1) as i32) << 8);
-        let dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(dx_bits)));
-        let qx = _mm256_loadu_si256(x_ptr.add(x_boff + 2) as *const __m256i);
-        // Carrega 8 escalas f16 em 1 load de 128 bits → 2 × _mm_cvtph_ps
-        let sc128 = _mm_loadu_si128(packed_ptr.add(boff) as *const __m128i);
-        let dw_lo = _mm_cvtph_ps(sc128);
-        let dw_hi = _mm_cvtph_ps(_mm_srli_si128(sc128, 8));
-        let d0 = _mm_cvtss_f32(dw_lo);
-        let d1 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0x55));
-        let d2 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xAA));
-        let d3 = _mm_cvtss_f32(_mm_shuffle_ps(dw_lo, dw_lo, 0xFF));
-        let d4 = _mm_cvtss_f32(dw_hi);
-        let d5 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0x55));
-        let d6 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xAA));
-        let d7 = _mm_cvtss_f32(_mm_shuffle_ps(dw_hi, dw_hi, 0xFF));
-        macro_rules! dot_row {
-            ($acc:ident, $j:expr, $d:expr) => {{
-                let qw = _mm256_loadu_si256(packed_ptr.add(boff + 16 + $j * 32) as *const __m256i);
-                let sum_i32 = _mm256_madd_epi16(
-                    _mm256_maddubs_epi16(_mm256_abs_epi8(qw), _mm256_sign_epi8(qx, qw)),
-                    ones,
-                );
-                $acc = _mm256_fmadd_ps(_mm256_set1_ps($d * dx), _mm256_cvtepi32_ps(sum_i32), $acc);
-            }};
-        }
-        dot_row!(acc0, 0, d0);
-        dot_row!(acc1, 1, d1);
-        dot_row!(acc2, 2, d2);
-        dot_row!(acc3, 3, d3);
-        dot_row!(acc4, 4, d4);
-        dot_row!(acc5, 5, d5);
-        dot_row!(acc6, 6, d6);
-        dot_row!(acc7, 7, d7);
+        [
+            hsum_f32_avx(acc0),
+            hsum_f32_avx(acc1),
+            hsum_f32_avx(acc2),
+            hsum_f32_avx(acc3),
+            hsum_f32_avx(acc4),
+            hsum_f32_avx(acc5),
+            hsum_f32_avx(acc6),
+            hsum_f32_avx(acc7),
+        ]
     }
-    [
-        hsum_f32_avx(acc0),
-        hsum_f32_avx(acc1),
-        hsum_f32_avx(acc2),
-        hsum_f32_avx(acc3),
-        hsum_f32_avx(acc4),
-        hsum_f32_avx(acc5),
-        hsum_f32_avx(acc6),
-        hsum_f32_avx(acc7),
-    ]
 }
 
 /// Fallback scalar para Q8_0 × Q8_0.
@@ -876,7 +889,6 @@ pub(crate) fn matmul_q8_0_actq_packed(
     const B: usize = 34;
     let n_blocks = n_in / Q;
     let row_bytes = n_blocks * B;
-    const PB: usize = 272;
     let mut out = vec![0.0f32; n_tok * n_out];
 
     #[cfg(target_arch = "x86_64")]
@@ -885,8 +897,6 @@ pub(crate) fn matmul_q8_0_actq_packed(
         && is_x86_feature_detected!("f16c");
     #[cfg(not(target_arch = "x86_64"))]
     let use_f16c = false;
-
-    let n_groups = n_out_packed / 8;
 
     // Static work division: one contiguous range per thread (same as llamafile).
     let n_threads = rayon::current_num_threads().max(1);
@@ -996,7 +1006,7 @@ pub(crate) unsafe fn q8_0_q8_0_dot_8rows_repacked_f16c_pub(
     x_ptr: *const u8,
     n_blocks: usize,
 ) -> [f32; 8] {
-    q8_0_q8_0_dot_8rows_repacked_f16c(packed_ptr, x_ptr, n_blocks)
+    unsafe { q8_0_q8_0_dot_8rows_repacked_f16c(packed_ptr, x_ptr, n_blocks) }
 }
 
 /// SAFETY: w_ptr e x_ptr devem apontar para pelo menos `row_bytes` bytes válidos.
@@ -1006,9 +1016,11 @@ pub(crate) unsafe fn q8_0_q8_0_dot_scalar_pub(
     n_blocks: usize,
     row_bytes: usize,
 ) -> f32 {
-    let w_row = std::slice::from_raw_parts(w_ptr, row_bytes);
-    let x_row = std::slice::from_raw_parts(x_ptr, row_bytes);
-    q8_0_q8_0_dot_scalar(w_row, x_row, n_blocks)
+    unsafe {
+        let w_row = std::slice::from_raw_parts(w_ptr, row_bytes);
+        let x_row = std::slice::from_raw_parts(x_ptr, row_bytes);
+        q8_0_q8_0_dot_scalar(w_row, x_row, n_blocks)
+    }
 }
 
 /// Índice do maior valor (greedy / argmax). Empate → menor índice.
