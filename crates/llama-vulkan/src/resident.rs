@@ -15,6 +15,117 @@ use llama_model::{GpuMatmul, ModelError};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Buffers de ativação residentes, compartilhados por todos os matvecs.
+/// Capacidades em bytes crescem sob demanda e nunca encolhem: após o 1º token
+/// atingem o máximo do modelo e estabilizam (zero realloc nos tokens seguintes).
+///
+/// Lado X (entrada): `x_staging` host-visible + `x_dev` device-local STORAGE.
+/// Lado Y (saída):   `y_dev` device-local STORAGE|TRANSFER_SRC + `y_read` host-visible.
+struct Buffers {
+    x_staging: vk::Buffer,
+    x_staging_mem: vk::DeviceMemory,
+    x_dev: vk::Buffer,
+    x_dev_mem: vk::DeviceMemory,
+    x_cap: vk::DeviceSize,
+    y_dev: vk::Buffer,
+    y_dev_mem: vk::DeviceMemory,
+    y_read: vk::Buffer,
+    y_read_mem: vk::DeviceMemory,
+    y_cap: vk::DeviceSize,
+    /// Nº de vezes que um lado (X ou Y) cresceu. Para teste/diagnóstico.
+    grows: usize,
+}
+
+impl Buffers {
+    /// Começa vazio (handles nulos). A 1ª chamada de `ensure` aloca.
+    fn empty() -> Self {
+        Self {
+            x_staging: vk::Buffer::null(),
+            x_staging_mem: vk::DeviceMemory::null(),
+            x_dev: vk::Buffer::null(),
+            x_dev_mem: vk::DeviceMemory::null(),
+            x_cap: 0,
+            y_dev: vk::Buffer::null(),
+            y_dev_mem: vk::DeviceMemory::null(),
+            y_read: vk::Buffer::null(),
+            y_read_mem: vk::DeviceMemory::null(),
+            y_cap: 0,
+            grows: 0,
+        }
+    }
+
+    /// Garante capacidade >= `x_size` no lado X e `y_size` no lado Y.
+    /// (Re)aloca apenas o lado insuficiente. Seguro porque o caller fez
+    /// `queue_wait_idle` antes (GPU ociosa, nenhum buffer em uso).
+    fn ensure(
+        &mut self,
+        ctx: &VulkanContext,
+        phys: &VulkanPhysicalDevice,
+        d: &ash::Device,
+        x_size: vk::DeviceSize,
+        y_size: vk::DeviceSize,
+    ) -> Result<(), MatmulError> {
+        use crate::tensor::{alloc_and_bind, create_buf};
+
+        if x_size > self.x_cap {
+            // SAFETY: handles ou são nulos (no-op) ou foram criados por nós e não
+            // estão em uso (wait_idle precedeu esta chamada).
+            unsafe {
+                d.destroy_buffer(self.x_staging, None);
+                d.free_memory(self.x_staging_mem, None);
+                d.destroy_buffer(self.x_dev, None);
+                d.free_memory(self.x_dev_mem, None);
+            }
+            self.x_staging = create_buf(d, x_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.x_staging_mem = alloc_and_bind(ctx, phys, d, self.x_staging, true)?;
+            self.x_dev = create_buf(
+                d,
+                x_size,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?;
+            self.x_dev_mem = alloc_and_bind(ctx, phys, d, self.x_dev, false)?;
+            self.x_cap = x_size;
+            self.grows += 1;
+        }
+
+        if y_size > self.y_cap {
+            // SAFETY: idem lado X.
+            unsafe {
+                d.destroy_buffer(self.y_dev, None);
+                d.free_memory(self.y_dev_mem, None);
+                d.destroy_buffer(self.y_read, None);
+                d.free_memory(self.y_read_mem, None);
+            }
+            self.y_dev = create_buf(
+                d,
+                y_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+            self.y_dev_mem = alloc_and_bind(ctx, phys, d, self.y_dev, false)?;
+            self.y_read = create_buf(d, y_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+            self.y_read_mem = alloc_and_bind(ctx, phys, d, self.y_read, true)?;
+            self.y_cap = y_size;
+            self.grows += 1;
+        }
+        Ok(())
+    }
+
+    /// Libera todos os handles. Chamar uma vez no Drop do `ResidentGpu`.
+    fn destroy(&mut self, d: &ash::Device) {
+        // SAFETY: handles criados por nós; chamado no Drop, sem uso concorrente.
+        unsafe {
+            d.destroy_buffer(self.x_staging, None);
+            d.free_memory(self.x_staging_mem, None);
+            d.destroy_buffer(self.x_dev, None);
+            d.free_memory(self.x_dev_mem, None);
+            d.destroy_buffer(self.y_dev, None);
+            d.free_memory(self.y_dev_mem, None);
+            d.destroy_buffer(self.y_read, None);
+            d.free_memory(self.y_read_mem, None);
+        }
+    }
+}
+
 /// Backend de matmul Q8_0 numa única GPU AMD, com pesos+pipeline residentes.
 pub struct ResidentGpu<'ctx> {
     ctx: &'ctx VulkanContext,
