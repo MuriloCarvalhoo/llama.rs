@@ -137,8 +137,13 @@ fn upload_tensor_q8_0_para_vram() {
         GpuTensor::upload_q8_0(&ctx, &phys[0], &dev, &bytes, n_in, n_out).expect("upload falhou");
     assert_eq!(tensor.n_out, n_out);
     assert_eq!(tensor.n_in, n_in);
-    assert_eq!(tensor.size_bytes, bytes.len() as u64);
-    eprintln!("Upload OK: {}x{} Q8_0 ({} bytes)", n_out, n_in, bytes.len());
+    // Buffer GPU repackeado para blocos de 36 bytes (scale[2]|pad[2]|qs[32]).
+    let gpu_bytes = (n_out * n_blocks * 36) as u64;
+    assert_eq!(tensor.size_bytes, gpu_bytes);
+    eprintln!(
+        "Upload OK: {}x{} Q8_0 ({} bytes GPU)",
+        n_out, n_in, gpu_bytes
+    );
     tensor.destroy(dev.as_device());
 }
 

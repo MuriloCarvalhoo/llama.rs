@@ -39,7 +39,30 @@ impl GpuTensor {
         n_in: usize,
         n_out: usize,
     ) -> Result<Self, TensorError> {
-        let size = bytes.len() as vk::DeviceSize;
+        // Repack Q8_0: blocos de 34 bytes (2 scale f16 + 32 qs i8) -> 36 bytes
+        // (scale[2] | pad[2] | qs[32]) para que o buffer seja lido como `uint`
+        // alinhado no shader (9 uints/bloco). Os valores nao mudam, so a posicao.
+        debug_assert_eq!(n_in % 32, 0, "Q8_0 exige n_in multiplo de 32");
+        let n_blocks = n_in / 32;
+        assert_eq!(
+            bytes.len(),
+            n_out * n_blocks * 34,
+            "Q8_0: bytes ({}) != n_out*n_blocks*34 ({})",
+            bytes.len(),
+            n_out * n_blocks * 34,
+        );
+        let repacked = {
+            let mut out = vec![0u8; n_out * n_blocks * 36];
+            for i in 0..(n_out * n_blocks) {
+                let src = i * 34;
+                let dst = i * 36;
+                out[dst..dst + 2].copy_from_slice(&bytes[src..src + 2]); // scale f16
+                // out[dst+2..dst+4] = pad (ja zerado)
+                out[dst + 4..dst + 36].copy_from_slice(&bytes[src + 2..src + 34]); // 32 qs
+            }
+            out
+        };
+        let size = repacked.len() as vk::DeviceSize;
         let d = &dev.device;
 
         // 1. Staging buffer (host-visible)
@@ -51,7 +74,7 @@ impl GpuTensor {
             // SAFETY: staging_mem foi alocada host-visible com tamanho `size`;
             // o ponteiro retornado e valido ate unmap_memory.
             let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            std::ptr::copy_nonoverlapping(repacked.as_ptr(), ptr as *mut u8, repacked.len());
             d.unmap_memory(staging_mem);
         }
 
