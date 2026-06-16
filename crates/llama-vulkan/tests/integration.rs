@@ -505,3 +505,39 @@ fn resident_gpu_nao_re_uploada_peso() {
         "mesmo ponteiro = cache-hit, sem novo upload"
     );
 }
+
+#[test]
+fn resident_gpu_buffers_estabilizam_apos_warmup() {
+    use llama_model::GpuMatmul;
+    use llama_vulkan::{ResidentGpu, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let backend = ResidentGpu::new(&ctx).unwrap();
+
+    // Peso Q8_0 sintético 1 linha × 32 col: 34 bytes (2 scale + 32 quants).
+    let w = vec![0u8; 34];
+    let x = vec![0f32; 32];
+
+    // 1ª chamada: cresce lado X (1) e lado Y (1) = 2 grows.
+    let _ = backend.matvec_q8_0(&w, &x, 32, 1).unwrap();
+    assert_eq!(backend.buffer_grows(), 2, "1ª chamada aloca X e Y");
+
+    // 2ª chamada idêntica: cache-hit total, nenhum grow novo.
+    let _ = backend.matvec_q8_0(&w, &x, 32, 1).unwrap();
+    assert_eq!(backend.buffer_grows(), 2, "mesmo tamanho => sem realloc");
+
+    // Saída maior (n_out=2): só o lado Y cresce (+1).
+    let w2 = vec![0u8; 2 * 34];
+    let _ = backend.matvec_q8_0(&w2, &x, 32, 2).unwrap();
+    assert_eq!(
+        backend.buffer_grows(),
+        3,
+        "n_out maior => 1 grow só no lado Y"
+    );
+}
