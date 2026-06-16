@@ -576,3 +576,57 @@ fn resident_gpu_buffers_estabilizam_apos_warmup() {
         "n_out maior => 1 grow só no lado Y"
     );
 }
+
+// ─── Fase 8.1C Task 5: swiglu + add GPU == CPU ───────────────────────────────
+
+#[test]
+fn resident_fwd_swiglu_igual_cpu() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n = 4864usize;
+    let g: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
+    let u: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * 0.3 + 0.1).collect();
+    let cpu: Vec<f32> = g
+        .iter()
+        .zip(u.iter())
+        .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
+        .collect();
+
+    let gpu = fwd.dbg_swiglu(&g, &u).unwrap();
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-4, "swiglu[{i}]: cpu={a} gpu={b}");
+    }
+}
+
+#[test]
+fn resident_fwd_add_igual_cpu() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n = 896usize;
+    let dst: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+    let src: Vec<f32> = (0..n).map(|i| i as f32 * -0.25 + 1.0).collect();
+    let cpu: Vec<f32> = dst.iter().zip(src.iter()).map(|(&a, &b)| a + b).collect();
+
+    let gpu = fwd.dbg_add(&dst, &src).unwrap();
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-5, "add[{i}]: cpu={a} gpu={b}");
+    }
+}

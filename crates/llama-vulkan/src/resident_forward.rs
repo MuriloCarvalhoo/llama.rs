@@ -318,6 +318,91 @@ impl<'ctx> ResidentForward<'ctx> {
         })
     }
 
+    /// nº de workgroups para cobrir `n` elementos com local_size_x=64.
+    pub(crate) fn groups_for(n: usize) -> u32 {
+        ((n + 63) / 64) as u32
+    }
+
+    pub fn dbg_swiglu(&self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        #[repr(C)]
+        struct P {
+            n: u32,
+        }
+        let d = &self.dev.device;
+        let n = g.len();
+        let gb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(g) as vk::DeviceSize,
+        )?;
+        let ub = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(u) as vk::DeviceSize,
+        )?;
+        let ob = Buf::device(self.ctx, self.phys(), d, (n * 4) as vk::DeviceSize)?;
+        self.upload_f32(&gb, g)?;
+        self.upload_f32(&ub, u)?;
+        let set = self.alloc_set(&self.swiglu)?;
+        let push = P { n: n as u32 };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
+        self.dispatch1(
+            &self.swiglu,
+            set,
+            &[
+                (gb.buffer, 0, gb.size),
+                (ub.buffer, 0, ub.size),
+                (ob.buffer, 0, ob.size),
+            ],
+            pb,
+            Self::groups_for(n),
+        )?;
+        let out = self.readback(&ob, n)?;
+        gb.destroy(d);
+        ub.destroy(d);
+        ob.destroy(d);
+        Ok(out)
+    }
+
+    pub fn dbg_add(&self, dst: &[f32], src: &[f32]) -> Result<Vec<f32>, MatmulError> {
+        #[repr(C)]
+        struct P {
+            n: u32,
+        }
+        let d = &self.dev.device;
+        let n = dst.len();
+        let db = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(dst) as vk::DeviceSize,
+        )?;
+        let sb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(src) as vk::DeviceSize,
+        )?;
+        self.upload_f32(&db, dst)?;
+        self.upload_f32(&sb, src)?;
+        let set = self.alloc_set(&self.add)?;
+        let push = P { n: n as u32 };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
+        self.dispatch1(
+            &self.add,
+            set,
+            &[(db.buffer, 0, db.size), (sb.buffer, 0, sb.size)],
+            pb,
+            Self::groups_for(n),
+        )?;
+        let out = self.readback(&db, n)?; // dst foi mutado in-place
+        db.destroy(d);
+        sb.destroy(d);
+        Ok(out)
+    }
+
     /// Diagnóstico: roda só o shader rmsnorm sobre `x`,`w` e devolve a saída ao host.
     pub fn dbg_rmsnorm(&self, x: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>, MatmulError> {
         #[repr(C)]
