@@ -318,6 +318,89 @@ impl<'ctx> ResidentForward<'ctx> {
         })
     }
 
+    /// Diagnóstico: roda o shader attention GQA sobre q/k_cache/v_cache e devolve o resultado.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_attention(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        total_len: usize,
+    ) -> Result<Vec<f32>, MatmulError> {
+        if head_dim > 64 {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        #[repr(C)]
+        struct P {
+            n_head: u32,
+            n_head_kv: u32,
+            head_dim: u32,
+            total_len: u32,
+            kv_dim: u32,
+            kv_layer_off: u32,
+        }
+        let d = &self.dev.device;
+        let kv_dim = n_head_kv * head_dim;
+        let qb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(q) as vk::DeviceSize,
+        )?;
+        let kb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(k_cache) as vk::DeviceSize,
+        )?;
+        let vb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(v_cache) as vk::DeviceSize,
+        )?;
+        let ob = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            (n_head * head_dim * 4) as vk::DeviceSize,
+        )?;
+        self.upload_f32(&qb, q)?;
+        self.upload_f32(&kb, k_cache)?;
+        self.upload_f32(&vb, v_cache)?;
+        let set = self.alloc_set(&self.attention)?;
+        let push = P {
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            total_len: total_len as u32,
+            kv_dim: kv_dim as u32,
+            kv_layer_off: 0,
+        };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 24) };
+        self.dispatch1(
+            &self.attention,
+            set,
+            &[
+                (qb.buffer, 0, qb.size),
+                (kb.buffer, 0, kb.size),
+                (vb.buffer, 0, vb.size),
+                (ob.buffer, 0, ob.size),
+            ],
+            pb,
+            n_head as u32, // 1 workgroup por head
+        )?;
+        let out = self.readback(&ob, n_head * head_dim)?;
+        qb.destroy(d);
+        kb.destroy(d);
+        vb.destroy(d);
+        ob.destroy(d);
+        Ok(out)
+    }
+
     /// nº de workgroups para cobrir `n` elementos com local_size_x=64.
     pub(crate) fn groups_for(n: usize) -> u32 {
         ((n + 63) / 64) as u32

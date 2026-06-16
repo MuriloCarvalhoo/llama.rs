@@ -678,3 +678,71 @@ fn resident_fwd_rope_igual_cpu() {
         assert!((a - b).abs() < 1e-4, "rope[{i}]: cpu={a} gpu={b}");
     }
 }
+
+// ─── Fase 8.1C Task 7: attention GQA GPU == CPU ──────────────────────────────
+
+#[test]
+fn resident_fwd_attention_igual_cpu() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n_head = 14usize;
+    let n_head_kv = 2usize;
+    let head_dim = 64usize;
+    let kv_dim = n_head_kv * head_dim;
+    let total_len = 7usize;
+    let n_rep = n_head / n_head_kv;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..n_head * head_dim)
+        .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+        .collect();
+    let kc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+        .collect();
+    let vc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+        .collect();
+
+    let mut cpu = vec![0f32; n_head * head_dim];
+    for h in 0..n_head {
+        let kv_h = h / n_rep;
+        let qoff = h * head_dim;
+        let mut scores = vec![0f32; total_len];
+        for j in 0..total_len {
+            let koff = j * kv_dim + kv_h * head_dim;
+            let dot: f32 = (0..head_dim).map(|dd| q[qoff + dd] * kc[koff + dd]).sum();
+            scores[j] = dot * scale;
+        }
+        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - m).exp();
+            sum += *s;
+        }
+        for s in scores.iter_mut() {
+            *s /= sum;
+        }
+        for j in 0..total_len {
+            let voff = j * kv_dim + kv_h * head_dim;
+            for dd in 0..head_dim {
+                cpu[qoff + dd] += scores[j] * vc[voff + dd];
+            }
+        }
+    }
+
+    let gpu = fwd
+        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len)
+        .unwrap();
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-3, "attn[{i}]: cpu={a} gpu={b}");
+    }
+}
