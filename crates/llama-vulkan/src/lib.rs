@@ -14,5 +14,14 @@ pub use dual_gpu::DualGpuMatmul;
 pub use model_gpu::GpuWeights;
 pub use resident::ResidentGpu;
 
-#[allow(dead_code)]
 pub(crate) const Q8_0_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
+#[allow(dead_code)]
+pub(crate) const RMSNORM_SPV: &[u8] = include_bytes!(concat!(env!("RMSNORM_SPV")));
+#[allow(dead_code)]
+pub(crate) const ROPE_SPV: &[u8] = include_bytes!(concat!(env!("ROPE_SPV")));
+#[allow(dead_code)]
+pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPV")));
+#[allow(dead_code)]
+pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_SPV")));
+#[allow(dead_code)]
+pub(crate) const ADD_SPV: &[u8] = include_bytes!(concat!(env!("ADD_SPV")));
