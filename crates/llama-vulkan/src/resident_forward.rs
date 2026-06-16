@@ -709,6 +709,82 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
+    /// Spike Fase 8.3: roda DOT4_PROBE_SPV (2 bindings, push 0) com inputs (a,b) e lê o int de saída.
+    /// Cria seu próprio device+pipeline (não depende do estado residente). Se a extensão
+    /// GL_EXT_integer_dot_product não compilar/rodar em RADV/gfx906, isto falha — esse é o gate.
+    ///
+    /// Helper de debug/teste: em caminhos de erro (`?`) os recursos Vulkan criados antes da
+    /// falha vazam — aceitável aqui (mesmo padrão dos `dbg_*` vizinhos; só roda em testes).
+    pub fn dbg_dot4_probe(ctx: &'ctx VulkanContext, a: i32, b: i32) -> Result<i32, MatmulError> {
+        let me = Self::new_pipelines_only(ctx)?;
+        let d = &me.dev.device;
+        // 2 bindings STORAGE_BUFFER, push_size 0, sem spec consts.
+        let pipe = ComputePipeline::with(d, crate::DOT4_PROBE_SPV, 2, 0, &[])?;
+
+        // binding 0: { int a; int b; } => 8 bytes. binding 1: { int r; } => 4 bytes.
+        let inp = Buf::device(ctx, me.phys(), d, 8)?;
+        let outp = Buf::device(ctx, me.phys(), d, 4)?;
+
+        // Upload [a, b] como bytes i32 via staging host-visible.
+        {
+            use crate::tensor::one_shot_copy;
+            let staging = Buf::host(ctx, me.phys(), d, 8)?;
+            let ints = [a, b];
+            unsafe {
+                // SAFETY: staging host-visible com 8 bytes; ptr válido até unmap.
+                let ptr = d.map_memory(staging.mem, 0, 8, vk::MemoryMapFlags::empty())?;
+                std::ptr::copy_nonoverlapping(ints.as_ptr(), ptr as *mut i32, 2);
+                d.unmap_memory(staging.mem);
+            }
+            one_shot_copy(
+                d,
+                me.dev.queue,
+                me.dev.cmd_pool,
+                staging.buffer,
+                inp.buffer,
+                8,
+            )?;
+            staging.destroy(d);
+        }
+
+        let set = me.alloc_set(&pipe)?;
+        me.dispatch1(
+            &pipe,
+            set,
+            &[(inp.buffer, 0, inp.size), (outp.buffer, 0, outp.size)],
+            &[],
+            1,
+        )?;
+
+        // Readback do i32 de saída.
+        let r = {
+            use crate::tensor::one_shot_copy;
+            let host = Buf::host(ctx, me.phys(), d, 4)?;
+            one_shot_copy(
+                d,
+                me.dev.queue,
+                me.dev.cmd_pool,
+                outp.buffer,
+                host.buffer,
+                4,
+            )?;
+            let val = unsafe {
+                // SAFETY: host host-visible com 4 bytes; ptr válido até unmap.
+                let ptr = d.map_memory(host.mem, 0, 4, vk::MemoryMapFlags::empty())?;
+                let v = std::ptr::read(ptr as *const i32);
+                d.unmap_memory(host.mem);
+                v
+            };
+            host.destroy(d);
+            val
+        };
+
+        inp.destroy(d);
+        outp.destroy(d);
+        pipe.destroy(d);
+        Ok(r)
+    }
+
     /// Diagnóstico: roda só o shader rmsnorm sobre `x`,`w` e devolve a saída ao host.
     pub fn dbg_rmsnorm(&self, x: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>, MatmulError> {
         #[repr(C)]

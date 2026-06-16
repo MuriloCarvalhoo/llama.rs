@@ -27,3 +27,5 @@ pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_S
 pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_SPV")));
 #[allow(dead_code)]
 pub(crate) const ADD_SPV: &[u8] = include_bytes!(concat!(env!("ADD_SPV")));
+#[allow(dead_code)]
+pub(crate) const DOT4_PROBE_SPV: &[u8] = include_bytes!(concat!(env!("DOT4_PROBE_SPV")));

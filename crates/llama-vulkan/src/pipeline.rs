@@ -72,11 +72,16 @@ impl ComputePipeline {
             offset: 0,
             size: push_size,
         };
+        // push_size == 0 ⇒ nenhum push range (size:0 com count:1 viola VUID-VkPushConstantRange-size-00297).
         let layout_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: 1,
             p_set_layouts: &desc_set_layout,
-            push_constant_range_count: 1,
-            p_push_constant_ranges: &push_range,
+            push_constant_range_count: if push_size > 0 { 1 } else { 0 },
+            p_push_constant_ranges: if push_size > 0 {
+                &push_range
+            } else {
+                std::ptr::null()
+            },
             ..Default::default()
         };
         // SAFETY: dev válido; layout_info aponta para dados vivos na stack.
