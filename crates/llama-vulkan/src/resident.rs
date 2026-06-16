@@ -126,7 +126,7 @@ impl Buffers {
     }
 }
 
-/// Backend de matmul Q8_0 numa única GPU AMD, com pesos+pipeline residentes.
+/// Backend de matmul Q8_0 numa única GPU AMD, com pesos+pipeline+buffers+descriptor residentes.
 pub struct ResidentGpu<'ctx> {
     ctx: &'ctx VulkanContext,
     phys_idx: usize,
@@ -134,6 +134,11 @@ pub struct ResidentGpu<'ctx> {
     pipeline: ComputePipeline,
     /// key = `w_bytes.as_ptr() as usize`; value = peso já residente na VRAM.
     weights: RefCell<HashMap<usize, GpuTensor>>,
+    /// Buffers x/y/staging residentes (crescem sob demanda).
+    buffers: RefCell<Buffers>,
+    /// Descriptor pool/set persistentes (re-escritos a cada dispatch).
+    desc_pool: vk::DescriptorPool,
+    desc_set: vk::DescriptorSet,
 }
 
 impl<'ctx> ResidentGpu<'ctx> {
@@ -147,12 +152,45 @@ impl<'ctx> ResidentGpu<'ctx> {
             .map_err(|e| ModelError::Gpu(format!("device create: {e}")))?;
         let pipeline = ComputePipeline::new(&dev.device)
             .map_err(|e| ModelError::Gpu(format!("pipeline: {e}")))?;
+
+        // Descriptor pool/set persistentes: 1 set com 3 bindings STORAGE_BUFFER.
+        let d = &dev.device;
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 3,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo {
+            max_sets: 1,
+            pool_size_count: pool_sizes.len() as u32,
+            p_pool_sizes: pool_sizes.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: d válido; pool_info aponta para dados válidos na stack.
+        let desc_pool = unsafe {
+            d.create_descriptor_pool(&pool_info, None)
+                .map_err(|e| ModelError::Gpu(format!("desc pool: {e}")))?
+        };
+        let alloc_info = vk::DescriptorSetAllocateInfo {
+            descriptor_pool: desc_pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &pipeline.desc_set_layout,
+            ..Default::default()
+        };
+        // SAFETY: d e desc_pool válidos; layout vem da pipeline recém-criada.
+        let desc_set = unsafe {
+            d.allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| ModelError::Gpu(format!("desc set: {e}")))?[0]
+        };
+
         Ok(Self {
             ctx,
             phys_idx: 0,
             dev,
             pipeline,
             weights: RefCell::new(HashMap::new()),
+            buffers: RefCell::new(Buffers::empty()),
+            desc_pool,
+            desc_set,
         })
     }
 
@@ -163,6 +201,11 @@ impl<'ctx> ResidentGpu<'ctx> {
     /// Nº de pesos residentes (uploads efetuados). Para testes/diagnóstico.
     pub fn resident_count(&self) -> usize {
         self.weights.borrow().len()
+    }
+
+    /// Nº de (re)alocações de buffer já feitas. Para testes/diagnóstico.
+    pub fn buffer_grows(&self) -> usize {
+        self.buffers.borrow().grows
     }
 
     /// Garante que o peso identificado por `w_bytes.as_ptr()` está residente.
@@ -366,12 +409,17 @@ impl<'ctx> ResidentGpu<'ctx> {
 impl Drop for ResidentGpu<'_> {
     fn drop(&mut self) {
         let d = &self.dev.device;
+        // SAFETY: wait_idle garante que nenhum recurso está em uso pela GPU.
+        unsafe {
+            let _ = d.device_wait_idle();
+        }
+        self.buffers.borrow_mut().destroy(d);
         for (_, t) in self.weights.borrow_mut().drain() {
             t.destroy(d);
         }
-        // ComputePipeline::destroy consome self; destruímos os handles diretamente
-        // (mesma ordem inversa de ComputePipeline::destroy).
+        // SAFETY: desc_pool/pipeline criados por nós; ordem inversa de criação.
         unsafe {
+            d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_pipeline(self.pipeline.pipeline, None);
             d.destroy_pipeline_layout(self.pipeline.layout, None);
             d.destroy_descriptor_set_layout(self.pipeline.desc_set_layout, None);
