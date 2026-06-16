@@ -747,6 +747,59 @@ fn resident_fwd_attention_igual_cpu() {
     }
 }
 
+// ─── Fase 8.1D Task 4: geração multi-token 1D == CPU ────────────────────────────
+
+#[test]
+fn resident_forward_gera_igual_cpu_multi_token() {
+    use llama_tokenizer::Tokenizer;
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    use rand::{SeedableRng, rngs::SmallRng};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let path = "../../models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("modelo ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let model = llama_model::Model::load(&f, &bytes).unwrap();
+    let tok = Tokenizer::from_gguf(&f).unwrap();
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config).unwrap();
+    let aux = model.gpu_aux_weights().unwrap();
+    let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux).unwrap();
+    let sampler = llama_sampling::Sampler::Greedy;
+
+    let mut cpu_out = String::new();
+    let mut r1 = SmallRng::seed_from_u64(0);
+    model
+        .generate_streaming(&tok, "Hello", 8, &sampler, &mut r1, &mut |p| {
+            cpu_out.push_str(p)
+        })
+        .unwrap();
+
+    let mut gpu_out = String::new();
+    let mut r2 = SmallRng::seed_from_u64(0);
+    model
+        .generate_streaming_gpu_resident(&tok, "Hello", 8, &sampler, &mut r2, &backend, &mut |p| {
+            gpu_out.push_str(p)
+        })
+        .unwrap();
+
+    eprintln!("CPU: {cpu_out:?}");
+    eprintln!("GPU: {gpu_out:?}");
+    assert_eq!(
+        cpu_out, gpu_out,
+        "geração GPU-resident (1D) deve igualar CPU em 8 tokens"
+    );
+}
+
 // ─── Fase 8.1C Task 11: ResidentForward logits == CPU (gate de correctude E2E) ─
 
 #[test]
