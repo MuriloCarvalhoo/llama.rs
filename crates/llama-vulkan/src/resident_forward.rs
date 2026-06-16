@@ -306,53 +306,6 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(())
     }
 
-    /// Copia `len` bytes de `src[+src_off]` para `dst[+dst_off]` (regiões dentro de buffers residentes).
-    pub(crate) fn copy_region(
-        &self,
-        src: vk::Buffer,
-        src_off: vk::DeviceSize,
-        dst: vk::Buffer,
-        dst_off: vk::DeviceSize,
-        len: vk::DeviceSize,
-    ) -> Result<(), MatmulError> {
-        let d = &self.dev.device;
-        let dev = &self.dev;
-        let cb_info = vk::CommandBufferAllocateInfo {
-            command_pool: dev.cmd_pool,
-            level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        };
-        // SAFETY: d/pool válidos.
-        let cmd = unsafe { d.allocate_command_buffers(&cb_info)? }[0];
-        let begin = vk::CommandBufferBeginInfo {
-            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-            ..Default::default()
-        };
-        let region = vk::BufferCopy {
-            src_offset: src_off,
-            dst_offset: dst_off,
-            size: len,
-        };
-        unsafe {
-            // SAFETY: cmd válido; src/dst buffers vivos; offsets/len dentro dos tamanhos (garantido pelo caller).
-            d.begin_command_buffer(cmd, &begin)?;
-            d.cmd_copy_buffer(cmd, src, dst, &[region]);
-            d.end_command_buffer(cmd)?;
-        }
-        let submit = vk::SubmitInfo {
-            command_buffer_count: 1,
-            p_command_buffers: &cmd,
-            ..Default::default()
-        };
-        unsafe {
-            d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
-            d.queue_wait_idle(dev.queue)?;
-            d.free_command_buffers(dev.cmd_pool, &[cmd]);
-        }
-        Ok(())
-    }
-
     /// Lê `len` f32 do `src` device-local de volta ao host.
     pub(crate) fn readback(&self, src: &Buf, len: usize) -> Result<Vec<f32>, MatmulError> {
         use crate::tensor::one_shot_copy;
@@ -493,15 +446,16 @@ impl<'ctx> ResidentForward<'ctx> {
                     d.unmap_memory(staging.mem);
                 }
                 use crate::tensor::one_shot_copy;
-                one_shot_copy(
+                let res = one_shot_copy(
                     d,
                     dev_ref.queue,
                     dev_ref.cmd_pool,
                     staging.buffer,
                     b.buffer,
                     bytes_val,
-                )?;
+                );
                 staging.destroy(d);
+                res?;
                 Ok(b)
             };
             let mk_opt = |o: &Option<Vec<f32>>| -> Result<Option<Buf>, MatmulError> {
