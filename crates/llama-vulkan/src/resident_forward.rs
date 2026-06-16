@@ -1043,6 +1043,141 @@ impl<'ctx> ResidentForward<'ctx> {
         )
     }
 
+    /// Barreira de memória global entre dispatches/cópias do mesmo command buffer.
+    fn full_barrier(&self, cmd: vk::CommandBuffer) {
+        let mb = vk::MemoryBarrier {
+            src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+            ..Default::default()
+        };
+        let stage = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+        // SAFETY: cmd em gravação; barreira global sem buffer/image barriers.
+        unsafe {
+            self.dev.device.cmd_pipeline_barrier(
+                cmd,
+                stage,
+                stage,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    /// Grava a stack inteira do token em `cmd` (já em `begin`). Push/offsets dependem de token/pos.
+    fn record_token(&self, cmd: vk::CommandBuffer, token: u32, pos: usize) {
+        let d = &self.dev.device;
+        let st = self
+            .state
+            .as_ref()
+            .expect("record_token requer state (new())");
+        let c = &st.cfg;
+        let total_len = (pos + 1) as u32;
+
+        for op in &st.plan {
+            match op {
+                PlannedOp::Embed => {
+                    let region = vk::BufferCopy {
+                        src_offset: (token as usize * c.n_embd * 4) as vk::DeviceSize,
+                        dst_offset: 0,
+                        size: (c.n_embd * 4) as vk::DeviceSize,
+                    };
+                    // SAFETY: cmd em gravação; buffers vivos; offsets dentro do tamanho.
+                    unsafe {
+                        d.cmd_copy_buffer(cmd, st.token_embd_buf.buffer, st.b_x.buffer, &[region]);
+                    }
+                    self.full_barrier(cmd);
+                }
+                PlannedOp::KvAppend { layer } => {
+                    let off = ((layer * c.ctx + pos) * c.kv_dim * 4) as vk::DeviceSize;
+                    let sz = (c.kv_dim * 4) as vk::DeviceSize;
+                    let rk = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: off,
+                        size: sz,
+                    };
+                    // SAFETY: idem.
+                    unsafe {
+                        d.cmd_copy_buffer(cmd, st.b_k.buffer, st.kcache.buffer, &[rk]);
+                        d.cmd_copy_buffer(cmd, st.b_v.buffer, st.vcache.buffer, &[rk]);
+                    }
+                    self.full_barrier(cmd);
+                }
+                PlannedOp::Dispatch {
+                    pipe,
+                    set,
+                    groups,
+                    push,
+                } => {
+                    let p = self.pipe_of(*pipe);
+                    let bytes: Vec<u8> = match push {
+                        PushSpec::Static(b) => b.clone(),
+                        PushSpec::Rope { n_head } => {
+                            #[repr(C)]
+                            struct P {
+                                n_head: u32,
+                                head_dim: u32,
+                                rope_dim: u32,
+                                pos: f32,
+                            }
+                            let pp = P {
+                                n_head: *n_head,
+                                head_dim: c.head_dim as u32,
+                                rope_dim: c.rope_dim as u32,
+                                pos: pos as f32,
+                            };
+                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 16) }
+                                .to_vec()
+                        }
+                        PushSpec::Attention { kv_layer_off } => {
+                            #[repr(C)]
+                            struct P {
+                                n_head: u32,
+                                n_head_kv: u32,
+                                head_dim: u32,
+                                total_len: u32,
+                                kv_dim: u32,
+                                kv_layer_off: u32,
+                            }
+                            let pp = P {
+                                n_head: c.n_head as u32,
+                                n_head_kv: c.n_head_kv as u32,
+                                head_dim: c.head_dim as u32,
+                                total_len,
+                                kv_dim: c.kv_dim as u32,
+                                kv_layer_off: *kv_layer_off,
+                            };
+                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 24) }
+                                .to_vec()
+                        }
+                    };
+                    // SAFETY: cmd em gravação; pipeline/set válidos; bytes do tamanho do range.
+                    unsafe {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            p.layout,
+                            0,
+                            &[*set],
+                            &[],
+                        );
+                        d.cmd_push_constants(
+                            cmd,
+                            p.layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &bytes,
+                        );
+                        d.cmd_dispatch(cmd, *groups, 1, 1);
+                    }
+                    self.full_barrier(cmd);
+                }
+            }
+        }
+    }
+
     pub(crate) fn pipe_of(&self, id: PipeId) -> &ComputePipeline {
         match id {
             PipeId::Matvec => &self.matvec,
