@@ -46,4 +46,8 @@ pub struct Args {
     /// Habilita backend Vulkan dual-GPU (requer duas AMD MI50 e feature "gpu").
     #[arg(long, default_value = "false")]
     pub gpu: bool,
+
+    /// Backend Vulkan single-GPU com pesos residentes (Fase 8.1A). Requer feature "gpu".
+    #[arg(long, default_value = "false")]
+    pub gpu_single: bool,
 }

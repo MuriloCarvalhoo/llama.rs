@@ -177,7 +177,42 @@ pub fn run_generate(
     let mut start: Option<Instant> = None;
 
     #[cfg(feature = "gpu")]
-    let used_gpu = if args.gpu {
+    let used_gpu = if args.gpu_single {
+        use llama_vulkan::{ResidentGpu, VulkanContext};
+        match VulkanContext::new() {
+            Ok(ctx) if !ctx.amd_compute_devices().is_empty() => {
+                let dev0 = ctx.amd_compute_devices()[0].name().to_owned();
+                eprintln!("[GPU] {dev0} — decode na GPU (single, resident)");
+                let gpu_w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config)?;
+                let backend = ResidentGpu::new(&ctx)?;
+                model.generate_streaming_gpu(
+                    &tokenizer,
+                    &args.prompt,
+                    args.n_predict,
+                    &sampler,
+                    &mut rng,
+                    &backend,
+                    &gpu_w,
+                    &mut |piece| {
+                        if start.is_none() {
+                            start = Some(Instant::now());
+                        }
+                        on_token(piece);
+                        n_tokens += 1;
+                    },
+                )?;
+                true
+            }
+            Ok(_) => {
+                eprintln!("[GPU] nenhum device AMD — fallback CPU");
+                false
+            }
+            Err(e) => {
+                eprintln!("[GPU] Vulkan indisponivel ({e}) — fallback CPU");
+                false
+            }
+        }
+    } else if args.gpu {
         use llama_vulkan::{DualGpuBackend, VulkanContext};
         match VulkanContext::new() {
             Ok(ctx) if ctx.amd_compute_devices().len() >= 2 => {
@@ -224,7 +259,7 @@ pub fn run_generate(
     };
     #[cfg(not(feature = "gpu"))]
     let used_gpu = {
-        if args.gpu {
+        if args.gpu || args.gpu_single {
             eprintln!("[GPU] Build sem feature 'gpu' -- recompile com: cargo build --features gpu");
         }
         false
