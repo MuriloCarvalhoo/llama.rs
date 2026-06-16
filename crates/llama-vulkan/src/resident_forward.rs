@@ -855,194 +855,6 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
-    fn op_rmsnorm(
-        &self,
-        x: &Buf,
-        w: &Buf,
-        out: &Buf,
-        dim: usize,
-        eps: f32,
-    ) -> Result<(), MatmulError> {
-        #[repr(C)]
-        struct P {
-            dim: u32,
-            eps: f32,
-        }
-        let push = P {
-            dim: dim as u32,
-            eps,
-        };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 8) };
-        let set = self.alloc_set(&self.rmsnorm)?;
-        self.dispatch1(
-            &self.rmsnorm,
-            set,
-            &[
-                (x.buffer, 0, x.size),
-                (w.buffer, 0, w.size),
-                (out.buffer, 0, out.size),
-            ],
-            pb,
-            1,
-        )
-    }
-
-    fn op_matvec(
-        &self,
-        w: &GpuTensor,
-        x: &Buf,
-        y: &Buf,
-        n_in: usize,
-        n_out: usize,
-    ) -> Result<(), MatmulError> {
-        use crate::pipeline::PushConstants;
-        let push = PushConstants {
-            n_in: n_in as u32,
-            n_out: n_out as u32,
-            row_offset: 0,
-        };
-        let pb = unsafe {
-            std::slice::from_raw_parts(
-                &push as *const PushConstants as *const u8,
-                std::mem::size_of::<PushConstants>(),
-            )
-        };
-        let set = self.alloc_set(&self.matvec)?;
-        self.dispatch1(
-            &self.matvec,
-            set,
-            &[
-                (w.buffer, 0, w.size_bytes),
-                (x.buffer, 0, (n_in * 4) as vk::DeviceSize),
-                (y.buffer, 0, (n_out * 4) as vk::DeviceSize),
-            ],
-            pb,
-            n_out as u32,
-        )
-    }
-
-    fn op_add(&self, dst: &Buf, src: &Buf, n: usize) -> Result<(), MatmulError> {
-        #[repr(C)]
-        struct P {
-            n: u32,
-        }
-        let push = P { n: n as u32 };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
-        let set = self.alloc_set(&self.add)?;
-        self.dispatch1(
-            &self.add,
-            set,
-            &[
-                (dst.buffer, 0, (n * 4) as vk::DeviceSize),
-                (src.buffer, 0, (n * 4) as vk::DeviceSize),
-            ],
-            pb,
-            Self::groups_for(n),
-        )
-    }
-
-    fn op_rope(
-        &self,
-        x: &Buf,
-        freq: &Buf,
-        n_head: usize,
-        head_dim: usize,
-        rope_dim: usize,
-        pos: usize,
-    ) -> Result<(), MatmulError> {
-        #[repr(C)]
-        struct P {
-            n_head: u32,
-            head_dim: u32,
-            rope_dim: u32,
-            pos: f32,
-        }
-        let push = P {
-            n_head: n_head as u32,
-            head_dim: head_dim as u32,
-            rope_dim: rope_dim as u32,
-            pos: pos as f32,
-        };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 16) };
-        let set = self.alloc_set(&self.rope)?;
-        let pairs = n_head * (rope_dim / 2);
-        self.dispatch1(
-            &self.rope,
-            set,
-            &[(x.buffer, 0, x.size), (freq.buffer, 0, freq.size)],
-            pb,
-            Self::groups_for(pairs),
-        )
-    }
-
-    fn op_swiglu(&self, g: &Buf, u: &Buf, out: &Buf, n: usize) -> Result<(), MatmulError> {
-        #[repr(C)]
-        struct P {
-            n: u32,
-        }
-        let push = P { n: n as u32 };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
-        let set = self.alloc_set(&self.swiglu)?;
-        self.dispatch1(
-            &self.swiglu,
-            set,
-            &[
-                (g.buffer, 0, (n * 4) as vk::DeviceSize),
-                (u.buffer, 0, (n * 4) as vk::DeviceSize),
-                (out.buffer, 0, (n * 4) as vk::DeviceSize),
-            ],
-            pb,
-            Self::groups_for(n),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn op_attention(
-        &self,
-        q: &Buf,
-        kcache: &Buf,
-        vcache: &Buf,
-        out: &Buf,
-        n_head: usize,
-        n_head_kv: usize,
-        head_dim: usize,
-        total_len: usize,
-        kv_dim: usize,
-        kv_layer_off: usize,
-    ) -> Result<(), MatmulError> {
-        #[repr(C)]
-        struct P {
-            n_head: u32,
-            n_head_kv: u32,
-            head_dim: u32,
-            total_len: u32,
-            kv_dim: u32,
-            kv_layer_off: u32,
-        }
-        let push = P {
-            n_head: n_head as u32,
-            n_head_kv: n_head_kv as u32,
-            head_dim: head_dim as u32,
-            total_len: total_len as u32,
-            kv_dim: kv_dim as u32,
-            kv_layer_off: kv_layer_off as u32,
-        };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 24) };
-        let set = self.alloc_set(&self.attention)?;
-        self.dispatch1(
-            &self.attention,
-            set,
-            &[
-                (q.buffer, 0, q.size),
-                (kcache.buffer, 0, kcache.size),
-                (vcache.buffer, 0, vcache.size),
-                (out.buffer, 0, out.size),
-            ],
-            pb,
-            n_head as u32,
-        )
-    }
-
     /// Barreira de memória global entre dispatches/cópias do mesmo command buffer.
     fn full_barrier(&self, cmd: vk::CommandBuffer) {
         let mb = vk::MemoryBarrier {
@@ -1485,106 +1297,50 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(plan)
     }
 
-    fn decode_step(&self, token: u32, pos: usize) -> Result<Vec<f32>, MatmulError> {
+    /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
+    fn record_and_submit(&self, token: u32, pos: usize) -> Result<Vec<f32>, MatmulError> {
         let st = self
             .state
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
-        let c = &st.cfg;
-        let total_len = pos + 1;
+        let d = &self.dev.device;
+        let dev = &self.dev;
+        let cmd = st.token_cmd;
 
-        // Recicla todos os descriptor sets do pool (GPU ociosa entre tokens).
-        // SAFETY: nenhum set em uso — o último op do token anterior fez wait_idle.
+        // SAFETY: pool RESET_COMMAND_BUFFER; cmd não está em uso (fence do token anterior aguardado).
         unsafe {
-            self.dev
-                .device
-                .reset_descriptor_pool(self.desc_pool, vk::DescriptorPoolResetFlags::empty())?;
+            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            d.begin_command_buffer(cmd, &begin)?;
+        }
+        self.record_token(cmd, token, pos);
+        // SAFETY: cmd em gravação.
+        unsafe {
+            d.end_command_buffer(cmd)?;
         }
 
-        // 1. Embedding lookup: copia a linha do token para b_x (sem host).
-        let row_bytes = (c.n_embd * 4) as vk::DeviceSize;
-        let src_off = (token as usize * c.n_embd * 4) as vk::DeviceSize;
-        self.copy_region(
-            st.token_embd_buf.buffer,
-            src_off,
-            st.b_x.buffer,
-            0,
-            row_bytes,
-        )?;
-
-        for l in 0..c.n_layer {
-            let lq = &st.qw[l];
-            let la = &st.aux[l];
-
-            self.op_rmsnorm(&st.b_x, &la.attn_norm, &st.b_normed, c.n_embd, c.rms_eps)?;
-            self.op_matvec(&lq.attn_q, &st.b_normed, &st.b_q, c.n_embd, c.n_embd)?;
-            self.op_matvec(&lq.attn_k, &st.b_normed, &st.b_k, c.n_embd, c.kv_dim)?;
-            self.op_matvec(&lq.attn_v, &st.b_normed, &st.b_v, c.n_embd, c.kv_dim)?;
-            if let Some(b) = &la.q_bias {
-                self.op_add(&st.b_q, b, c.n_embd)?;
-            }
-            if let Some(b) = &la.k_bias {
-                self.op_add(&st.b_k, b, c.kv_dim)?;
-            }
-            if let Some(b) = &la.v_bias {
-                self.op_add(&st.b_v, b, c.kv_dim)?;
-            }
-            self.op_rope(&st.b_q, &st.freq_buf, c.n_head, c.head_dim, c.rope_dim, pos)?;
-            self.op_rope(
-                &st.b_k,
-                &st.freq_buf,
-                c.n_head_kv,
-                c.head_dim,
-                c.rope_dim,
-                pos,
-            )?;
-
-            let kv_off = ((l * c.ctx + pos) * c.kv_dim * 4) as vk::DeviceSize;
-            let kv_bytes = (c.kv_dim * 4) as vk::DeviceSize;
-            self.copy_region(st.b_k.buffer, 0, st.kcache.buffer, kv_off, kv_bytes)?;
-            self.copy_region(st.b_v.buffer, 0, st.vcache.buffer, kv_off, kv_bytes)?;
-
-            let layer_off = l * c.ctx * c.kv_dim;
-            self.op_attention(
-                &st.b_q,
-                &st.kcache,
-                &st.vcache,
-                &st.b_attn,
-                c.n_head,
-                c.n_head_kv,
-                c.head_dim,
-                total_len,
-                c.kv_dim,
-                layer_off,
-            )?;
-
-            self.op_matvec(&lq.attn_output, &st.b_attn, &st.b_proj, c.n_embd, c.n_embd)?;
-            self.op_add(&st.b_x, &st.b_proj, c.n_embd)?;
-
-            self.op_rmsnorm(&st.b_x, &la.ffn_norm, &st.b_normed, c.n_embd, c.rms_eps)?;
-            self.op_matvec(&lq.ffn_gate, &st.b_normed, &st.b_gate, c.n_embd, c.n_ff)?;
-            self.op_matvec(&lq.ffn_up, &st.b_normed, &st.b_up, c.n_embd, c.n_ff)?;
-            self.op_swiglu(&st.b_gate, &st.b_up, &st.b_act, c.n_ff)?;
-            self.op_matvec(&lq.ffn_down, &st.b_act, &st.b_proj, c.n_ff, c.n_embd)?;
-            self.op_add(&st.b_x, &st.b_proj, c.n_embd)?;
+        let submit = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        // SAFETY: fence resetado antes do submit; cmd válido.
+        unsafe {
+            d.reset_fences(&[st.token_fence])?;
+            d.queue_submit(dev.queue, &[submit], st.token_fence)?;
+            d.wait_for_fences(&[st.token_fence], true, u64::MAX)?;
         }
-
-        self.op_rmsnorm(
-            &st.b_x,
-            &st.output_norm_buf,
-            &st.b_normed,
-            c.n_embd,
-            c.rms_eps,
-        )?;
-        self.op_matvec(&st.output_w, &st.b_normed, &st.b_logits, c.n_embd, c.vocab)?;
-        self.readback(&st.b_logits, c.vocab)
+        self.readback(&st.b_logits, st.cfg.vocab)
     }
 }
 
 impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, llama_model::ModelError> {
         let logits = self
-            .decode_step(token, pos)
+            .record_and_submit(token, pos)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = pos + 1;
