@@ -228,69 +228,44 @@ impl<'ctx> ResidentGpu<'ctx> {
         n_out: usize,
     ) -> Result<Vec<f32>, MatmulError> {
         use crate::pipeline::PushConstants;
-        use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
+        use crate::tensor::one_shot_copy;
 
         let d = &self.dev.device;
         let dev = &self.dev;
+
+        let x_size = std::mem::size_of_val(x_f32) as vk::DeviceSize;
+        let y_size = (n_out * std::mem::size_of::<f32>()) as vk::DeviceSize;
+
+        // 1. Garantir capacidade dos buffers residentes (grow-on-demand).
+        let mut buffers = self.buffers.borrow_mut();
+        buffers.ensure(self.ctx, self.phys(), d, x_size, y_size)?;
+
+        // 2. Carregar X no staging host-visible e copiar para o device-local residente.
+        unsafe {
+            // SAFETY: x_staging_mem host-visible com x_cap >= x_size; ptr válido até unmap.
+            let ptr = d.map_memory(
+                buffers.x_staging_mem,
+                0,
+                x_size,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(x_f32.as_ptr(), ptr as *mut f32, x_f32.len());
+            d.unmap_memory(buffers.x_staging_mem);
+        }
+        one_shot_copy(
+            d,
+            dev.queue,
+            dev.cmd_pool,
+            buffers.x_staging,
+            buffers.x_dev,
+            x_size,
+        )?;
+
+        // 3. Re-escrever o descriptor set persistente (binding 0 = peso muda; 1/2 residentes).
         let weights = self.weights.borrow();
         let w_tensor = weights
             .get(&weight_key)
             .expect("peso garantido por ensure_weight");
-
-        // X: staging host-visible -> device-local STORAGE
-        let x_size = std::mem::size_of_val(x_f32) as vk::DeviceSize;
-        let x_staging = create_buf(d, x_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        let x_staging_mem = alloc_and_bind(self.ctx, self.phys(), d, x_staging, true)?;
-        unsafe {
-            // SAFETY: x_staging_mem é host-visible com x_size bytes; ptr válido até unmap.
-            let ptr = d.map_memory(x_staging_mem, 0, x_size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(x_f32.as_ptr(), ptr as *mut f32, x_f32.len());
-            d.unmap_memory(x_staging_mem);
-        }
-        let x_buf = create_buf(
-            d,
-            x_size,
-            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-        )?;
-        let x_mem = alloc_and_bind(self.ctx, self.phys(), d, x_buf, false)?;
-        one_shot_copy(d, dev.queue, dev.cmd_pool, x_staging, x_buf, x_size)?;
-        unsafe {
-            // SAFETY: staging já copiado; criado por nós nesta função.
-            d.destroy_buffer(x_staging, None);
-            d.free_memory(x_staging_mem, None);
-        }
-
-        // Y: device-local STORAGE | TRANSFER_SRC
-        let y_size = (n_out * std::mem::size_of::<f32>()) as vk::DeviceSize;
-        let y_buf = create_buf(
-            d,
-            y_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
-        let y_mem = alloc_and_bind(self.ctx, self.phys(), d, y_buf, false)?;
-
-        // Descriptor pool/set (por chamada; barato relativo ao upload de peso)
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 3,
-        }];
-        let pool_info = vk::DescriptorPoolCreateInfo {
-            max_sets: 1,
-            pool_size_count: pool_sizes.len() as u32,
-            p_pool_sizes: pool_sizes.as_ptr(),
-            ..Default::default()
-        };
-        // SAFETY: d válido; pool_info aponta para dados válidos na stack.
-        let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
-        let alloc_info = vk::DescriptorSetAllocateInfo {
-            descriptor_pool: desc_pool,
-            descriptor_set_count: 1,
-            p_set_layouts: &self.pipeline.desc_set_layout,
-            ..Default::default()
-        };
-        // SAFETY: d e desc_pool válidos.
-        let desc_set = unsafe { d.allocate_descriptor_sets(&alloc_info)? }[0];
-
         let buf_infos = [
             vk::DescriptorBufferInfo {
                 buffer: w_tensor.buffer,
@@ -298,12 +273,12 @@ impl<'ctx> ResidentGpu<'ctx> {
                 range: w_tensor.size_bytes,
             },
             vk::DescriptorBufferInfo {
-                buffer: x_buf,
+                buffer: buffers.x_dev,
                 offset: 0,
                 range: x_size,
             },
             vk::DescriptorBufferInfo {
-                buffer: y_buf,
+                buffer: buffers.y_dev,
                 offset: 0,
                 range: y_size,
             },
@@ -312,7 +287,7 @@ impl<'ctx> ResidentGpu<'ctx> {
             .iter()
             .enumerate()
             .map(|(binding, bi)| vk::WriteDescriptorSet {
-                dst_set: desc_set,
+                dst_set: self.desc_set,
                 dst_binding: binding as u32,
                 descriptor_count: 1,
                 descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -320,10 +295,10 @@ impl<'ctx> ResidentGpu<'ctx> {
                 ..Default::default()
             })
             .collect();
-        // SAFETY: d válido; writes apontam para buf_infos vivos na stack.
+        // SAFETY: d válido; writes apontam para buf_infos vivos na stack; GPU ociosa (wait_idle anterior).
         unsafe { d.update_descriptor_sets(&writes, &[]) };
 
-        // Command buffer
+        // 4. Command buffer (ainda por-chamada nesta fatia; fusão vira 1 cmd/token na Fase 1D).
         let cb_info = vk::CommandBufferAllocateInfo {
             command_pool: dev.cmd_pool,
             level: vk::CommandBufferLevel::PRIMARY,
@@ -342,7 +317,7 @@ impl<'ctx> ResidentGpu<'ctx> {
             row_offset: 0,
         };
         unsafe {
-            // SAFETY: cmd recém-alocado e válido.
+            // SAFETY: cmd recém-alocado; desc_set/pipeline válidos.
             d.begin_command_buffer(cmd, &begin)?;
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
             d.cmd_bind_descriptor_sets(
@@ -350,7 +325,7 @@ impl<'ctx> ResidentGpu<'ctx> {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline.layout,
                 0,
-                &[desc_set],
+                &[self.desc_set],
                 &[],
             );
             d.cmd_push_constants(
@@ -379,29 +354,23 @@ impl<'ctx> ResidentGpu<'ctx> {
             d.free_command_buffers(dev.cmd_pool, &[cmd]);
         }
 
-        // Readback Y
-        let y_read = create_buf(d, y_size, vk::BufferUsageFlags::TRANSFER_DST)?;
-        let y_read_mem = alloc_and_bind(self.ctx, self.phys(), d, y_read, true)?;
-        one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, y_read, y_size)?;
+        // 5. Readback de Y do device-local residente para o host-visible residente.
+        one_shot_copy(
+            d,
+            dev.queue,
+            dev.cmd_pool,
+            buffers.y_dev,
+            buffers.y_read,
+            y_size,
+        )?;
         let out = unsafe {
-            // SAFETY: y_read_mem host-visible com y_size; ptr válido até unmap.
-            let ptr = d.map_memory(y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
+            // SAFETY: y_read_mem host-visible com y_cap >= y_size; ptr válido até unmap.
+            let ptr = d.map_memory(buffers.y_read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
             let mut v = vec![0f32; n_out];
             std::ptr::copy_nonoverlapping(ptr as *const f32, v.as_mut_ptr(), n_out);
-            d.unmap_memory(y_read_mem);
+            d.unmap_memory(buffers.y_read_mem);
             v
         };
-
-        // Cleanup do que é por-chamada (NÃO destrói peso nem pipeline)
-        unsafe {
-            d.destroy_buffer(y_read, None);
-            d.free_memory(y_read_mem, None);
-            d.destroy_descriptor_pool(desc_pool, None);
-            d.destroy_buffer(y_buf, None);
-            d.free_memory(y_mem, None);
-            d.destroy_buffer(x_buf, None);
-            d.free_memory(x_mem, None);
-        }
         Ok(out)
     }
 }
