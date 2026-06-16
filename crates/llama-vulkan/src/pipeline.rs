@@ -26,47 +26,45 @@ pub struct ComputePipeline {
 }
 
 impl ComputePipeline {
-    /// Cria a pipeline Vulkan para o shader Q8_0 matmul-vector.
-    /// `dev` deve ser mantido vivo enquanto esta struct existir.
+    /// Pipeline do matvec Q8_0 (3 bindings STORAGE_BUFFER + push de `PushConstants`).
     pub fn new(dev: &ash::Device) -> Result<Self, PipelineError> {
-        // 1. DescriptorSetLayout com 3 bindings STORAGE_BUFFER
-        //    binding 0 = weights, 1 = activations, 2 = output
-        let bindings = [
-            vk::DescriptorSetLayoutBinding {
-                binding: 0,
+        Self::with(
+            dev,
+            crate::Q8_0_MATVEC_SPV,
+            3,
+            std::mem::size_of::<PushConstants>() as u32,
+        )
+    }
+
+    /// Pipeline de compute genérico: `n_bindings` STORAGE_BUFFER (bindings 0..n) +
+    /// um push-constant range de `push_size` bytes (COMPUTE). `spv` é o SPIR-V já compilado.
+    pub fn with(
+        dev: &ash::Device,
+        spv: &[u8],
+        n_bindings: u32,
+        push_size: u32,
+    ) -> Result<Self, PipelineError> {
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_bindings)
+            .map(|b| vk::DescriptorSetLayoutBinding {
+                binding: b,
                 descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 1,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 2,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-        ];
+            })
+            .collect();
         let dsl_info = vk::DescriptorSetLayoutCreateInfo {
             binding_count: bindings.len() as u32,
             p_bindings: bindings.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: dev é válido; dsl_info aponta para dados válidos na stack frame.
+        // SAFETY: dev válido; dsl_info aponta para `bindings` vivo na stack.
         let desc_set_layout = unsafe { dev.create_descriptor_set_layout(&dsl_info, None)? };
 
-        // 2. PipelineLayout com o descriptor set layout + push constants (3× u32 = 12 bytes)
         let push_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             offset: 0,
-            size: std::mem::size_of::<PushConstants>() as u32,
+            size: push_size,
         };
         let layout_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: 1,
@@ -75,12 +73,9 @@ impl ComputePipeline {
             p_push_constant_ranges: &push_range,
             ..Default::default()
         };
-        // SAFETY: dev é válido; layout_info aponta para dados válidos na stack frame.
+        // SAFETY: dev válido; layout_info aponta para dados vivos na stack.
         let layout = unsafe { dev.create_pipeline_layout(&layout_info, None)? };
 
-        // 3. ShaderModule carregado do SPIR-V
-        // Copia para Vec<u32> para garantir alinhamento a 4 bytes exigido por Vulkan.
-        let spv = crate::Q8_0_MATVEC_SPV;
         assert_eq!(spv.len() % 4, 0, "SPIR-V size deve ser multiplo de 4 bytes");
         let spv_u32: Vec<u32> = spv
             .chunks(4)
@@ -91,10 +86,9 @@ impl ComputePipeline {
             p_code: spv_u32.as_ptr(),
             ..Default::default()
         };
-        // SAFETY: dev é válido; shader_info aponta para SPIR-V válido na memória estática.
+        // SAFETY: dev válido; shader_info aponta para `spv_u32` vivo na stack.
         let shader_module = unsafe { dev.create_shader_module(&shader_info, None)? };
 
-        // 4. ComputePipelineCreateInfo → create_compute_pipelines
         let entry_point = c"main";
         let stage = vk::PipelineShaderStageCreateInfo {
             stage: vk::ShaderStageFlags::COMPUTE,
@@ -107,15 +101,13 @@ impl ComputePipeline {
             layout,
             ..Default::default()
         };
-        // SAFETY: dev é válido; pipeline_info aponta para dados válidos na stack frame.
+        // SAFETY: dev válido; pipeline_info aponta para dados vivos na stack.
         let pipelines = unsafe {
             dev.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
                 .map_err(|(_, e)| e)?
         };
         let pipeline = pipelines[0];
-
-        // 5. Destruir o ShaderModule após criar a pipeline
-        // SAFETY: shader_module foi criado por nós; a pipeline já foi criada acima.
+        // SAFETY: shader_module foi criado por nós; a pipeline já o consumiu.
         unsafe { dev.destroy_shader_module(shader_module, None) };
 
         Ok(Self {
