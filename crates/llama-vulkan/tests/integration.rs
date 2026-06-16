@@ -422,3 +422,86 @@ fn gpu_matvec_large_n_out_matches_cpu_ref() {
         cfg.n_ff
     );
 }
+
+// ─── Fase 8.1A: ResidentGpu (single-GPU, pesos+pipeline residentes) ──────────
+
+#[test]
+fn resident_gpu_decode_matches_cpu_ref() {
+    use std::path::Path;
+    let Ok(bytes) = std::fs::read(Path::new("../../models/qwen2.5-0.5b-instruct-q8_0.gguf")) else {
+        eprintln!("qwen ausente — pulando");
+        return;
+    };
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Vulkan indisponível: {e} — pulando");
+            return;
+        }
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
+    let model = llama_model::Model::load_with_config(&f, &bytes, cfg.clone()).unwrap();
+    let w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+    let backend = llama_vulkan::ResidentGpu::new(&ctx).expect("ResidentGpu falhou");
+
+    // Mesma referência CPU-f32 usada pelo teste dual: isola "GPU computa correto"
+    // de "quantização de ativação muda o argmax". O token deve ser idêntico.
+    struct CpuF32ActMatmul;
+    impl llama_model::GpuMatmul for CpuF32ActMatmul {
+        fn matvec_q8_0(
+            &self,
+            w_bytes: &[u8],
+            x: &[f32],
+            n_in: usize,
+            n_out: usize,
+        ) -> Result<Vec<f32>, llama_model::ModelError> {
+            Ok(cpu_ref_q8_0_f32act(w_bytes, x, n_in, n_out))
+        }
+    }
+
+    let prompt = [cfg.bos_id];
+    let gpu_tok = model.decode_one_gpu_owned(&prompt, &backend, &w).unwrap();
+    let ref_tok = model
+        .decode_one_gpu_owned(&prompt, &CpuF32ActMatmul, &w)
+        .unwrap();
+    eprintln!("ResidentGpu decode: gpu_tok={gpu_tok} ref_f32_tok={ref_tok}");
+    assert_eq!(
+        gpu_tok, ref_tok,
+        "ResidentGpu deve igualar a referência f32 (mesmo shader q8_0_matvec)"
+    );
+}
+
+#[test]
+fn resident_gpu_nao_re_uploada_peso() {
+    use llama_model::GpuMatmul;
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("sem Vulkan — pulando");
+            return;
+        }
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let backend = llama_vulkan::ResidentGpu::new(&ctx).unwrap();
+
+    // Peso Q8_0 sintético 1 linha × 32 col: 34 bytes (2 scale f16 + 32 quants i8).
+    let w = vec![0u8; 34];
+    let x = vec![0f32; 32];
+    backend.matvec_q8_0(&w, &x, 32, 1).unwrap();
+    assert_eq!(backend.resident_count(), 1, "primeiro uso = 1 upload");
+    backend.matvec_q8_0(&w, &x, 32, 1).unwrap();
+    assert_eq!(
+        backend.resident_count(),
+        1,
+        "mesmo ponteiro = cache-hit, sem novo upload"
+    );
+}
