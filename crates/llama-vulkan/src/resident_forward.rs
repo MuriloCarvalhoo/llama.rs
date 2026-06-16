@@ -10,6 +10,11 @@ use ash::vk;
 use llama_model::{GpuAuxWeights, GpuRawWeights, LlamaConfig};
 use std::cell::RefCell;
 
+/// Linhas de saida processadas por cada workgroup do matvec Q8_0 (tunavel — varredura no Step 5).
+pub(crate) const MATVEC_NUM_ROWS: u32 = 2;
+/// local_size_x do matvec (wave64 no MI50).
+pub(crate) const MATVEC_WG: u32 = 64;
+
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
     pub buffer: vk::Buffer,
@@ -1001,6 +1006,7 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             .to_vec()
         };
+        let mv_groups = |n_out: usize| -> u32 { (n_out as u32).div_ceil(MATVEC_NUM_ROWS) };
 
         let mk = |pipe: PipeId,
                   binds: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
@@ -1063,7 +1069,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_normed.buffer, 0, nb(c.n_embd)),
                     (st.b_q.buffer, 0, nb(c.n_embd)),
                 ],
-                c.n_embd as u32,
+                mv_groups(c.n_embd),
                 PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
             )?);
             plan.push(mk(
@@ -1073,7 +1079,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_normed.buffer, 0, nb(c.n_embd)),
                     (st.b_k.buffer, 0, nb(c.kv_dim)),
                 ],
-                c.kv_dim as u32,
+                mv_groups(c.kv_dim),
                 PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
             )?);
             plan.push(mk(
@@ -1083,7 +1089,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_normed.buffer, 0, nb(c.n_embd)),
                     (st.b_v.buffer, 0, nb(c.kv_dim)),
                 ],
-                c.kv_dim as u32,
+                mv_groups(c.kv_dim),
                 PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
             )?);
             if let Some(b) = &la.q_bias {
@@ -1154,7 +1160,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_attn.buffer, 0, nb(c.n_embd)),
                     (st.b_proj.buffer, 0, nb(c.n_embd)),
                 ],
-                c.n_embd as u32,
+                mv_groups(c.n_embd),
                 PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
             )?);
             plan.push(mk(
@@ -1183,7 +1189,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_normed.buffer, 0, nb(c.n_embd)),
                     (st.b_gate.buffer, 0, nb(c.n_ff)),
                 ],
-                c.n_ff as u32,
+                mv_groups(c.n_ff),
                 PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
             )?);
             plan.push(mk(
@@ -1193,7 +1199,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_normed.buffer, 0, nb(c.n_embd)),
                     (st.b_up.buffer, 0, nb(c.n_ff)),
                 ],
-                c.n_ff as u32,
+                mv_groups(c.n_ff),
                 PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
             )?);
             plan.push(mk(
@@ -1213,7 +1219,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_act.buffer, 0, nb(c.n_ff)),
                     (st.b_proj.buffer, 0, nb(c.n_embd)),
                 ],
-                c.n_embd as u32,
+                mv_groups(c.n_embd),
                 PushSpec::Static(mv_push(c.n_ff, c.n_embd)),
             )?);
             plan.push(mk(
@@ -1244,7 +1250,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 (st.b_normed.buffer, 0, nb(c.n_embd)),
                 (st.b_logits.buffer, 0, nb(c.vocab)),
             ],
-            c.vocab as u32,
+            mv_groups(c.vocab),
             PushSpec::Static(mv_push(c.n_embd, c.vocab)),
         )?);
 

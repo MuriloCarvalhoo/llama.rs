@@ -33,7 +33,10 @@ impl ComputePipeline {
             crate::Q8_0_MATVEC_SPV,
             3,
             std::mem::size_of::<PushConstants>() as u32,
-            &[],
+            &[
+                (0, crate::resident_forward::MATVEC_WG),
+                (1, crate::resident_forward::MATVEC_NUM_ROWS),
+            ],
         )
     }
 

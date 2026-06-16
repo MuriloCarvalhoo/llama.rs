@@ -2,63 +2,57 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 
-// Workgroup = um wave64 (64 lanes) computa UM elemento de saida (uma linha de W . x).
-// gfx906 (MI50) tem wave64 nativo; local_size_x=64 garante um workgroup = uma wave.
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-// AVISO: assume gl_SubgroupSize == 64 (wave64, gfx906/MI50).
-// Em hardware wave32 este shader produz resultado incorreto.
+// Specialization constants (preenchidas no pipeline creation).
+layout(constant_id = 0) const uint WG = 64u;       // local_size_x (wave64)
+layout(constant_id = 1) const uint NUM_ROWS = 1u;  // linhas de saida por workgroup
 
-// W: pesos Q8_0 row-major. Cada linha = n_blocks x 34 bytes (2 bytes f16 scale + 32 bytes i8).
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// W: pesos Q8_0 row-major. Cada linha = n_blocks x 34 bytes (2 = f16 scale, 32 = i8).
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uint8_t w[]; } weight_buf;
-// X: ativacoes f32. Tamanho: n_in floats.
-layout(set = 0, binding = 1) readonly buffer ActBuf   { float   x[]; } act_buf;
-// Y: saida f32. Tamanho: n_out floats.
-layout(set = 0, binding = 2) writeonly buffer OutBuf  { float   y[]; } out_buf;
+// X: ativacoes f32 (n_in floats).
+layout(set = 0, binding = 1) readonly buffer ActBuf { float x[]; } act_buf;
+// Y: saida f32 (n_out floats).
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float y[]; } out_buf;
 
 layout(push_constant) uniform PC {
-    uint n_in;       // dimensao de entrada (multiplo de 32)
-    uint n_out;      // dimensao de saida
-    uint row_offset; // para row-split: GPU1 comeca em row_offset
+    uint n_in;
+    uint n_out;
+    uint row_offset; // vestigial (saida indexada por row absoluta)
 } pc;
 
 void main() {
-    // Indice LOCAL: o lado host fatia os pesos por GPU (w1 = &w[split..]) e dimensiona
-    // o buffer de saida como n_out_local. Indexar pelo offset global causa acesso OOB
-    // (leituras->0, escritas descartadas) na GPU1. pc.row_offset fica vestigial.
-    uint row = gl_WorkGroupID.x;
-    uint lane = gl_LocalInvocationID.x; // 0..63
+    uint lane = gl_LocalInvocationID.x;
+    uint base_row = gl_WorkGroupID.x * NUM_ROWS;
+    uint n_blocks = pc.n_in / 32u;
+    uint row_stride = n_blocks * 34u; // bytes por linha de peso
 
-    if (row >= gl_NumWorkGroups.x) return;
-
-    uint n_blocks  = pc.n_in / 32u;
-    uint row_bytes = n_blocks * 34u;
-
-    float acc = 0.0;
-
-    // Cada lane processa blocos em stride de 64 (um wave completo).
-    for (uint b = lane; b < n_blocks; b += 64u) {
-        uint boff = row * row_bytes + b * 34u;
-
-        // Carrega escala f16 (2 bytes little-endian) e converte para f32.
-        uint d_lo = uint(weight_buf.w[boff]);
-        uint d_hi = uint(weight_buf.w[boff + 1u]);
-        float d = unpackHalf2x16((d_hi << 8u) | d_lo).x;
-
-        // Produto escalar: 32 pares i8 x f32.
-        float dot = 0.0;
-        for (uint i = 0u; i < 32u; i++) {
-            int qi = int(int8_t(weight_buf.w[boff + 2u + i]));
-            float xi = act_buf.x[b * 32u + i];
-            dot += float(qi) * xi;
+    // Cada linha mantem EXATAMENTE a mesma ordem de acumulacao do kernel original
+    // (lane-strided sobre blocos + subgroupAdd) -> resultado bit-identico por linha.
+    for (uint r = 0u; r < NUM_ROWS; r++) {
+        uint row = base_row + r;
+        // `row` cresce monotonicamente com r; uma vez fora do range, todas as linhas
+        // seguintes deste workgroup tambem estao -> break (nao continue) e correto e evita
+        // iteracoes inuteis. `row` independe de lane, logo o break e uniforme no subgroup.
+        if (row >= pc.n_out) { break; }
+        uint roff = row * row_stride;
+        float acc = 0.0;
+        for (uint b = lane; b < n_blocks; b += WG) {
+            uint boff = roff + b * 34u;
+            uint d_lo = uint(weight_buf.w[boff + 0u]);
+            uint d_hi = uint(weight_buf.w[boff + 1u]);
+            float d = unpackHalf2x16((d_hi << 8u) | d_lo).x;
+            float dot = 0.0;
+            for (uint i = 0u; i < 32u; i++) {
+                int qi = int(int8_t(weight_buf.w[boff + 2u + i]));
+                float xi = act_buf.x[b * 32u + i];
+                dot += float(qi) * xi;
+            }
+            acc += d * dot;
         }
-        acc += d * dot;
-    }
-
-    // Reducao wave64 via subgroupAdd.
-    acc = subgroupAdd(acc);
-
-    // Apenas a lane 0 de cada subgroup escreve.
-    if (gl_SubgroupInvocationID == 0u) {
-        out_buf.y[row] = acc;
+        acc = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) {
+            out_buf.y[row] = acc;
+        }
     }
 }
