@@ -76,6 +76,12 @@ impl Buffers {
                 d.destroy_buffer(self.x_dev, None);
                 d.free_memory(self.x_dev_mem, None);
             }
+            // Zera os handles antes de qualquer alocação falível: se um `?` abaixo
+            // disparar, um `ensure`/`destroy` posterior vê nulos (no-op), não double-free.
+            self.x_staging = vk::Buffer::null();
+            self.x_staging_mem = vk::DeviceMemory::null();
+            self.x_dev = vk::Buffer::null();
+            self.x_dev_mem = vk::DeviceMemory::null();
             self.x_staging = create_buf(d, x_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
             self.x_staging_mem = alloc_and_bind(ctx, phys, d, self.x_staging, true)?;
             self.x_dev = create_buf(
@@ -96,6 +102,11 @@ impl Buffers {
                 d.destroy_buffer(self.y_read, None);
                 d.free_memory(self.y_read_mem, None);
             }
+            // Zera os handles antes da alocação falível (ver lado X).
+            self.y_dev = vk::Buffer::null();
+            self.y_dev_mem = vk::DeviceMemory::null();
+            self.y_read = vk::Buffer::null();
+            self.y_read_mem = vk::DeviceMemory::null();
             self.y_dev = create_buf(
                 d,
                 y_size,
@@ -295,7 +306,9 @@ impl<'ctx> ResidentGpu<'ctx> {
                 ..Default::default()
             })
             .collect();
-        // SAFETY: d válido; writes apontam para buf_infos vivos na stack; GPU ociosa (wait_idle anterior).
+        // SAFETY: d válido; writes apontam para buf_infos vivos na stack. O desc_set não
+        // está em uso: na 1ª chamada nenhum cmd o referenciou; nas demais o queue_wait_idle
+        // do dispatch anterior garantiu GPU ociosa.
         unsafe { d.update_descriptor_sets(&writes, &[]) };
 
         // 4. Command buffer (ainda por-chamada nesta fatia; fusão vira 1 cmd/token na Fase 1D).
