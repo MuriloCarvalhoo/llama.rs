@@ -423,6 +423,41 @@ fn gpu_matvec_large_n_out_matches_cpu_ref() {
     );
 }
 
+// ─── Fase 8.1C Task 4: ResidentForward rmsnorm GPU == CPU ────────────────────
+
+#[test]
+fn resident_fwd_rmsnorm_igual_cpu() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let dim = 896usize;
+    let x: Vec<f32> = (0..dim).map(|i| ((i % 13) as f32) * 0.1 - 0.5).collect();
+    let w: Vec<f32> = (0..dim).map(|i| 1.0 + ((i % 7) as f32) * 0.01).collect();
+    let eps = 1e-6f32;
+
+    let ss: f32 = x.iter().map(|v| v * v).sum();
+    let scale = 1.0 / (ss / dim as f32 + eps).sqrt();
+    let cpu: Vec<f32> = x
+        .iter()
+        .zip(w.iter())
+        .map(|(&xi, &wi)| xi * scale * wi)
+        .collect();
+
+    let gpu = fwd.dbg_rmsnorm(&x, &w, eps).unwrap();
+    assert_eq!(gpu.len(), dim);
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-4, "rmsnorm[{i}]: cpu={a} gpu={b}");
+    }
+}
+
 // ─── Fase 8.1A: ResidentGpu (single-GPU, pesos+pipeline residentes) ──────────
 
 #[test]

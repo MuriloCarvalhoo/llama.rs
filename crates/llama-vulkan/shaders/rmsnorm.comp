@@ -1,3 +1,24 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// 1 workgroup = 1 subgroup (wave64) processa a linha inteira.
 layout(local_size_x = 64) in;
-void main() {}
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } xb;
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; } wb;
+layout(set = 0, binding = 2) writeonly buffer OBuf { float o[]; } ob;
+
+layout(push_constant) uniform PC { uint dim; float eps; } pc;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (uint i = lane; i < pc.dim; i += 64u) {
+        float v = xb.x[i];
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);                       // soma total em TODAS as lanes
+    float scale = inversesqrt(ss / float(pc.dim) + pc.eps);
+    for (uint i = lane; i < pc.dim; i += 64u) {
+        ob.o[i] = xb.x[i] * scale * wb.w[i];
+    }
+}

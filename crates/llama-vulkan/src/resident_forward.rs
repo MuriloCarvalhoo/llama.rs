@@ -275,4 +275,122 @@ impl<'ctx> ResidentForward<'ctx> {
         host.destroy(d);
         Ok(out)
     }
+
+    /// Constrói só device + pipelines + descriptor pool (sem pesos/buffers). Para micro-testes.
+    pub fn new_pipelines_only(ctx: &'ctx VulkanContext) -> Result<Self, MatmulError> {
+        let phys = ctx.amd_compute_devices();
+        if phys.is_empty() {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
+        let dev = VulkanDevice::create(ctx, &phys[0])?;
+        let d = &dev.device;
+        let matvec = ComputePipeline::new(d)?;
+        let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8)?; // dim:u32 + eps:f32
+        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16)?;
+        let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24)?;
+        let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4)?;
+        let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4)?;
+
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 4096,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo {
+            max_sets: 1024,
+            pool_size_count: 1,
+            p_pool_sizes: pool_sizes.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: d válido; pool_info aponta para dados vivos.
+        let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
+
+        Ok(Self {
+            ctx,
+            phys_idx: 0,
+            dev,
+            matvec,
+            rmsnorm,
+            rope,
+            attention,
+            swiglu,
+            add,
+            desc_pool,
+        })
+    }
+
+    /// Diagnóstico: roda só o shader rmsnorm sobre `x`,`w` e devolve a saída ao host.
+    pub fn dbg_rmsnorm(&self, x: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>, MatmulError> {
+        #[repr(C)]
+        struct P {
+            dim: u32,
+            eps: f32,
+        }
+        let d = &self.dev.device;
+        let dim = x.len();
+        let xb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(x) as vk::DeviceSize,
+        )?;
+        let wb = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            std::mem::size_of_val(w) as vk::DeviceSize,
+        )?;
+        let ob = Buf::device(self.ctx, self.phys(), d, (dim * 4) as vk::DeviceSize)?;
+        self.upload_f32(&xb, x)?;
+        self.upload_f32(&wb, w)?;
+        let set = self.alloc_set(&self.rmsnorm)?;
+        let push = P {
+            dim: dim as u32,
+            eps,
+        };
+        let push_bytes = unsafe {
+            std::slice::from_raw_parts(&push as *const P as *const u8, std::mem::size_of::<P>())
+        };
+        self.dispatch1(
+            &self.rmsnorm,
+            set,
+            &[
+                (xb.buffer, 0, xb.size),
+                (wb.buffer, 0, wb.size),
+                (ob.buffer, 0, ob.size),
+            ],
+            push_bytes,
+            1, // 1 workgroup processa a linha
+        )?;
+        let out = self.readback(&ob, dim)?;
+        xb.destroy(d);
+        wb.destroy(d);
+        ob.destroy(d);
+        Ok(out)
+    }
+}
+
+impl Drop for ResidentForward<'_> {
+    fn drop(&mut self) {
+        let d = &self.dev.device;
+        // SAFETY: wait_idle garante GPU ociosa antes de liberar.
+        unsafe {
+            let _ = d.device_wait_idle();
+            d.destroy_descriptor_pool(self.desc_pool, None);
+        }
+        for p in [
+            &self.matvec,
+            &self.rmsnorm,
+            &self.rope,
+            &self.attention,
+            &self.swiglu,
+            &self.add,
+        ] {
+            // SAFETY: handles criados por nós, destruímos em ordem inversa.
+            unsafe {
+                d.destroy_pipeline(p.pipeline, None);
+                d.destroy_pipeline_layout(p.layout, None);
+                d.destroy_descriptor_set_layout(p.desc_set_layout, None);
+            }
+        }
+    }
 }
