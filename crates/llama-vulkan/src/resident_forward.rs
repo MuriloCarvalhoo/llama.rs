@@ -341,11 +341,11 @@ impl<'ctx> ResidentForward<'ctx> {
         let dev = VulkanDevice::create(ctx, &phys[0])?;
         let d = &dev.device;
         let matvec = ComputePipeline::new(d)?;
-        let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8)?; // dim:u32 + eps:f32
-        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16)?;
-        let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24)?;
-        let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4)?;
-        let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4)?;
+        let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
+        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16, &[])?;
+        let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24, &[])?;
+        let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
+        let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,

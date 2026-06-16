@@ -33,16 +33,19 @@ impl ComputePipeline {
             crate::Q8_0_MATVEC_SPV,
             3,
             std::mem::size_of::<PushConstants>() as u32,
+            &[],
         )
     }
 
     /// Pipeline de compute genérico: `n_bindings` STORAGE_BUFFER (bindings 0..n) +
     /// um push-constant range de `push_size` bytes (COMPUTE). `spv` é o SPIR-V já compilado.
+    /// `spec_consts` são pares (constant_id, valor u32) para specialization constants.
     pub fn with(
         dev: &ash::Device,
         spv: &[u8],
         n_bindings: u32,
         push_size: u32,
+        spec_consts: &[(u32, u32)],
     ) -> Result<Self, PipelineError> {
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_bindings)
             .map(|b| vk::DescriptorSetLayoutBinding {
@@ -89,11 +92,40 @@ impl ComputePipeline {
         // SAFETY: dev válido; shader_info aponta para `spv_u32` vivo na stack.
         let shader_module = unsafe { dev.create_shader_module(&shader_info, None)? };
 
+        // Specialization constants (cada uma é um u32, layout little-endian contíguo).
+        let spec_entries: Vec<vk::SpecializationMapEntry> = spec_consts
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, _))| vk::SpecializationMapEntry {
+                constant_id: id,
+                offset: (i * 4) as u32,
+                size: 4,
+            })
+            .collect();
+        let spec_data: Vec<u8> = spec_consts
+            .iter()
+            .flat_map(|&(_, v)| v.to_le_bytes())
+            .collect();
+        // SAFETY: spec_entries e spec_data vivem neste stack frame; spec_info é consumido
+        // por create_compute_pipelines antes que qualquer um deles seja dropped.
+        let spec_info = vk::SpecializationInfo {
+            map_entry_count: spec_entries.len() as u32,
+            p_map_entries: spec_entries.as_ptr(),
+            data_size: spec_data.len(),
+            p_data: spec_data.as_ptr().cast(),
+            ..Default::default()
+        };
+
         let entry_point = c"main";
         let stage = vk::PipelineShaderStageCreateInfo {
             stage: vk::ShaderStageFlags::COMPUTE,
             module: shader_module,
             p_name: entry_point.as_ptr(),
+            p_specialization_info: if spec_consts.is_empty() {
+                std::ptr::null()
+            } else {
+                &spec_info
+            },
             ..Default::default()
         };
         let pipeline_info = vk::ComputePipelineCreateInfo {
