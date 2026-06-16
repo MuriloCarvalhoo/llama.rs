@@ -97,6 +97,16 @@ run_rs() {
     grep -oE "[0-9]+\.[0-9]+ tok/s" "$log" | grep -oE "^[0-9]+\.[0-9]+" | head -1
 }
 
+# ── Rust (--gpu-single, 1x MI50 resident) — retorna tok/s de decode ──────────
+run_rs_single() {
+    local log=$1
+    "$RS_BIN" -m "$MODEL" -p "$PROMPT" -n "$N_TOKENS" \
+        --temp 0 --seed "$SEED" --no-display-prompt --timings --gpu-single \
+        2>"$log" >/dev/null || true
+    assert_no_nvidia "$log" "llama-rs (--gpu-single)"
+    grep -oE "[0-9]+\.[0-9]+ tok/s" "$log" | grep -oE "^[0-9]+\.[0-9]+" | head -1
+}
+
 # ── Execução ─────────────────────────────────────────────────────────────────
 model_name="$(basename "$MODEL")"
 
@@ -118,6 +128,8 @@ echo "Rodando llama.cpp 2x MI50..." >&2
 cpp2=$(run_cpp "$VK_AMD_DEVICES" /tmp/bench-cpp2.err)
 echo "Rodando llama-rs 2x MI50..." >&2
 rs=$(run_rs /tmp/bench-rs.err)
+echo "Rodando llama-rs 1x MI50 (resident)..." >&2
+rs1=$(run_rs_single /tmp/bench-rs1.err)
 
 # Device names efetivamente usados (prova de AMD-only).
 cpp_dev=$(grep -oiE "Radeon[^,)]*\)" /tmp/bench-cpp2.err | head -1 || true)
@@ -137,6 +149,7 @@ printf "| %-28s | %-16s |\n" "$(printf -- '-%.0s' {1..28})" "$(printf -- '-%.0s'
 printf "| %-28s | %-16s |\n" "llama.cpp — 1x MI50" "${cpp1:-erro}"
 printf "| %-28s | %-16s |\n" "llama.cpp — 2x MI50" "${cpp2:-erro}"
 printf "| %-28s | %-16s |\n" "llama-rs  — 2x MI50" "${rs:-erro}"
+printf "| %-28s | %-16s |\n" "llama-rs  — 1x MI50 (resident)" "${rs1:-erro}"
 echo ""
 echo "**Razão llama-rs / llama.cpp (2x MI50): $ratio**"
 echo ""
