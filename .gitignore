@@ -3,6 +3,12 @@
 /models
 /refs/tensors.txt
 
+# Benchmark GPU (scripts/benchmark-gpu.sh): clone + builds + relatórios
+/llama.cpp
+/build-vulkan
+/.deps
+/bench-results
+
 # Repositório separado que vive aqui por acaso (tem seu próprio .git)
 /everything-claude-code
 # Scratch da deep-research (notas de verificação, não entregáveis)
