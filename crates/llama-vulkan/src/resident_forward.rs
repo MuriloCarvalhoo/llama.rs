@@ -100,6 +100,41 @@ pub(crate) struct LayerAux {
     pub v_bias: Option<Buf>,
 }
 
+/// Identifica qual pipeline um dispatch usa (resolvido em `pipe_of`).
+#[derive(Clone, Copy)]
+pub(crate) enum PipeId {
+    Matvec,
+    Rmsnorm,
+    Rope,
+    Attention,
+    Swiglu,
+    Add,
+}
+
+/// Como obter os bytes de push-constant de um dispatch no momento da gravação.
+pub(crate) enum PushSpec {
+    /// Push totalmente conhecido na construção do plano.
+    Static(Vec<u8>),
+    /// RoPE: precisa de `pos` na gravação. `n_head` fixo.
+    Rope { n_head: u32 },
+    /// Attention: precisa de `total_len`. `kv_layer_off` fixo.
+    Attention { kv_layer_off: u32 },
+}
+
+/// Uma op do token. `Dispatch` usa um descriptor set pré-escrito; as cópias não.
+pub(crate) enum PlannedOp {
+    Dispatch {
+        pipe: PipeId,
+        set: vk::DescriptorSet,
+        groups: u32,
+        push: PushSpec,
+    },
+    /// Embedding lookup: copia a linha `token` de `token_embd` para `b_x`.
+    Embed,
+    /// Append do K e do V da camada ao KV-cache na posição `pos`.
+    KvAppend { layer: usize },
+}
+
 /// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
 pub(crate) struct ResidentState {
@@ -124,6 +159,9 @@ pub(crate) struct ResidentState {
     pub b_act: Buf,
     pub b_logits: Buf,
     pub len: RefCell<usize>,
+    pub plan: Vec<PlannedOp>,
+    pub token_cmd: vk::CommandBuffer,
+    pub token_fence: vk::Fence,
 }
 
 /// Backend de decode GPU-resident (1 GPU). Construído via `ResidentForward::new`.
@@ -494,6 +532,20 @@ impl<'ctx> ResidentForward<'ctx> {
                 Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)
             };
 
+            let cb_info = vk::CommandBufferAllocateInfo {
+                command_pool: dev_ref.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            // SAFETY: device/pool válidos; pool tem RESET_COMMAND_BUFFER.
+            let token_cmd = unsafe { dev_ref.device.allocate_command_buffers(&cb_info)? }[0];
+            let token_fence = unsafe {
+                dev_ref
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)?
+            };
+
             ResidentState {
                 cfg,
                 qw,
@@ -516,10 +568,17 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_act: nf(config.n_ff)?,
                 b_logits: nf(config.vocab)?,
                 len: RefCell::new(0),
+                plan: Vec::new(),
+                token_cmd,
+                token_fence,
             }
         };
 
         me.state = Some(state);
+        let plan = me.build_plan()?;
+        if let Some(st) = me.state.as_mut() {
+            st.plan = plan;
+        }
         Ok(me)
     }
 
@@ -984,6 +1043,313 @@ impl<'ctx> ResidentForward<'ctx> {
         )
     }
 
+    pub(crate) fn pipe_of(&self, id: PipeId) -> &ComputePipeline {
+        match id {
+            PipeId::Matvec => &self.matvec,
+            PipeId::Rmsnorm => &self.rmsnorm,
+            PipeId::Rope => &self.rope,
+            PipeId::Attention => &self.attention,
+            PipeId::Swiglu => &self.swiglu,
+            PipeId::Add => &self.add,
+        }
+    }
+
+    /// Monta a lista de ops do token (ordem idêntica a `decode_step`) e pré-aloca/escreve
+    /// um descriptor set por dispatch (bindings estáticos entre tokens).
+    fn build_plan(&self) -> Result<Vec<PlannedOp>, MatmulError> {
+        use crate::pipeline::PushConstants;
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let c = &st.cfg;
+        let d = &self.dev.device;
+        let mut plan = Vec::new();
+
+        let rms_push = || -> Vec<u8> {
+            #[repr(C)]
+            struct P {
+                dim: u32,
+                eps: f32,
+            }
+            let p = P {
+                dim: c.n_embd as u32,
+                eps: c.rms_eps,
+            };
+            unsafe { std::slice::from_raw_parts(&p as *const P as *const u8, 8) }.to_vec()
+        };
+        let n_push = |n: usize| -> Vec<u8> {
+            #[repr(C)]
+            struct P {
+                n: u32,
+            }
+            let p = P { n: n as u32 };
+            unsafe { std::slice::from_raw_parts(&p as *const P as *const u8, 4) }.to_vec()
+        };
+        let mv_push = |n_in: usize, n_out: usize| -> Vec<u8> {
+            let p = PushConstants {
+                n_in: n_in as u32,
+                n_out: n_out as u32,
+                row_offset: 0,
+            };
+            unsafe {
+                std::slice::from_raw_parts(
+                    &p as *const PushConstants as *const u8,
+                    std::mem::size_of::<PushConstants>(),
+                )
+            }
+            .to_vec()
+        };
+
+        let mk = |pipe: PipeId,
+                  binds: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+                  groups: u32,
+                  push: PushSpec|
+         -> Result<PlannedOp, MatmulError> {
+            let set = self.alloc_set(self.pipe_of(pipe))?;
+            let buf_infos: Vec<vk::DescriptorBufferInfo> = binds
+                .iter()
+                .map(|&(buffer, offset, range)| vk::DescriptorBufferInfo {
+                    buffer,
+                    offset,
+                    range,
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+                .iter()
+                .enumerate()
+                .map(|(b, bi)| vk::WriteDescriptorSet {
+                    dst_set: set,
+                    dst_binding: b as u32,
+                    descriptor_count: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    p_buffer_info: bi,
+                    ..Default::default()
+                })
+                .collect();
+            // SAFETY: d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
+            unsafe { d.update_descriptor_sets(&writes, &[]) };
+            Ok(PlannedOp::Dispatch {
+                pipe,
+                set,
+                groups,
+                push,
+            })
+        };
+
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+
+        plan.push(PlannedOp::Embed);
+
+        for l in 0..c.n_layer {
+            let lq = &st.qw[l];
+            let la = &st.aux[l];
+
+            plan.push(mk(
+                PipeId::Rmsnorm,
+                &[
+                    (st.b_x.buffer, 0, nb(c.n_embd)),
+                    (la.attn_norm.buffer, 0, la.attn_norm.size),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                ],
+                1,
+                PushSpec::Static(rms_push()),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.attn_q.buffer, 0, lq.attn_q.size_bytes),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_q.buffer, 0, nb(c.n_embd)),
+                ],
+                c.n_embd as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.attn_k.buffer, 0, lq.attn_k.size_bytes),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_k.buffer, 0, nb(c.kv_dim)),
+                ],
+                c.kv_dim as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.attn_v.buffer, 0, lq.attn_v.size_bytes),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_v.buffer, 0, nb(c.kv_dim)),
+                ],
+                c.kv_dim as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
+            )?);
+            if let Some(b) = &la.q_bias {
+                plan.push(mk(
+                    PipeId::Add,
+                    &[(st.b_q.buffer, 0, nb(c.n_embd)), (b.buffer, 0, b.size)],
+                    Self::groups_for(c.n_embd),
+                    PushSpec::Static(n_push(c.n_embd)),
+                )?);
+            }
+            if let Some(b) = &la.k_bias {
+                plan.push(mk(
+                    PipeId::Add,
+                    &[(st.b_k.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
+                    Self::groups_for(c.kv_dim),
+                    PushSpec::Static(n_push(c.kv_dim)),
+                )?);
+            }
+            if let Some(b) = &la.v_bias {
+                plan.push(mk(
+                    PipeId::Add,
+                    &[(st.b_v.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
+                    Self::groups_for(c.kv_dim),
+                    PushSpec::Static(n_push(c.kv_dim)),
+                )?);
+            }
+            plan.push(mk(
+                PipeId::Rope,
+                &[
+                    (st.b_q.buffer, 0, nb(c.n_embd)),
+                    (st.freq_buf.buffer, 0, st.freq_buf.size),
+                ],
+                Self::groups_for(c.n_head * (c.rope_dim / 2)),
+                PushSpec::Rope {
+                    n_head: c.n_head as u32,
+                },
+            )?);
+            plan.push(mk(
+                PipeId::Rope,
+                &[
+                    (st.b_k.buffer, 0, nb(c.kv_dim)),
+                    (st.freq_buf.buffer, 0, st.freq_buf.size),
+                ],
+                Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
+                PushSpec::Rope {
+                    n_head: c.n_head_kv as u32,
+                },
+            )?);
+            plan.push(PlannedOp::KvAppend { layer: l });
+            let layer_off = (l * c.ctx * c.kv_dim) as u32;
+            plan.push(mk(
+                PipeId::Attention,
+                &[
+                    (st.b_q.buffer, 0, nb(c.n_embd)),
+                    (st.kcache.buffer, 0, st.kcache.size),
+                    (st.vcache.buffer, 0, st.vcache.size),
+                    (st.b_attn.buffer, 0, nb(c.n_embd)),
+                ],
+                c.n_head as u32,
+                PushSpec::Attention {
+                    kv_layer_off: layer_off,
+                },
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.attn_output.buffer, 0, lq.attn_output.size_bytes),
+                    (st.b_attn.buffer, 0, nb(c.n_embd)),
+                    (st.b_proj.buffer, 0, nb(c.n_embd)),
+                ],
+                c.n_embd as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
+            )?);
+            plan.push(mk(
+                PipeId::Add,
+                &[
+                    (st.b_x.buffer, 0, nb(c.n_embd)),
+                    (st.b_proj.buffer, 0, nb(c.n_embd)),
+                ],
+                Self::groups_for(c.n_embd),
+                PushSpec::Static(n_push(c.n_embd)),
+            )?);
+            plan.push(mk(
+                PipeId::Rmsnorm,
+                &[
+                    (st.b_x.buffer, 0, nb(c.n_embd)),
+                    (la.ffn_norm.buffer, 0, la.ffn_norm.size),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                ],
+                1,
+                PushSpec::Static(rms_push()),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.ffn_gate.buffer, 0, lq.ffn_gate.size_bytes),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_gate.buffer, 0, nb(c.n_ff)),
+                ],
+                c.n_ff as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.ffn_up.buffer, 0, lq.ffn_up.size_bytes),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_up.buffer, 0, nb(c.n_ff)),
+                ],
+                c.n_ff as u32,
+                PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
+            )?);
+            plan.push(mk(
+                PipeId::Swiglu,
+                &[
+                    (st.b_gate.buffer, 0, nb(c.n_ff)),
+                    (st.b_up.buffer, 0, nb(c.n_ff)),
+                    (st.b_act.buffer, 0, nb(c.n_ff)),
+                ],
+                Self::groups_for(c.n_ff),
+                PushSpec::Static(n_push(c.n_ff)),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (lq.ffn_down.buffer, 0, lq.ffn_down.size_bytes),
+                    (st.b_act.buffer, 0, nb(c.n_ff)),
+                    (st.b_proj.buffer, 0, nb(c.n_embd)),
+                ],
+                c.n_embd as u32,
+                PushSpec::Static(mv_push(c.n_ff, c.n_embd)),
+            )?);
+            plan.push(mk(
+                PipeId::Add,
+                &[
+                    (st.b_x.buffer, 0, nb(c.n_embd)),
+                    (st.b_proj.buffer, 0, nb(c.n_embd)),
+                ],
+                Self::groups_for(c.n_embd),
+                PushSpec::Static(n_push(c.n_embd)),
+            )?);
+        }
+
+        plan.push(mk(
+            PipeId::Rmsnorm,
+            &[
+                (st.b_x.buffer, 0, nb(c.n_embd)),
+                (st.output_norm_buf.buffer, 0, st.output_norm_buf.size),
+                (st.b_normed.buffer, 0, nb(c.n_embd)),
+            ],
+            1,
+            PushSpec::Static(rms_push()),
+        )?);
+        plan.push(mk(
+            PipeId::Matvec,
+            &[
+                (st.output_w.buffer, 0, st.output_w.size_bytes),
+                (st.b_normed.buffer, 0, nb(c.n_embd)),
+                (st.b_logits.buffer, 0, nb(c.vocab)),
+            ],
+            c.vocab as u32,
+            PushSpec::Static(mv_push(c.n_embd, c.vocab)),
+        )?);
+
+        Ok(plan)
+    }
+
     fn decode_step(&self, token: u32, pos: usize) -> Result<Vec<f32>, MatmulError> {
         let st = self
             .state
@@ -1148,6 +1514,11 @@ impl Drop for ResidentForward<'_> {
                 &st.b_logits,
             ] {
                 b.destroy(d);
+            }
+            // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
+            unsafe {
+                d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
+                d.destroy_fence(st.token_fence, None);
             }
         }
 
