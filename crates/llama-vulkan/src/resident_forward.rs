@@ -14,6 +14,9 @@ use std::cell::RefCell;
 pub(crate) const MATVEC_NUM_ROWS: u32 = 2;
 /// local_size_x do matvec (wave64 no MI50).
 pub(crate) const MATVEC_WG: u32 = 64;
+/// Máximo de blocos Q8_0 (n_in/32) que o shader matvec cacheia em LDS (`MAX_BLOCKS` em
+/// q8_0_matvec.comp). n_in > MATVEC_MAX_BLOCKS*32 escreveria OOB no LDS → rejeitado em `new`.
+pub(crate) const MATVEC_MAX_BLOCKS: usize = 160;
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
@@ -390,6 +393,11 @@ impl<'ctx> ResidentForward<'ctx> {
     ) -> Result<Self, MatmulError> {
         if config.head_dim > 64 {
             // Shader de attention assume head_dim <= subgroup (64).
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        // O matvec quantiza x (n_in floats) em LDS dimensionado por MATVEC_MAX_BLOCKS.
+        // n_in > MATVEC_MAX_BLOCKS*32 (maior matvec = max(n_embd, n_ff)) causaria OOB no LDS.
+        if config.n_embd.max(config.n_ff).div_ceil(32) > MATVEC_MAX_BLOCKS {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
         let mut me = Self::new_pipelines_only(ctx)?;

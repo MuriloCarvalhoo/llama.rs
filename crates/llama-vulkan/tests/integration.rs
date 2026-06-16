@@ -831,3 +831,64 @@ fn resident_forward_logits_iguais_a_cpu_qwen() {
         .unwrap();
     assert_eq!(cpu, gpu, "argmax do decode GPU-resident deve igualar CPU");
 }
+
+// ─── Fase 8.3 Task 5: ativação int8 + dotPacked4x8 no matvec (tolerância) ──────
+
+#[test]
+fn resident_matvec_int8_logits_dentro_da_tolerancia() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let path = "../../models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("modelo ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let model = llama_model::Model::load(&f, &bytes).unwrap();
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config).unwrap();
+    let aux = model.gpu_aux_weights().unwrap();
+    let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux).unwrap();
+
+    let prompt: [u32; 2] = [model.config.bos_id, 9707];
+    let cpu = model.decode_one_cpu_logits(&prompt).unwrap();
+    let gpu = model
+        .decode_one_gpu_resident_logits(&prompt, &backend)
+        .unwrap();
+
+    assert_eq!(cpu.len(), gpu.len(), "tamanho dos logits deve casar");
+
+    // Erro relativo máximo (escalado pela magnitude máxima do vetor CPU para
+    // evitar divisão por valores próximos de zero).
+    let max_abs = cpu.iter().fold(0.0_f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let mut max_rel = 0.0_f32;
+    for (&c, &g) in cpu.iter().zip(gpu.iter()) {
+        let rel = (c - g).abs() / max_abs;
+        if rel > max_rel {
+            max_rel = rel;
+        }
+    }
+
+    let argmax = |v: &[f32]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let argmax_cpu = argmax(&cpu);
+    let argmax_gpu = argmax(&gpu);
+    eprintln!("max_rel_err={max_rel:.6} argmax_cpu={argmax_cpu} argmax_gpu={argmax_gpu}");
+
+    assert!(
+        max_rel < 0.05,
+        "erro relativo máximo {max_rel} deve ser < 0.05 (5%)"
+    );
+    assert_eq!(argmax_cpu, argmax_gpu, "argmax CPU == GPU");
+}

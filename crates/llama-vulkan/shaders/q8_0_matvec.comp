@@ -1,6 +1,7 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_integer_dot_product : require
 
 // Specialization constants (preenchidas no pipeline creation).
 layout(constant_id = 0) const uint WG = 64u;       // local_size_x (wave64)
@@ -21,14 +22,49 @@ layout(push_constant) uniform PC {
     uint row_offset; // vestigial (saida indexada por row absoluta)
 } pc;
 
+// Ativacao x quantizada int8 simetrica por bloco, reutilizada por todas as
+// NUM_ROWS linhas deste workgroup. Dimensionada para o maior matvec do 0.5B
+// (n_ff=4864 -> n_blocks=152), com pequena margem -> 160 blocos.
+// Footprint: sxq = 160*8*4 = 5120 B, sxd = 160*4 = 640 B  => ~5.6 KB de LDS,
+// bem abaixo dos ~20 KB que derrubaram a ocupacao na Task 3.
+const uint MAX_BLOCKS = 160u;
+shared int   sxq[MAX_BLOCKS * 8u]; // 4 i8 empacotados por int, 8 ints por bloco
+shared float sxd[MAX_BLOCKS];      // escala (d_x) por bloco
+
 void main() {
     uint lane = gl_LocalInvocationID.x;
     uint base_row = gl_WorkGroupID.x * NUM_ROWS;
     uint n_blocks = pc.n_in / 32u;
     uint row_stride = n_blocks * 34u; // bytes por linha de peso
 
-    // Cada linha mantem EXATAMENTE a mesma ordem de acumulacao do kernel original
-    // (lane-strided sobre blocos + subgroupAdd) -> resultado bit-identico por linha.
+    // --- Quantizacao cooperativa de x em int8 simetrico, uma vez por workgroup ---
+    // Cada lane processa blocos lane-strided. Para o bloco blk: amax sobre 32
+    // elementos, d_x = amax/127, e empacota 4 quantizados por int (little-endian
+    // de bytes: o byte j vai para o lane 8*j -> bit pattern i8 em complemento de 2,
+    // mesma semantica validada no dot4_probe).
+    for (uint blk = lane; blk < n_blocks; blk += WG) {
+        uint base = blk * 32u;
+        float amax = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            amax = max(amax, abs(act_buf.x[base + i]));
+        }
+        float d_x = amax / 127.0;
+        float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+        sxd[blk] = d_x;
+        for (uint g = 0u; g < 8u; g++) {
+            int packed = 0;
+            for (uint j = 0u; j < 4u; j++) {
+                int q = int(round(act_buf.x[base + g * 4u + j] * inv));
+                q = clamp(q, -127, 127);
+                packed |= (q & 0xff) << (8u * j);
+            }
+            sxq[blk * 8u + g] = packed;
+        }
+    }
+    barrier();
+
+    // Cada linha mantem a mesma ordem de acumulacao do kernel original
+    // (lane-strided sobre blocos + subgroupAdd).
     for (uint r = 0u; r < NUM_ROWS; r++) {
         uint row = base_row + r;
         // `row` cresce monotonicamente com r; uma vez fora do range, todas as linhas
@@ -41,14 +77,18 @@ void main() {
             uint boff = roff + b * 34u;
             uint d_lo = uint(weight_buf.w[boff + 0u]);
             uint d_hi = uint(weight_buf.w[boff + 1u]);
-            float d = unpackHalf2x16((d_hi << 8u) | d_lo).x;
-            float dot = 0.0;
-            for (uint i = 0u; i < 32u; i++) {
-                int qi = int(int8_t(weight_buf.w[boff + 2u + i]));
-                float xi = act_buf.x[b * 32u + i];
-                dot += float(qi) * xi;
+            float d_w = unpackHalf2x16((d_hi << 8u) | d_lo).x;
+            // Soma dos 32 produtos i8(peso) * i8(x) via dot empacotado (4 MAC/instr).
+            int isum = 0;
+            for (uint g = 0u; g < 8u; g++) {
+                uint wo = boff + 2u + g * 4u;
+                int wp = int(weight_buf.w[wo + 0u])
+                       | (int(weight_buf.w[wo + 1u]) << 8)
+                       | (int(weight_buf.w[wo + 2u]) << 16)
+                       | (int(weight_buf.w[wo + 3u]) << 24);
+                isum = dotPacked4x8AccSatEXT(wp, sxq[b * 8u + g], isum);
             }
-            acc += d * dot;
+            acc += d_w * sxd[b] * float(isum);
         }
         acc = subgroupAdd(acc);
         if (gl_SubgroupInvocationID == 0u) {

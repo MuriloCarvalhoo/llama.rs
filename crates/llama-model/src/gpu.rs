@@ -264,6 +264,28 @@ impl Model {
         u32::try_from(crate::ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
     }
 
+    /// Prefill + 1 decode na CPU; retorna o vetor de logits completo ([vocab]).
+    /// Para teste de tolerância vs GPU.
+    pub fn decode_one_cpu_logits(&self, prompt: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let mut cache = self.new_cache();
+        self.forward(prompt, &mut cache)
+    }
+
+    /// Prefill + 1 decode 100% na GPU; retorna o vetor de logits completo ([vocab]).
+    /// Para teste de tolerância vs CPU.
+    pub fn decode_one_gpu_resident_logits(
+        &self,
+        prompt: &[u32],
+        gpu: &dyn GpuResidentDecode,
+    ) -> Result<Vec<f32>, ModelError> {
+        gpu.reset();
+        let mut logits = Vec::new();
+        for (pos, &t) in prompt.iter().enumerate() {
+            logits = gpu.decode(t, pos)?;
+        }
+        Ok(logits)
+    }
+
     /// Forward de **decode** (n_tok=1) com os 8 matmuls na GPU.
     /// RMSNorm/RoPE/attention/SwiGLU/bias permanecem na CPU.
     pub(crate) fn forward_gpu(
