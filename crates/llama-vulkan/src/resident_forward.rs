@@ -5,7 +5,10 @@
 use crate::device::{VulkanContext, VulkanDevice, VulkanPhysicalDevice};
 use crate::matmul::MatmulError;
 use crate::pipeline::ComputePipeline;
+use crate::tensor::GpuTensor;
 use ash::vk;
+use llama_model::{GpuAuxWeights, GpuRawWeights, LlamaConfig};
+use std::cell::RefCell;
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
@@ -62,6 +65,67 @@ impl Buf {
     }
 }
 
+/// Escalares de arquitetura necessários ao decode.
+pub(crate) struct Cfg {
+    pub n_embd: usize,
+    pub n_layer: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub n_ff: usize,
+    pub rope_dim: usize,
+    pub kv_dim: usize,
+    pub vocab: usize,
+    pub ctx: usize,
+    pub rms_eps: f32,
+}
+
+/// Pesos Q8_0 residentes de uma camada.
+pub(crate) struct LayerQ {
+    pub attn_q: GpuTensor,
+    pub attn_k: GpuTensor,
+    pub attn_v: GpuTensor,
+    pub attn_output: GpuTensor,
+    pub ffn_gate: GpuTensor,
+    pub ffn_up: GpuTensor,
+    pub ffn_down: GpuTensor,
+}
+
+/// Buffers f32 auxiliares residentes de uma camada.
+pub(crate) struct LayerAux {
+    pub attn_norm: Buf,
+    pub ffn_norm: Buf,
+    pub q_bias: Option<Buf>,
+    pub k_bias: Option<Buf>,
+    pub v_bias: Option<Buf>,
+}
+
+/// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
+/// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
+pub(crate) struct ResidentState {
+    pub cfg: Cfg,
+    pub qw: Vec<LayerQ>,
+    pub output_w: GpuTensor,
+    pub aux: Vec<LayerAux>,
+    pub output_norm_buf: Buf,
+    pub freq_buf: Buf,
+    pub token_embd_buf: Buf,
+    pub kcache: Buf,
+    pub vcache: Buf,
+    pub b_x: Buf,
+    pub b_normed: Buf,
+    pub b_q: Buf,
+    pub b_k: Buf,
+    pub b_v: Buf,
+    pub b_attn: Buf,
+    pub b_proj: Buf,
+    pub b_gate: Buf,
+    pub b_up: Buf,
+    pub b_act: Buf,
+    pub b_logits: Buf,
+    pub len: RefCell<usize>,
+}
+
 /// Backend de decode GPU-resident (1 GPU). Construído via `ResidentForward::new`.
 pub struct ResidentForward<'ctx> {
     pub(crate) ctx: &'ctx VulkanContext,
@@ -75,6 +139,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) swiglu: ComputePipeline,
     pub(crate) add: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
+    pub(crate) state: Option<ResidentState>,
 }
 
 impl<'ctx> ResidentForward<'ctx> {
@@ -315,7 +380,147 @@ impl<'ctx> ResidentForward<'ctx> {
             swiglu,
             add,
             desc_pool,
+            state: None,
         })
+    }
+
+    /// Constrói o backend GPU-resident: sobe todos os pesos (Q8_0 + aux f32) e aloca
+    /// as ativações e o KV-cache em VRAM. Após retornar, `raw`/`aux` podem ser descartados.
+    pub fn new(
+        ctx: &'ctx VulkanContext,
+        config: &LlamaConfig,
+        raw: &GpuRawWeights,
+        aux: &GpuAuxWeights<'_>,
+    ) -> Result<Self, MatmulError> {
+        if config.head_dim > 64 {
+            // Shader de attention assume head_dim <= subgroup (64).
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        let mut me = Self::new_pipelines_only(ctx)?;
+        let kv_dim = config.n_head_kv * config.head_dim;
+
+        // Bloco que constrói todo o estado residente emprestando `me` imutavelmente;
+        // ao final o `state` é movido para fora (sem borrows de `me`), e só então
+        // `me.state = Some(state)` é atribuído.
+        let state = {
+            let phys = me.phys();
+            let dev_ref = &me.dev;
+            let d = &dev_ref.device;
+
+            let cfg = Cfg {
+                n_embd: config.n_embd,
+                n_layer: config.n_layer,
+                n_head: config.n_head,
+                n_head_kv: config.n_head_kv,
+                head_dim: config.head_dim,
+                n_ff: config.n_ff,
+                rope_dim: config.rope_dim,
+                kv_dim,
+                vocab: config.vocab,
+                ctx: config.ctx,
+                rms_eps: config.rms_eps,
+            };
+
+            let up_q =
+                |bytes: &[u8], n_in: usize, n_out: usize| -> Result<GpuTensor, MatmulError> {
+                    GpuTensor::upload_q8_0(ctx, phys, dev_ref, bytes, n_in, n_out)
+                        .map_err(MatmulError::from)
+                };
+            let mut qw = Vec::with_capacity(cfg.n_layer);
+            for lw in &raw.layers {
+                qw.push(LayerQ {
+                    attn_q: up_q(&lw.attn_q, cfg.n_embd, cfg.n_embd)?,
+                    attn_k: up_q(&lw.attn_k, cfg.n_embd, kv_dim)?,
+                    attn_v: up_q(&lw.attn_v, cfg.n_embd, kv_dim)?,
+                    attn_output: up_q(&lw.attn_output, cfg.n_embd, cfg.n_embd)?,
+                    ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
+                    ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
+                    ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
+                });
+            }
+            let output_w = up_q(&raw.output, cfg.n_embd, cfg.vocab)?;
+
+            let mk = |data: &[f32]| -> Result<Buf, MatmulError> {
+                let b = Buf::device(ctx, phys, d, std::mem::size_of_val(data) as vk::DeviceSize)?;
+                let bytes_val = std::mem::size_of_val(data) as vk::DeviceSize;
+                let staging = Buf::host(ctx, phys, d, bytes_val)?;
+                unsafe {
+                    let ptr =
+                        d.map_memory(staging.mem, 0, bytes_val, vk::MemoryMapFlags::empty())?;
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const u8,
+                        ptr as *mut u8,
+                        bytes_val as usize,
+                    );
+                    d.unmap_memory(staging.mem);
+                }
+                use crate::tensor::one_shot_copy;
+                one_shot_copy(
+                    d,
+                    dev_ref.queue,
+                    dev_ref.cmd_pool,
+                    staging.buffer,
+                    b.buffer,
+                    bytes_val,
+                )?;
+                staging.destroy(d);
+                Ok(b)
+            };
+            let mk_opt = |o: &Option<Vec<f32>>| -> Result<Option<Buf>, MatmulError> {
+                match o {
+                    Some(v) => Ok(Some(mk(v)?)),
+                    None => Ok(None),
+                }
+            };
+            let mut aux_buf = Vec::with_capacity(cfg.n_layer);
+            for al in &aux.layers {
+                aux_buf.push(LayerAux {
+                    attn_norm: mk(&al.attn_norm)?,
+                    ffn_norm: mk(&al.ffn_norm)?,
+                    q_bias: mk_opt(&al.q_bias)?,
+                    k_bias: mk_opt(&al.k_bias)?,
+                    v_bias: mk_opt(&al.v_bias)?,
+                });
+            }
+            let output_norm_buf = mk(&aux.output_norm)?;
+            let freq_buf = mk(&aux.freq_table)?;
+            let token_embd_buf = mk(aux.token_embd)?;
+
+            let kv_elems = (cfg.n_layer * cfg.ctx * kv_dim) as vk::DeviceSize;
+            let kcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
+            let vcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
+
+            let nf = |n: usize| -> Result<Buf, MatmulError> {
+                Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)
+            };
+
+            ResidentState {
+                cfg,
+                qw,
+                output_w,
+                aux: aux_buf,
+                output_norm_buf,
+                freq_buf,
+                token_embd_buf,
+                kcache,
+                vcache,
+                b_x: nf(config.n_embd)?,
+                b_normed: nf(config.n_embd)?,
+                b_q: nf(config.n_embd)?,
+                b_k: nf(kv_dim)?,
+                b_v: nf(kv_dim)?,
+                b_attn: nf(config.n_embd)?,
+                b_proj: nf(config.n_embd)?,
+                b_gate: nf(config.n_ff)?,
+                b_up: nf(config.n_ff)?,
+                b_act: nf(config.n_ff)?,
+                b_logits: nf(config.vocab)?,
+                len: RefCell::new(0),
+            }
+        };
+
+        me.state = Some(state);
+        Ok(me)
     }
 
     /// Diagnóstico: roda o shader attention GQA sobre q/k_cache/v_cache e devolve o resultado.
@@ -595,9 +800,59 @@ impl<'ctx> ResidentForward<'ctx> {
 impl Drop for ResidentForward<'_> {
     fn drop(&mut self) {
         let d = &self.dev.device;
-        // SAFETY: wait_idle garante GPU ociosa antes de liberar.
+        // SAFETY: GPU ociosa antes de liberar.
         unsafe {
             let _ = d.device_wait_idle();
+        }
+
+        if let Some(st) = self.state.take() {
+            for lq in st.qw {
+                lq.attn_q.destroy(d);
+                lq.attn_k.destroy(d);
+                lq.attn_v.destroy(d);
+                lq.attn_output.destroy(d);
+                lq.ffn_gate.destroy(d);
+                lq.ffn_up.destroy(d);
+                lq.ffn_down.destroy(d);
+            }
+            st.output_w.destroy(d);
+            for la in st.aux {
+                la.attn_norm.destroy(d);
+                la.ffn_norm.destroy(d);
+                if let Some(b) = la.q_bias {
+                    b.destroy(d);
+                }
+                if let Some(b) = la.k_bias {
+                    b.destroy(d);
+                }
+                if let Some(b) = la.v_bias {
+                    b.destroy(d);
+                }
+            }
+            for b in [
+                &st.output_norm_buf,
+                &st.freq_buf,
+                &st.token_embd_buf,
+                &st.kcache,
+                &st.vcache,
+                &st.b_x,
+                &st.b_normed,
+                &st.b_q,
+                &st.b_k,
+                &st.b_v,
+                &st.b_attn,
+                &st.b_proj,
+                &st.b_gate,
+                &st.b_up,
+                &st.b_act,
+                &st.b_logits,
+            ] {
+                b.destroy(d);
+            }
+        }
+
+        // SAFETY: pool/pipelines criados por nós.
+        unsafe {
             d.destroy_descriptor_pool(self.desc_pool, None);
         }
         for p in [
@@ -608,7 +863,7 @@ impl Drop for ResidentForward<'_> {
             &self.swiglu,
             &self.add,
         ] {
-            // SAFETY: handles criados por nós, destruímos em ordem inversa.
+            // SAFETY: handles criados por nós, ordem inversa.
             unsafe {
                 d.destroy_pipeline(p.pipeline, None);
                 d.destroy_pipeline_layout(p.layout, None);
