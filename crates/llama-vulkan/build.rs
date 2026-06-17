@@ -9,7 +9,6 @@ fn main() {
         ("attention.comp", "ATTENTION_SPV"),
         ("swiglu.comp", "SWIGLU_SPV"),
         ("add.comp", "ADD_SPV"),
-        ("dot4_probe.comp", "DOT4_PROBE_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

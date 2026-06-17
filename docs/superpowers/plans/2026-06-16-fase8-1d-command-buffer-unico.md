@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Gravar a stack inteira de um token (embedding → 48/24 camadas → norm final → logits) como **um único command buffer** com pipeline barriers entre dispatches, submetido **uma vez** com **um fence wait por token**. Elimina os ~169 `queue_submit` + `queue_wait_idle` por token que a Fase 1C ainda fazia (1 por op). É a fatia onde o tok/s salta para a vizinhança do llama.cpp single-GPU.
+**Goal:** Gravar a stack inteira de um token (embedding → 48/24 camadas → norm final → logits) como **um único command buffer** com pipeline barriers entre dispatches, submetido **uma vez** com **um fence wait por token**. Elimina os ~169 `queue_submit` + `queue_wait_idle` por token que a Fase 1C ainda fazia (1 por op). Fecha o forward residente correto em 1 GPU que serve de esqueleto para o tensor-parallel da Fase 2.
 
 **Architecture:** Estende o `ResidentForward` (Fase 1C). Na 1C, `decode_step` faz, por op: `update_descriptor_sets` + `queue_submit` + `queue_wait_idle`, e reseta o descriptor pool por token. Esta fatia: (1) **pré-aloca e pré-escreve** um descriptor set por dispatch (os bindings são estáticos entre tokens — pesos por camada e buffers de ativação não mudam; o KV-cache é ligado pelo buffer inteiro, com o offset da camada/pos indo no push ou no `cmd_copy_buffer`); (2) constrói **uma vez** um "plano" de ops (lista de dados, sem closures) que descreve a sequência exata do token; (3) por token, **regrava** um command buffer persistente percorrendo o plano (push-constants e offsets de cópia dependem de `token`/`pos`, por isso a regravação), inserindo um pipeline barrier entre ops; (4) **um** `queue_submit` com fence + **um** `wait_for_fences`; readback só dos logits. A regravação por token é barata; o ganho é trocar 169 sincronizações GPU↔host por uma.
 
@@ -579,7 +579,7 @@ git commit -m "test(vulkan): decode 1D == CPU (1 token e geração de 8 tokens)"
 A flag `--gpu-resident` agora usa o caminho de command buffer único. Não há mudança no script (a linha "1x MI50 (resident-fwd)" foi adicionada na Fase 1C).
 
 Run: `./scripts/benchmark-gpu.sh 2>&1 | tail -30`
-Expected: "1x MI50 (resident-fwd)" reporta tok/s **muito maior** que na 1C (que ainda fazia ~169 `wait_idle`/token). **Meta da Fase 1** (spec §7): chegar à vizinhança dos **314 tok/s** do llama.cpp single-GPU no 0.5B. O número exato decide se a tese (row-split nas 2 GPUs no 14B vence) está madura para a Fase 2, ou se ainda falta otimização de kernel (Fase 3).
+Expected: "1x MI50 (resident-fwd)" reporta tok/s **muito maior** que na 1C (que ainda fazia ~169 `wait_idle`/token). A medição é diagnóstica — **não há meta de velocidade single-GPU**. O critério de aceite da Fase 1 é correção (bit-exact vs CPU). A paralelização entre GPUs (Fase 2) é o que persegue o desempenho.
 
 - [ ] **Step 2: Comparar a progressão 1A→1B→1C→1D**
 
@@ -609,9 +609,8 @@ git commit -m "bench(gpu): 1x MI50 resident-fwd em 1 cmd/token (Fase 1D) — pro
 
 ## Conclusão da Fase 1
 
-Com 1A→1B→1C→1D, o decode single-GPU passa de **2.16 tok/s** (protótipo da Fase 7) para o regime residente + 1 command buffer/token. Conforme o número final do benchmark (Task 5):
+Com 1A→1B→1C→1D, o decode single-GPU passa de **2.16 tok/s** (protótipo da Fase 7) para o regime residente + 1 command buffer/token, **correto** (bit-exact vs CPU). Esse é o objetivo da Fase 1: um forward residente correto em 1 GPU que serve de **esqueleto** para a paralelização.
 
-- **Se ≈/≥ 314 tok/s (llama.cpp 1× MI50):** a tese está validada no campo de prova; seguir para a **Fase 2** (tensor-parallel row-split nas 2 MI50 no 14B) — depende do mecanismo de all-reduce medido na **Fase 0**.
-- **Se ainda abaixo:** o gargalo é kernel/arquitetura (não comunicação) → **Fase 3** (matvec wave64 com subgroup reduction otimizada, coalescência, barreiras finas, overlap) antes de escalar para 2 GPUs.
+Velocidade single-GPU não é meta do projeto. O próximo passo é a **Fase 2** (tensor-parallel row-split nas 2 MI50 no 14B), que reusa este forward residente distribuindo os matmuls entre as GPUs — depende do mecanismo de all-reduce medido na **Fase 0**. A otimização de kernel (matvec wave64 com subgroup reduction, coalescência, barreiras finas, overlap) é a **Fase 3**, depois do row-split.
 
-Ambas as próximas fases têm planos próprios (a serem escritos quando seus pré-requisitos — número da Fase 1, spike de banda P2P da Fase 0 — existirem; ver spec §7).
+As próximas fases têm planos próprios (a serem escritos quando seus pré-requisitos — spike de banda P2P da Fase 0 — existirem; ver spec §7).

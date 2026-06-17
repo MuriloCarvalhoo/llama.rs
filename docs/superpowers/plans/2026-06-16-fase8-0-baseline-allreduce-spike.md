@@ -12,7 +12,7 @@
 
 ## Contexto herdado (leia antes de começar)
 
-- A Fase 1 (single-GPU resident decode) ficou em **~80 tok/s** no Qwen2.5-0.5B (`bench-results/gpu-20260616-131520.md`), contra **301 tok/s** do llama.cpp 1× MI50. Por isso a **Fase 3 (kernel)** vem antes da Fase 2 (row-split). **Esta Fase 0 não desbloqueia a Fase 2 sozinha** — ela só levanta os números e de-risca o all-reduce, para que a Fase 2 (depois da Fase 3) já comece com o mecanismo decidido.
+- A Fase 1 (single-GPU resident decode) está validada como **correta** (bit-exact vs CPU no Qwen2.5-0.5B). Velocidade single-GPU **não é objetivo** — o ganho vem de paralelizar os tensores entre as GPUs. Esta Fase 0 levanta os números-alvo do 14B e de-risca o all-reduce, deixando a Fase 2 (row-split) pronta para começar com o mecanismo já decidido.
 - O risco nº 1 da spec (§6) é a **latência** de all-reduce sem NVLink: 2 all-reduces × 48 camadas = **96 sincronizações/token** no 14B. Se cada round-trip custar, digamos, 50 µs, são ~4.8 ms/token só de all-reduce → teto de ~200 tok/s **antes** de qualquer compute. É isso que o spike mede.
 - Já existem duas `VulkanDevice` independentes sendo criadas em `crates/llama-vulkan/src/dual_gpu.rs` (`DualGpuMatmul::new`) — o spike reusa esse padrão (`VulkanDevice::create(ctx, &phys[i])`).
 - `llama-bench` aceita `-sm <none|layer|row|tensor>` e `-ts <a/b>` (confirmado via `--help`).
@@ -416,8 +416,10 @@ Criar `bench-results/fase8-0-allreduce-decisao.md` preenchendo com os números m
       - Se ACIMA: host-staged simples basta; otimizar depois se preciso.
 
 ## Pré-condição lembrada
-A Fase 2 só deve começar após a **Fase 3** trazer o single-GPU para perto do
-llama.cpp 1× MI50 (~301 tok/s no 0.5B). Hoje está em ~80 tok/s.
+A Fase 2 (row-split) precisa apenas do decode single-GPU **correto** (bit-exact
+vs CPU, já validado na Fase 1) e do mecanismo de all-reduce decidido nesta Fase 0.
+Velocidade single-GPU não é pré-condição. Otimização de kernel fica para a Fase 3,
+depois do row-split.
 ```
 
 - [ ] **Step 2: Commit**
@@ -435,5 +437,5 @@ git commit -m "docs(fase8-0): decisão de all-reduce + baseline 14B registrados"
 - **Risco nº 1 (latência all-reduce):** Tasks 4–5 (host-bounce, device-local, probe P2P) + Task 6 (decisão). ✓
 - **Risco nº 3 (VRAM 14B):** Task 3 Step 2. ✓
 - **§7 Fase 0 ("baseline & spikes, sem código de produção"):** nenhuma alteração no caminho de decode; só script de bench, get-model e testes `--ignored`. ✓
-- **Gate herdado (Fase 1 < 314):** registrado no contexto e na Task 6 — a Fase 0 **não** libera a Fase 2; a Fase 3 vem antes.
+- **Sequência:** Fase 0 (baseline + all-reduce) → Fase 2 (row-split tensor-parallel) → Fase 3 (otimização de kernel, com folga). A velocidade single-GPU não é gate de nada.
 ```

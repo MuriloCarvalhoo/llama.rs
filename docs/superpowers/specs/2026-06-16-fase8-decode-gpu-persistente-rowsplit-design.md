@@ -105,7 +105,7 @@ O KV-cache é particionado por head junto com o split de q/k/v — cada GPU guar
 ## 6. Riscos
 
 1. **All-reduce MI50↔MI50 (risco nº 1).** Sem NVLink. Caminhos possíveis: PCIe peer-to-peer (se RADV expuser `VK_EXT_external_memory` utilizável entre devices) ou via host bounce. O volume é pequeno, mas a **latência** a 100+ tok/s pode dominar (2 all-reduces × 48 camadas = 96 sincronizações/token). **Mitigação:** spike de medição na Fase 0; se peer-to-peer não existir, avaliar host-staged com double-buffering e sobreposição compute/transfer na Fase 3.
-2. **Paridade single-GPU primeiro.** Row-split só vale se o decode single-GPU já for eficiente. Se a Fase 1 não chegar perto dos 314 tok/s no 0.5B, o problema é de kernel/arquitetura, não de multi-GPU — resolver antes de seguir.
+2. **Correção single-GPU primeiro.** Row-split exige que o decode single-GPU seja numericamente correto (bit-exact vs CPU) e funcional no 0.5B — esse é o pré-requisito da Fase 2, **não** uma meta de velocidade. A velocidade single-GPU não é objetivo do projeto; o ganho vem de paralelizar os tensores entre as GPUs (Fase 2) e otimizar o kernel com folga depois (Fase 3).
 3. **VRAM apertada no 14B.** ~15.6 GB de pesos / 2 = ~7.8 GB por GPU + KV + ativações + overhead do driver. Folgado em 16 GB, mas medir. (No 32B Q8_0 estouraria → motivo da Fase 4 com Q4.)
 4. **AMDVLK/RADV quirks** (limite de 2 GB por alocação já contornado pelo sub-alocador; revalidar com tensores grandes do 14B).
 
@@ -118,13 +118,13 @@ O KV-cache é particionado por head junto com o split de q/k/v — cada GPU guar
 - Medir llama.cpp 2× MI50 em **layer-split e row-split** (`-sm layer` / `-sm row`) → registrar o **melhor número** (o alvo honesto). Confirmar OOM em 1 GPU.
 - Spike: bandwidth/latência de transferência MI50↔MI50 (peer-to-peer vs host). **Saída:** decisão do mecanismo de all-reduce.
 
-### Fase 1 — Decode GPU-residente persistente, 1 GPU ⬅️ **começa agora (0.5B local)**
+### Fase 1 — Decode GPU-residente persistente, 1 GPU ✅ **concluída (correção bit-exact no 0.5B)**
 - Conectar `GpuWeights` (upload único) ao decode; pipelines/descriptors persistentes.
 - KV-cache + ativações residentes em VRAM.
 - Shaders RMSNorm / RoPE / attention-GQA / SwiGLU; 1 command buffer/token; sem readback exceto logits.
-- **Aceite:** bit-exact vs CPU no 0.5B (mesma sequência greedy); **meta 2 → ≥200 tok/s** single-GPU (na vizinhança dos 314 do llama.cpp).
+- **Aceite:** bit-exact vs CPU no 0.5B (mesma sequência greedy). É só prova de correção do forward residente em 1 GPU — **não há meta de velocidade single-GPU**. O esqueleto validado aqui é reutilizado na Fase 2, distribuindo os matmuls entre as GPUs.
 
-### Fase 2 — Tensor-parallel row-split, 2 GPUs, 14B Q8_0
+### Fase 2 — Tensor-parallel row-split, 2 GPUs, 14B Q8_0 ⬅️ **próximo passo (objetivo central: todas as GPUs a 100%)**
 - Layout Megatron (§5) + all-reduce (mecanismo da Fase 0).
 - **Aceite:** saída correta no 14B; **decode tok/s (2× MI50) > melhor número do llama.cpp (2× MI50)**.
 

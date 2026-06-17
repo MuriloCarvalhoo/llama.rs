@@ -40,8 +40,7 @@ void main() {
     // --- Quantizacao cooperativa de x em int8 simetrico, uma vez por workgroup ---
     // Cada lane processa blocos lane-strided. Para o bloco blk: amax sobre 32
     // elementos, d_x = amax/127, e empacota 4 quantizados por int (little-endian
-    // de bytes: o byte j vai para o lane 8*j -> bit pattern i8 em complemento de 2,
-    // mesma semantica validada no dot4_probe).
+    // de bytes: o byte j vai para o lane 8*j -> bit pattern i8 em complemento de 2).
     for (uint blk = lane; blk < n_blocks; blk += WG) {
         uint base = blk * 32u;
         float amax = 0.0;

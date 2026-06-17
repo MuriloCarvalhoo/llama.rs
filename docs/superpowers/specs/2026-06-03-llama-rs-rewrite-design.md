@@ -3,6 +3,16 @@
 **Data:** 2026-06-03
 **Status:** Aprovado para planejamento de implementação (Fase 0)
 
+> **Reorientação (2026-06): foco em multi-GPU tensor-parallel.** O objetivo do projeto
+> passou a ser **rodar modelos pesados com os tensores paralelizados entre todas as GPUs
+> (todas a ~100% de utilização)**. Em consequência:
+> - **Velocidade single-GPU não é mais meta.** O backend single-GPU residente serve apenas
+>   como esqueleto correto (bit-exact vs CPU) reutilizado pelo forward multi-GPU.
+> - **CPU é somente referência de teste** (oráculo de correção), **não** alvo de
+>   performance. Metas de throughput de CPU abaixo (ex.: Fase 5) estão **superadas**.
+> - O roadmap ativo é a spec **`2026-06-16-fase8-decode-gpu-persistente-rowsplit-design.md`**
+>   (Fase 0 baseline+all-reduce → Fase 1 ✅ → **Fase 2 row-split tensor-parallel** → Fase 3 kernel).
+
 ## Objetivo
 
 Reescrever o llama.cpp em Rust com paridade funcional de features, **restrita ao hardware desta máquina**. Execução por fatias verticais com validação diferencial contínua contra o llama.cpp C++ original (oráculo).
