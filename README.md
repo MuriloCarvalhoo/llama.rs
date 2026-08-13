@@ -1,14 +1,16 @@
 # llama-rs
 
-Reescrita do zero em Rust do runtime de inferência LLM, com foco no backend **Vulkan** para GPUs AMD MI50 e NVIDIA Tesla K80.
+Reescrita do zero em Rust do runtime de inferência LLM, com foco no backend **Vulkan** para 2× GPUs AMD MI50 em tensor-parallel.
 
 O projeto resolve limitações arquiteturais conhecidas do llama.cpp nessas GPUs: dequantização elemento-a-elemento ineficiente no Vulkan, incompatibilidade com wave64 (AMD), ausência de row-split em multi-GPU e overhead de CPU redundante por token gerado.
+
+> **Estado do backend Vulkan:** em desenvolvimento ativo — correção validada em 1 GPU, row-split real entre as 2 GPUs ainda não implementado. Ver [`PROGRESS.md`](PROGRESS.md) para o estado detalhado e os próximos passos.
 
 ---
 
 ## Motivação
 
-O llama.cpp tem quatro problemas confirmados que afetam diretamente MI50 e K80:
+O llama.cpp tem quatro problemas confirmados que afetam diretamente a MI50:
 
 | Problema | Impacto no hardware alvo |
 |---|---|
@@ -31,7 +33,15 @@ A pipeline **CPU** está funcional e bit-exact contra o llama.cpp:
 - [x] Quantização Q8_0 — matmul direto no espaço inteiro (sem expansão f32)
 - [x] Sampling: temperatura, top-p, greedy
 - [x] CLI de geração com timings
-- [ ] Backend Vulkan (em desenvolvimento)
+
+O backend **Vulkan** (1× MI50) está correto, mas não competitivo em velocidade; o multi-GPU real ainda não existe:
+
+- [x] Decode residente em 1 GPU, bit-exact vs CPU (`--gpu-resident`)
+- [x] 1 command buffer/token, pipelines e descriptors persistentes
+- [ ] Kernel matvec competitivo (~91 tok/s vs ~314 do llama.cpp na mesma MI50 — gate não atingido)
+- [ ] Tensor-parallel row-split real entre as 2 MI50 (`--gpu` hoje usa um row-split ingênuo e não-residente, ~145× mais lento que o llama.cpp 2×MI50)
+
+Detalhes, benchmarks e próximos passos em [`PROGRESS.md`](PROGRESS.md).
 
 ---
 
@@ -39,10 +49,11 @@ A pipeline **CPU** está funcional e bit-exact contra o llama.cpp:
 
 | GPU | Arquitetura | VRAM | API |
 |---|---|---|---|
-| NVIDIA Tesla K80 | Kepler (sm_37) | 24 GB GDDR5 (2× 12 GB) | Vulkan 1.1 |
 | AMD MI50 (× 2) | GCN 5.1 / gfx906 | 16 GB HBM2 cada | Vulkan 1.2 |
 
-As três GPUs são **memory-bandwidth bound** em token generation (batch-1). O teto de performance é determinado pela largura de banda, não pelos FLOPS — isso torna a dequantização eficiente e o row-split multi-GPU críticos.
+As duas GPUs são **memory-bandwidth bound** em token generation (batch-1). O teto de performance é determinado pela largura de banda, não pelos FLOPS — isso torna a dequantização eficiente e o row-split multi-GPU críticos.
+
+> **NVIDIA Tesla K80 — fora de escopo (decisão deliberada).** O backend enumera só devices AMD (`crates/llama-vulkan/src/device.rs`). A K80 (Kepler, wave32) é incompatível com os shaders wave64 escritos para o gfx906 e é mais lenta que uma única MI50; suportá-la exigiria uma segunda família de kernels sem ganho líquido. Ela também não poderia participar de tensor-parallel simétrico com as MI50 (sem P2P entre vendors diferentes) — no máximo serviria como worker isolado de layer-split, fora do design atual.
 
 ---
 
@@ -100,12 +111,15 @@ O gap no Qwen2 é esperado: llama.cpp usa kernels AVX2 vetorizados para Q8\_0×Q
 
 ## Roadmap Vulkan
 
-1. **Sub-alocador de memória (VMA)** — evitar falhas de alocação em drivers conservadores (AMDVLK com limite de 2 GB por alocação)
-2. **Dequantização packed-int** — mantém valores inteiros até após o dot product (elimina overhead por elemento)
-3. **Shaders wave64** — subgroup ops corretas para gfx906 (MI50), corrigindo o bug de WARP\_SIZE=32 upstream
-4. **Contextos de grafo persistentes** — grafo SPIR-V construído uma vez, re-executado por token sem reconstrução
-5. **Row-split multi-GPU** — dividir o matmul por linhas entre as duas MI50 em vez de só por camada
-6. **Suporte K80** — validar shaders no sm\_37 via Vulkan 1.1 sem extensões modernas
+1. [x] **Sub-alocador de memória (VMA)** — evitar falhas de alocação em drivers conservadores (AMDVLK com limite de 2 GB por alocação)
+2. [x] **Dequantização packed-int** — ativação int8 + `dotPacked4x8` (gate validado em RADV/gfx906; ganho medido ~0%, kernel não é ALU-bound)
+3. [x] **Shaders wave64** — subgroup ops corretas para gfx906 (MI50), corrigindo o bug de WARP\_SIZE=32 upstream
+4. [x] **Contextos de grafo persistentes** — 1 command buffer/token, pipelines e descriptors persistentes (Fase 8.1)
+5. [ ] **Kernel matvec competitivo** — gate de ~314 tok/s (1× MI50) não atingido (~91 tok/s); gargalo é ocupação/paralelização estrutural do matvec, não ALU nem banda. Requer profiling (`rocprof`) e redesenho do particionamento antes de mais ajustes incrementais
+6. [ ] **Row-split multi-GPU real (tensor-parallel)** — layout Megatron (column/row-parallel + all-reduce) entre as duas MI50. O `--gpu` atual é um row-split ingênuo e não-residente, não a arquitetura final
+7. **NVIDIA Tesla K80 — fora de escopo**, ver seção "Hardware alvo"
+
+Estado detalhado, benchmarks e ordem recomendada dos próximos passos: [`PROGRESS.md`](PROGRESS.md).
 
 ---
 
@@ -122,7 +136,7 @@ O gap no Qwen2 é esperado: llama.cpp usa kernels AVX2 vetorizados para Q8\_0×Q
 
 - Rust 1.87+ (ver `rust-toolchain.toml`)
 - Modelos no formato GGUF v3 (compatível com llama.cpp)
-- Para Vulkan (futuro): driver com suporte a Vulkan 1.1+, `VK_KHR_storage_buffer_storage_class`
+- Para Vulkan (GPU, opcional): 2× GPU AMD (RADV/AMDVLK) com suporte a Vulkan 1.2+ e subgroup ops wave64 (gfx906 validado)
 
 ---
 
