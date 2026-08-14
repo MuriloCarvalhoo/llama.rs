@@ -1,7 +1,12 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
-// 1 workgroup = 1 subgroup (wave64) processa a linha inteira.
-layout(local_size_x = 64) in;
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// A reducao e sobre o vetor inteiro, entao cabe num unico workgroup — mas com 64 lanes
+// cada uma percorria dim/64 elementos em serie (80 iteracoes no n_embd=5120 do 14B),
+// deixando 59 dos 60 CUs ociosos: media de 74 us por rmsnorm, 22% do tempo de GPU do
+// token. Com 256 lanes a soma parcial e feita por subgrupo e combinada via LDS.
+layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } xb;
 layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; } wb;
@@ -9,16 +14,33 @@ layout(set = 0, binding = 2) writeonly buffer OBuf { float o[]; } ob;
 
 layout(push_constant) uniform PC { uint dim; float eps; } pc;
 
+const uint WG = 256u;
+// Um slot por subgrupo. 8 cobre wave64 (4 subgrupos) e wave32 (8 subgrupos).
+shared float partial[8];
+
 void main() {
-    uint lane = gl_LocalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+
     float ss = 0.0;
-    for (uint i = lane; i < pc.dim; i += 64u) {
+    for (uint i = tid; i < pc.dim; i += WG) {
         float v = xb.x[i];
         ss += v * v;
     }
-    ss = subgroupAdd(ss);                       // soma total em TODAS as lanes
-    float scale = inversesqrt(ss / float(pc.dim) + pc.eps);
-    for (uint i = lane; i < pc.dim; i += 64u) {
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) {
+        partial[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    // Cada lane refaz a soma dos subgrupos (poucos termos) para ter `scale` uniforme
+    // sem uma segunda barreira.
+    float total = 0.0;
+    for (uint k = 0u; k < gl_NumSubgroups; k++) {
+        total += partial[k];
+    }
+    float scale = inversesqrt(total / float(pc.dim) + pc.eps);
+
+    for (uint i = tid; i < pc.dim; i += WG) {
         ob.o[i] = xb.x[i] * scale * wb.w[i];
     }
 }

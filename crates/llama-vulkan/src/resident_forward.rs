@@ -186,6 +186,10 @@ pub(crate) struct ResidentState {
     /// produzidas uma vez por matvec pelo dispatch `QuantizeX`.
     pub b_xq: Buf,
     pub b_xd: Buf,
+    /// Staging host-visible dos logits, alocado uma vez. A copia entra no proprio
+    /// command buffer do token: alocar 608 KB (`vkAllocateMemory`) e submeter um
+    /// segundo command buffer a cada token custava mais que o readback em si.
+    pub logits_host: Buf,
     pub len: RefCell<usize>,
     pub plan: Vec<PlannedOp>,
     pub token_cmd: vk::CommandBuffer,
@@ -198,6 +202,8 @@ pub(crate) struct ResidentState {
 /// Ativado por `LLAMA_RS_PROFILE=1`; fora disso nada é gravado no command buffer.
 pub(crate) struct Prof {
     pub pool: vk::QueryPool,
+    /// Nanossegundos de host por fase: gravacao do command buffer, submit+fence, leitura.
+    pub host: RefCell<[u64; 3]>,
     /// Nanossegundos por tick do timestamp (VkPhysicalDeviceLimits::timestampPeriod).
     pub period_ns: f32,
     /// Nanossegundos acumulados por índice de op do plano.
@@ -591,6 +597,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_logits: nf(config.vocab)?,
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
+                logits_host: Buf::host(ctx, phys, d, (config.vocab * 4) as vk::DeviceSize)?,
                 len: RefCell::new(0),
                 plan: Vec::new(),
                 token_cmd,
@@ -619,6 +626,7 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             Some(Prof {
                 pool,
+                host: RefCell::new([0; 3]),
                 period_ns: props.limits.timestamp_period,
                 accum: RefCell::new(Vec::new()),
                 tokens: std::cell::Cell::new(0),
@@ -1071,7 +1079,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
             }
             if let Some(pf) = &st.prof {
-                // SAFETY: cmd em gravação; slot op_idx+1 < 1024.
+                // SAFETY: cmd em gravação; o pool foi dimensionado com plan.len()+1 slots.
                 unsafe {
                     d.cmd_write_timestamp(
                         cmd,
@@ -1081,6 +1089,18 @@ impl<'ctx> ResidentForward<'ctx> {
                     );
                 }
             }
+        }
+
+        // Logits para o staging host-visible no mesmo command buffer (o full_barrier da
+        // ultima op ja ordena a escrita de b_logits antes desta copia).
+        let region = vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: (c.vocab * 4) as vk::DeviceSize,
+        };
+        // SAFETY: cmd em gravação; ambos os buffers vivem no state.
+        unsafe {
+            d.cmd_copy_buffer(cmd, st.b_logits.buffer, st.logits_host.buffer, &[region]);
         }
     }
 
@@ -1528,7 +1548,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 n
             );
         }
-        eprintln!("{:<12} {:>10.3} {:>7.1}%", "TOTAL", ms(total), 100.0);
+        eprintln!("{:<12} {:>10.3} {:>7.1}%", "TOTAL GPU", ms(total), 100.0);
+        let h = pf.host.borrow();
+        eprintln!("\n--- host (ms/token) ---");
+        eprintln!("{:<12} {:>10.3}", "gravacao", ms(h[0]));
+        eprintln!("{:<12} {:>10.3}", "submit+fence", ms(h[1]));
+        eprintln!("{:<12} {:>10.3}", "leitura", ms(h[2]));
     }
 
     /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
@@ -1550,11 +1575,14 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             d.begin_command_buffer(cmd, &begin)?;
         }
+        let t0 = std::time::Instant::now();
         self.record_token(cmd, token, pos);
         // SAFETY: cmd em gravação.
         unsafe {
             d.end_command_buffer(cmd)?;
         }
+        let t_rec = t0.elapsed();
+        let t1 = std::time::Instant::now();
 
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
@@ -1567,8 +1595,28 @@ impl<'ctx> ResidentForward<'ctx> {
             d.queue_submit(dev.queue, &[submit], st.token_fence)?;
             d.wait_for_fences(&[st.token_fence], true, u64::MAX)?;
         }
+        let t_sub = t1.elapsed();
+        let t2 = std::time::Instant::now();
         self.collect_prof(st)?;
-        self.readback(&st.b_logits, st.cfg.vocab)
+
+        let len = st.cfg.vocab;
+        let bytes = (len * 4) as vk::DeviceSize;
+        // SAFETY: logits_host é host-coherent com `bytes` e a copia ja terminou (fence
+        // aguardado acima); ptr válido até unmap.
+        let out = unsafe {
+            let ptr = d.map_memory(st.logits_host.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
+            let mut v = vec![0f32; len];
+            std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), len);
+            d.unmap_memory(st.logits_host.mem);
+            v
+        };
+        if let Some(pf) = &st.prof {
+            let mut h = pf.host.borrow_mut();
+            h[0] += t_rec.as_nanos() as u64;
+            h[1] += t_sub.as_nanos() as u64;
+            h[2] += t2.elapsed().as_nanos() as u64;
+        }
+        Ok(out)
     }
 }
 
@@ -1644,6 +1692,7 @@ impl Drop for ResidentForward<'_> {
                 &st.b_logits,
                 &st.b_xq,
                 &st.b_xd,
+                &st.logits_host,
             ] {
                 b.destroy(d);
             }
