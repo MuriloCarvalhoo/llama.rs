@@ -277,3 +277,32 @@ pub(crate) fn one_shot_copy(
     wait_res?;
     Ok(())
 }
+
+/// Quantiza `x` em int8 simetrico por bloco de 32, no mesmo layout que
+/// `shaders/quantize_x.comp` produz: 8 u32 por bloco (4 i8 empacotados em cada,
+/// byte j = elemento j) + a escala do bloco.
+///
+/// Usado pelos caminhos que ainda montam o dispatch do matvec no host; o decode
+/// residente faz isso na propria GPU, uma vez por matvec.
+pub(crate) fn quantize_x_host(x: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    let n_blocks = x.len() / 32;
+    let mut xq = vec![0u32; n_blocks * 8];
+    let mut xd = vec![0f32; n_blocks];
+    for b in 0..n_blocks {
+        let blk = &x[b * 32..b * 32 + 32];
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d_x = amax / 127.0;
+        let inv = if d_x > 0.0 { 1.0 / d_x } else { 0.0 };
+        xd[b] = d_x;
+        for g in 0..8 {
+            let mut packed = 0u32;
+            for j in 0..4 {
+                #[allow(clippy::cast_possible_truncation)]
+                let q = (blk[g * 4 + j] * inv).round().clamp(-127.0, 127.0) as i32;
+                packed |= ((q as u32) & 0xff) << (8 * j);
+            }
+            xq[b * 8 + g] = packed;
+        }
+    }
+    (xq, xd)
+}

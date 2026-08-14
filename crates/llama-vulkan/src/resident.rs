@@ -251,16 +251,29 @@ impl<'ctx> ResidentGpu<'ctx> {
         let mut buffers = self.buffers.borrow_mut();
         buffers.ensure(self.ctx, self.phys(), d, x_size, y_size)?;
 
-        // 2. Carregar X no staging host-visible e copiar para o device-local residente.
+        // 2. Quantizar X no host e carregar (xq | xd) no buffer residente.
+        // O shader consome a ativacao ja em int8: xq sao 8 u32 por bloco de 32 e xd a
+        // escala do bloco — 36 B/bloco contra os 128 B/bloco do x em f32, entao os dois
+        // cabem no mesmo buffer, xd logo apos xq.
+        let (xq, xd) = crate::tensor::quantize_x_host(x_f32);
+        let xq_size = std::mem::size_of_val(&xq[..]) as vk::DeviceSize;
+        let xd_size = std::mem::size_of_val(&xd[..]) as vk::DeviceSize;
         unsafe {
-            // SAFETY: x_staging_mem host-visible com x_cap >= x_size; ptr válido até unmap.
+            // SAFETY: x_staging_mem host-visible com x_cap >= x_size >= xq_size+xd_size;
+            // ptr válido até unmap; as duas escritas nao se sobrepoem.
             let ptr = d.map_memory(
                 buffers.x_staging_mem,
                 0,
                 x_size,
                 vk::MemoryMapFlags::empty(),
             )?;
-            std::ptr::copy_nonoverlapping(x_f32.as_ptr(), ptr as *mut f32, x_f32.len());
+            let base = ptr.cast::<u8>();
+            std::ptr::copy_nonoverlapping(xq.as_ptr().cast::<u8>(), base, xq_size as usize);
+            std::ptr::copy_nonoverlapping(
+                xd.as_ptr().cast::<u8>(),
+                base.add(xq_size as usize),
+                xd_size as usize,
+            );
             d.unmap_memory(buffers.x_staging_mem);
         }
         one_shot_copy(
@@ -286,7 +299,12 @@ impl<'ctx> ResidentGpu<'ctx> {
             vk::DescriptorBufferInfo {
                 buffer: buffers.x_dev,
                 offset: 0,
-                range: x_size,
+                range: xq_size,
+            },
+            vk::DescriptorBufferInfo {
+                buffer: buffers.x_dev,
+                offset: xq_size,
+                range: xd_size,
             },
             vk::DescriptorBufferInfo {
                 buffer: buffers.y_dev,

@@ -71,30 +71,46 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
     // 1. Upload W (n_out_local linhas de pesos) via GpuTensor::upload_q8_0
     let w_tensor = GpuTensor::upload_q8_0(ctx, phys, dev, w_bytes, n_in, n_out_local)?;
 
-    // 2. Upload X (activations f32) via staging → STORAGE_BUFFER
-    let x_size = std::mem::size_of_val(x_f32) as vk::DeviceSize;
+    // 2. Quantizar X no host e subir (xq, xd) — o shader consome a ativacao ja em int8.
+    let (xq, xd) = crate::tensor::quantize_x_host(x_f32);
 
-    let x_staging = create_buf(d, x_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
-    let x_staging_mem = alloc_and_bind(ctx, phys, d, x_staging, true)?;
-    unsafe {
-        // SAFETY: x_staging_mem é host-visible com tamanho x_size; ptr é válido até unmap.
-        let ptr = d.map_memory(x_staging_mem, 0, x_size, vk::MemoryMapFlags::empty())?;
-        std::ptr::copy_nonoverlapping(x_f32.as_ptr(), ptr as *mut f32, x_f32.len());
-        d.unmap_memory(x_staging_mem);
-    }
+    // Sobe um Vec<T> para um STORAGE_BUFFER device-local via staging descartavel.
+    let upload = |bytes_of: &[u8]| -> Result<(vk::Buffer, vk::DeviceMemory), MatmulError> {
+        let size = bytes_of.len() as vk::DeviceSize;
+        let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
+        unsafe {
+            // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
+            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(bytes_of.as_ptr(), ptr.cast::<u8>(), bytes_of.len());
+            d.unmap_memory(staging_mem);
+        }
+        let buf = create_buf(
+            d,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let mem = alloc_and_bind(ctx, phys, d, buf, false)?;
+        one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buf, size)?;
+        unsafe {
+            // SAFETY: staging já copiado; ambos criados por nós.
+            d.destroy_buffer(staging, None);
+            d.free_memory(staging_mem, None);
+        }
+        Ok((buf, mem))
+    };
 
-    let x_buf = create_buf(
-        d,
-        x_size,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let x_mem = alloc_and_bind(ctx, phys, d, x_buf, false)?;
-    one_shot_copy(d, dev.queue, dev.cmd_pool, x_staging, x_buf, x_size)?;
-    unsafe {
-        // SAFETY: staging já foi copiado; staging_buf e staging_mem foram criados por nós.
-        d.destroy_buffer(x_staging, None);
-        d.free_memory(x_staging_mem, None);
-    }
+    // SAFETY: Vec<u32>/Vec<f32> são POD contíguos; reinterpretar como bytes é válido.
+    let xq_bytes = unsafe {
+        std::slice::from_raw_parts(xq.as_ptr().cast::<u8>(), std::mem::size_of_val(&xq[..]))
+    };
+    let xd_bytes = unsafe {
+        std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), std::mem::size_of_val(&xd[..]))
+    };
+    let (xq_buf, xq_mem) = upload(xq_bytes)?;
+    let (xd_buf, xd_mem) = upload(xd_bytes)?;
+    let xq_size = xq_bytes.len() as vk::DeviceSize;
+    let xd_size = xd_bytes.len() as vk::DeviceSize;
 
     // 3. Criar buffer Y (output) — TRANSFER_SRC para readback posterior
     let y_size = (n_out_local * std::mem::size_of::<f32>()) as vk::DeviceSize;
@@ -131,7 +147,7 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
     let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info)? };
     let desc_set = desc_sets[0];
 
-    // Escrever descriptors: binding 0=weights, 1=activations, 2=output
+    // Escrever descriptors: 0=weights, 1=x quantizado, 2=escalas de x, 3=output
     let buf_infos = [
         vk::DescriptorBufferInfo {
             buffer: w_tensor.buffer,
@@ -139,9 +155,14 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
             range: w_tensor.size_bytes,
         },
         vk::DescriptorBufferInfo {
-            buffer: x_buf,
+            buffer: xq_buf,
             offset: 0,
-            range: x_size,
+            range: xq_size,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: xd_buf,
+            offset: 0,
+            range: xd_size,
         },
         vk::DescriptorBufferInfo {
             buffer: y_buf,
@@ -257,8 +278,10 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         d.destroy_descriptor_pool(desc_pool, None);
         d.destroy_buffer(y_buf, None);
         d.free_memory(y_mem, None);
-        d.destroy_buffer(x_buf, None);
-        d.free_memory(x_mem, None);
+        d.destroy_buffer(xq_buf, None);
+        d.free_memory(xq_mem, None);
+        d.destroy_buffer(xd_buf, None);
+        d.free_memory(xd_mem, None);
     }
     w_tensor.destroy(d);
 

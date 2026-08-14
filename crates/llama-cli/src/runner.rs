@@ -225,6 +225,8 @@ pub fn run_generate(
                         n_tokens += 1;
                     },
                 )?;
+                // No-op sem LLAMA_RS_PROFILE=1.
+                backend.print_profile();
                 true
             }
             Ok(_) => {

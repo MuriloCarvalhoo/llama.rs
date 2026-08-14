@@ -34,6 +34,50 @@ impl VulkanPhysicalDevice {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Bytes livres nos heaps DEVICE_LOCAL, via `VK_EXT_memory_budget`.
+    /// Retorna `None` se a extensão não estiver disponível.
+    ///
+    /// Importa porque a GPU que roda o display já tem ~1.6 GB ocupados: num modelo que
+    /// quase enche a VRAM, o driver realoca o excedente em GTT (memória do host, via
+    /// PCIe) e a banda efetiva do matvec despenca — medimos 95 GB/s contra 714 GB/s
+    /// para o mesmo modelo na GPU sem display.
+    pub fn free_device_memory(&self, ctx: &VulkanContext) -> Option<u64> {
+        let exts = unsafe {
+            ctx.instance
+                .enumerate_device_extension_properties(self.handle)
+        }
+        .ok()?;
+        let has_budget = exts.iter().any(|e| {
+            // SAFETY: extension_name é nul-terminado pela spec Vulkan.
+            let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+            n.to_bytes() == b"VK_EXT_memory_budget"
+        });
+        if !has_budget {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceMemoryProperties2 {
+            p_next: std::ptr::from_mut(&mut budget).cast(),
+            ..Default::default()
+        };
+        // SAFETY: handle válido; p_next aponta para `budget`, vivo durante a chamada.
+        unsafe {
+            ctx.instance
+                .get_physical_device_memory_properties2(self.handle, &mut props2)
+        };
+        let mem = props2.memory_properties;
+        let mut free = 0u64;
+        for i in 0..mem.memory_heap_count as usize {
+            if mem.memory_heaps[i]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            {
+                free += budget.heap_budget[i].saturating_sub(budget.heap_usage[i]);
+            }
+        }
+        Some(free)
+    }
     pub fn subgroup_size(&self) -> u32 {
         self.subgroup_size
     }

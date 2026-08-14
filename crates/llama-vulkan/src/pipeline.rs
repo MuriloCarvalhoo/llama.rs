@@ -31,7 +31,7 @@ impl ComputePipeline {
         Self::with(
             dev,
             crate::Q8_0_MATVEC_SPV,
-            3,
+            4,
             std::mem::size_of::<PushConstants>() as u32,
             &[
                 (0, crate::resident_forward::MATVEC_WG),

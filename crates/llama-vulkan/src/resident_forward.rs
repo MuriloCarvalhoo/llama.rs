@@ -109,11 +109,26 @@ pub(crate) struct LayerAux {
 #[derive(Clone, Copy)]
 pub(crate) enum PipeId {
     Matvec,
+    QuantizeX,
     Rmsnorm,
     Rope,
     Attention,
     Swiglu,
     Add,
+}
+
+impl PipeId {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PipeId::Matvec => "matvec",
+            PipeId::QuantizeX => "quantize_x",
+            PipeId::Rmsnorm => "rmsnorm",
+            PipeId::Rope => "rope",
+            PipeId::Attention => "attention",
+            PipeId::Swiglu => "swiglu",
+            PipeId::Add => "add",
+        }
+    }
 }
 
 /// Como obter os bytes de push-constant de um dispatch no momento da gravação.
@@ -167,10 +182,27 @@ pub(crate) struct ResidentState {
     pub b_up: Buf,
     pub b_act: Buf,
     pub b_logits: Buf,
+    /// Ativacao quantizada em int8 (8 uints por bloco de 32) e escala por bloco,
+    /// produzidas uma vez por matvec pelo dispatch `QuantizeX`.
+    pub b_xq: Buf,
+    pub b_xd: Buf,
     pub len: RefCell<usize>,
     pub plan: Vec<PlannedOp>,
     pub token_cmd: vk::CommandBuffer,
     pub token_fence: vk::Fence,
+    /// Perfilamento por op via timestamp queries. `Some` só com LLAMA_RS_PROFILE=1.
+    pub prof: Option<Prof>,
+}
+
+/// Acumulador de tempo de GPU por operação do plano, medido com timestamp queries.
+/// Ativado por `LLAMA_RS_PROFILE=1`; fora disso nada é gravado no command buffer.
+pub(crate) struct Prof {
+    pub pool: vk::QueryPool,
+    /// Nanossegundos por tick do timestamp (VkPhysicalDeviceLimits::timestampPeriod).
+    pub period_ns: f32,
+    /// Nanossegundos acumulados por índice de op do plano.
+    pub accum: RefCell<Vec<u64>>,
+    pub tokens: std::cell::Cell<usize>,
 }
 
 /// Backend de decode GPU-resident (1 GPU). Construído via `ResidentForward::new`.
@@ -180,6 +212,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dev: VulkanDevice,
     // pipelines (preenchidos na Task 9; campos públicos ao crate para as tasks de teste)
     pub(crate) matvec: ComputePipeline,
+    pub(crate) quantize_x: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) rope: ComputePipeline,
     pub(crate) attention: ComputePipeline,
@@ -347,9 +380,27 @@ impl<'ctx> ResidentForward<'ctx> {
         if phys.is_empty() {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
         }
-        let dev = VulkanDevice::create(ctx, &phys[0])?;
+        // Escolhe a GPU com mais VRAM livre; LLAMA_RS_GPU força um índice.
+        // A GPU que roda o display já tem ~1.6 GB ocupados, e num modelo que quase enche
+        // a VRAM o driver realoca o excedente em GTT (memória do host, via PCIe): medimos
+        // 95 GB/s no matvec do 14B na GPU do display contra 714 GB/s na outra.
+        let idx = std::env::var("LLAMA_RS_GPU")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|i| *i < phys.len())
+            .or_else(|| {
+                phys.iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| p.free_device_memory(ctx).map(|f| (i, f)))
+                    .max_by_key(|&(_, f)| f)
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        let dev = VulkanDevice::create(ctx, &phys[idx])?;
         let d = &dev.device;
         let matvec = ComputePipeline::new(d)?;
+        // 3 bindings (x, xq, xd) + push de 12 bytes (n_in + 2 pads de alinhamento).
+        let quantize_x = ComputePipeline::with(d, crate::QUANTIZE_X_SPV, 3, 12, &[])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24, &[])?;
@@ -358,10 +409,13 @@ impl<'ctx> ResidentForward<'ctx> {
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 4096,
+            descriptor_count: 65536,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo {
-            max_sets: 1024,
+            // Um descriptor set por op do plano. O 14B tem ~1100 ops/token (48 camadas
+            // x ~23 ops), e cada matvec usa 4 bindings — o pool anterior (1024 sets)
+            // estourava com ERROR_OUT_OF_POOL_MEMORY.
+            max_sets: 16384,
             pool_size_count: 1,
             p_pool_sizes: pool_sizes.as_ptr(),
             ..Default::default()
@@ -371,9 +425,10 @@ impl<'ctx> ResidentForward<'ctx> {
 
         Ok(Self {
             ctx,
-            phys_idx: 0,
+            phys_idx: idx,
             dev,
             matvec,
+            quantize_x,
             rmsnorm,
             rope,
             attention,
@@ -534,17 +589,46 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_up: nf(config.n_ff)?,
                 b_act: nf(config.n_ff)?,
                 b_logits: nf(config.vocab)?,
+                b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
+                b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
                 len: RefCell::new(0),
                 plan: Vec::new(),
                 token_cmd,
                 token_fence,
+                prof: None,
             }
         };
 
         me.state = Some(state);
         let plan = me.build_plan()?;
+        // Perfilamento opcional: 1 timestamp antes do plano + 1 depois de cada op, então
+        // o pool é dimensionado pelo plano (o 14B tem ~1100 ops/token).
+        let prof = if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
+            let info = vk::QueryPoolCreateInfo {
+                query_type: vk::QueryType::TIMESTAMP,
+                query_count: u32::try_from(plan.len() + 1)
+                    .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?,
+                ..Default::default()
+            };
+            // SAFETY: device válido; info preenchido nesta stack frame.
+            let pool = unsafe { me.dev.device.create_query_pool(&info, None)? };
+            // SAFETY: instance e handle válidos (enumerados por VulkanContext).
+            let props = unsafe {
+                ctx.instance
+                    .get_physical_device_properties(ctx.amd_compute_devices()[me.phys_idx].handle)
+            };
+            Some(Prof {
+                pool,
+                period_ns: props.limits.timestamp_period,
+                accum: RefCell::new(Vec::new()),
+                tokens: std::cell::Cell::new(0),
+            })
+        } else {
+            None
+        };
         if let Some(st) = me.state.as_mut() {
             st.plan = plan;
+            st.prof = prof;
         }
         Ok(me)
     }
@@ -854,7 +938,17 @@ impl<'ctx> ResidentForward<'ctx> {
         let c = &st.cfg;
         let total_len = (pos + 1) as u32;
 
-        for op in &st.plan {
+        // Timestamp inicial (slot 0); cada op grava o seu em slot i+1.
+        if let Some(pf) = &st.prof {
+            let n = (st.plan.len() + 1) as u32;
+            // SAFETY: cmd em gravação; pool criado com 1024 slots >= n.
+            unsafe {
+                d.cmd_reset_query_pool(cmd, pf.pool, 0, n);
+                d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, pf.pool, 0);
+            }
+        }
+
+        for (op_idx, op) in st.plan.iter().enumerate() {
             match op {
                 PlannedOp::Embed => {
                     // Copia a linha do token da tabela host para o staging e daí para b_x.
@@ -976,12 +1070,24 @@ impl<'ctx> ResidentForward<'ctx> {
                     self.full_barrier(cmd);
                 }
             }
+            if let Some(pf) = &st.prof {
+                // SAFETY: cmd em gravação; slot op_idx+1 < 1024.
+                unsafe {
+                    d.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        pf.pool,
+                        (op_idx + 1) as u32,
+                    );
+                }
+            }
         }
     }
 
     pub(crate) fn pipe_of(&self, id: PipeId) -> &ComputePipeline {
         match id {
             PipeId::Matvec => &self.matvec,
+            PipeId::QuantizeX => &self.quantize_x,
             PipeId::Rmsnorm => &self.rmsnorm,
             PipeId::Rope => &self.rope,
             PipeId::Attention => &self.attention,
@@ -1037,6 +1143,12 @@ impl<'ctx> ResidentForward<'ctx> {
             .to_vec()
         };
         let mv_groups = |n_out: usize| -> u32 { (n_out as u32).div_ceil(MATVEC_NUM_ROWS) };
+        // Push do quantize: n_in + 2 pads (o range declarado no pipeline e de 12 bytes).
+        let qx_push = |n_in: usize| -> Vec<u8> {
+            let p: [u32; 3] = [n_in as u32, 0, 0];
+            unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), 12) }.to_vec()
+        };
+        let qx_groups = |n_in: usize| -> u32 { ((n_in / 32) as u32).div_ceil(64) };
 
         let mk = |pipe: PipeId,
                   binds: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
@@ -1093,10 +1205,21 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(rms_push()),
             )?);
             plan.push(mk(
+                PipeId::QuantizeX,
+                &[
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                qx_groups(c.n_embd),
+                PushSpec::Static(qx_push(c.n_embd)),
+            )?);
+            plan.push(mk(
                 PipeId::Matvec,
                 &[
                     (lq.attn_q.buffer, 0, lq.attn_q.size_bytes),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_q.buffer, 0, nb(c.n_embd)),
                 ],
                 mv_groups(c.n_embd),
@@ -1106,7 +1229,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 PipeId::Matvec,
                 &[
                     (lq.attn_k.buffer, 0, lq.attn_k.size_bytes),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_k.buffer, 0, nb(c.kv_dim)),
                 ],
                 mv_groups(c.kv_dim),
@@ -1116,7 +1240,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 PipeId::Matvec,
                 &[
                     (lq.attn_v.buffer, 0, lq.attn_v.size_bytes),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_v.buffer, 0, nb(c.kv_dim)),
                 ],
                 mv_groups(c.kv_dim),
@@ -1184,10 +1309,21 @@ impl<'ctx> ResidentForward<'ctx> {
                 },
             )?);
             plan.push(mk(
+                PipeId::QuantizeX,
+                &[
+                    (st.b_attn.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                qx_groups(c.n_embd),
+                PushSpec::Static(qx_push(c.n_embd)),
+            )?);
+            plan.push(mk(
                 PipeId::Matvec,
                 &[
                     (lq.attn_output.buffer, 0, lq.attn_output.size_bytes),
-                    (st.b_attn.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_proj.buffer, 0, nb(c.n_embd)),
                 ],
                 mv_groups(c.n_embd),
@@ -1213,10 +1349,21 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(rms_push()),
             )?);
             plan.push(mk(
+                PipeId::QuantizeX,
+                &[
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                qx_groups(c.n_embd),
+                PushSpec::Static(qx_push(c.n_embd)),
+            )?);
+            plan.push(mk(
                 PipeId::Matvec,
                 &[
                     (lq.ffn_gate.buffer, 0, lq.ffn_gate.size_bytes),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_gate.buffer, 0, nb(c.n_ff)),
                 ],
                 mv_groups(c.n_ff),
@@ -1226,7 +1373,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 PipeId::Matvec,
                 &[
                     (lq.ffn_up.buffer, 0, lq.ffn_up.size_bytes),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_up.buffer, 0, nb(c.n_ff)),
                 ],
                 mv_groups(c.n_ff),
@@ -1243,10 +1391,21 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(n_push(c.n_ff)),
             )?);
             plan.push(mk(
+                PipeId::QuantizeX,
+                &[
+                    (st.b_act.buffer, 0, nb(c.n_ff)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                qx_groups(c.n_ff),
+                PushSpec::Static(qx_push(c.n_ff)),
+            )?);
+            plan.push(mk(
                 PipeId::Matvec,
                 &[
                     (lq.ffn_down.buffer, 0, lq.ffn_down.size_bytes),
-                    (st.b_act.buffer, 0, nb(c.n_ff)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
                     (st.b_proj.buffer, 0, nb(c.n_embd)),
                 ],
                 mv_groups(c.n_embd),
@@ -1274,10 +1433,21 @@ impl<'ctx> ResidentForward<'ctx> {
             PushSpec::Static(rms_push()),
         )?);
         plan.push(mk(
+            PipeId::QuantizeX,
+            &[
+                (st.b_normed.buffer, 0, nb(c.n_embd)),
+                (st.b_xq.buffer, 0, st.b_xq.size),
+                (st.b_xd.buffer, 0, st.b_xd.size),
+            ],
+            qx_groups(c.n_embd),
+            PushSpec::Static(qx_push(c.n_embd)),
+        )?);
+        plan.push(mk(
             PipeId::Matvec,
             &[
                 (st.output_w.buffer, 0, st.output_w.size_bytes),
-                (st.b_normed.buffer, 0, nb(c.n_embd)),
+                (st.b_xq.buffer, 0, st.b_xq.size),
+                (st.b_xd.buffer, 0, st.b_xd.size),
                 (st.b_logits.buffer, 0, nb(c.vocab)),
             ],
             mv_groups(c.vocab),
@@ -1285,6 +1455,80 @@ impl<'ctx> ResidentForward<'ctx> {
         )?);
 
         Ok(plan)
+    }
+
+    /// Lê os timestamps do token e acumula o tempo de GPU por op. No-op sem profiling.
+    fn collect_prof(&self, st: &ResidentState) -> Result<(), MatmulError> {
+        let Some(pf) = &st.prof else { return Ok(()) };
+        let n = st.plan.len() + 1;
+        let mut ticks = vec![0u64; n];
+        // SAFETY: pool tem >= n slots, todos escritos neste command buffer já concluído.
+        unsafe {
+            self.dev.device.get_query_pool_results(
+                pf.pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )?;
+        }
+        let mut accum = pf.accum.borrow_mut();
+        if accum.len() < n - 1 {
+            accum.resize(n - 1, 0);
+        }
+        for i in 0..n - 1 {
+            let delta = ticks[i + 1].saturating_sub(ticks[i]);
+            #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+            let ns = (delta as f64 * f64::from(pf.period_ns)) as u64;
+            accum[i] += ns;
+        }
+        pf.tokens.set(pf.tokens.get() + 1);
+        Ok(())
+    }
+
+    /// Imprime o perfil agregado por tipo de op (stderr). No-op sem profiling.
+    pub fn print_profile(&self) {
+        let Some(st) = self.state.as_ref() else {
+            return;
+        };
+        let Some(pf) = &st.prof else { return };
+        let tokens = pf.tokens.get().max(1);
+        let accum = pf.accum.borrow();
+
+        let mut por_tipo: std::collections::BTreeMap<&'static str, (u64, usize)> =
+            std::collections::BTreeMap::new();
+        for (i, &ns) in accum.iter().enumerate() {
+            let label = match st.plan.get(i) {
+                Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
+                Some(PlannedOp::Embed) => "embed",
+                Some(PlannedOp::KvAppend { .. }) => "kv_append",
+                None => continue,
+            };
+            let e = por_tipo.entry(label).or_insert((0, 0));
+            e.0 += ns;
+            e.1 += 1;
+        }
+
+        let total: u64 = accum.iter().sum();
+        let ms = |ns: u64| ns as f64 / 1e6 / tokens as f64;
+        eprintln!(
+            "\n=== PERFIL GPU ({tokens} tokens, {} ops/token) ===",
+            accum.len()
+        );
+        eprintln!(
+            "{:<12} {:>10} {:>8} {:>10}",
+            "op", "ms/token", "%", "n/token"
+        );
+        let mut linhas: Vec<_> = por_tipo.iter().collect();
+        linhas.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (label, (ns, n)) in linhas {
+            eprintln!(
+                "{label:<12} {:>10.3} {:>7.1}% {:>10}",
+                ms(*ns),
+                100.0 * *ns as f64 / total.max(1) as f64,
+                n
+            );
+        }
+        eprintln!("{:<12} {:>10.3} {:>7.1}%", "TOTAL", ms(total), 100.0);
     }
 
     /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
@@ -1323,6 +1567,7 @@ impl<'ctx> ResidentForward<'ctx> {
             d.queue_submit(dev.queue, &[submit], st.token_fence)?;
             d.wait_for_fences(&[st.token_fence], true, u64::MAX)?;
         }
+        self.collect_prof(st)?;
         self.readback(&st.b_logits, st.cfg.vocab)
     }
 }
@@ -1353,6 +1598,10 @@ impl Drop for ResidentForward<'_> {
         }
 
         if let Some(st) = self.state.take() {
+            if let Some(pf) = &st.prof {
+                // SAFETY: pool criado por nós; GPU ociosa (device_wait_idle acima).
+                unsafe { d.destroy_query_pool(pf.pool, None) };
+            }
             for lq in st.qw {
                 lq.attn_q.destroy(d);
                 lq.attn_k.destroy(d);
@@ -1393,6 +1642,8 @@ impl Drop for ResidentForward<'_> {
                 &st.b_up,
                 &st.b_act,
                 &st.b_logits,
+                &st.b_xq,
+                &st.b_xd,
             ] {
                 b.destroy(d);
             }

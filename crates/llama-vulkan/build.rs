@@ -4,6 +4,7 @@ fn main() {
     // (arquivo, env var). O matvec já existia; os demais entram na Fase 1C.
     let shaders = [
         ("q8_0_matvec.comp", "Q8_0_MATVEC_SPV"),
+        ("quantize_x.comp", "QUANTIZE_X_SPV"),
         ("rmsnorm.comp", "RMSNORM_SPV"),
         ("rope.comp", "ROPE_SPV"),
         ("attention.comp", "ATTENTION_SPV"),

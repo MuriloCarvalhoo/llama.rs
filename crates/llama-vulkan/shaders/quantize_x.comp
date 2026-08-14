@@ -1,0 +1,49 @@
+#version 450
+
+// Quantiza a ativacao x (f32) em int8 simetrico por bloco de 32, UMA VEZ por matvec.
+//
+// Antes isso era feito dentro do q8_0_matvec, em LDS, por cada workgroup — e cada
+// workgroup cobre apenas NUM_ROWS linhas de saida. No ffn_gate do Qwen2.5-14B sao
+// 6912 workgroups repetindo a quantizacao dos mesmos 160 blocos, o que custava ~12x
+// mais instrucoes que o proprio produto interno.
+//
+// Saida: xq[8 ints por bloco] (4 i8 empacotados por int) e xd[1 float por bloco].
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } xb;
+layout(set = 0, binding = 1) writeonly buffer XqBuf { int xq[]; } xqb;
+layout(set = 0, binding = 2) writeonly buffer XdBuf { float xd[]; } xdb;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint pad0;
+    uint pad1;
+} pc;
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    uint n_blocks = pc.n_in / 32u;
+    if (blk >= n_blocks) { return; }
+
+    uint base = blk * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        amax = max(amax, abs(xb.x[base + i]));
+    }
+    float d_x = amax / 127.0;
+    float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+    xdb.xd[blk] = d_x;
+
+    // Empacota 4 quantizados por int, little-endian de bytes (byte j = elemento j),
+    // igual ao layout que o matvec consome com dotPacked4x8.
+    for (uint g = 0u; g < 8u; g++) {
+        int packed = 0;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = int(round(xb.x[base + g * 4u + j] * inv));
+            q = clamp(q, -127, 127);
+            packed |= (q & 0xff) << (8u * j);
+        }
+        xqb.xq[blk * 8u + g] = packed;
+    }
+}

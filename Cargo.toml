@@ -31,3 +31,10 @@ cast_possible_truncation = "deny"
 cast_sign_loss = "deny"
 cast_possible_wrap = "deny"
 indexing_slicing = "warn"
+
+# LTO + codegen-units=1: 3-20% conforme as medicoes em docs/rust-memoria-e-desempenho.md.
+# `thin` entrega quase todo o ganho do `fat` a metade do tempo de build.
+# panic="abort" fica de fora: quebra os testes com #[should_panic].
+[profile.release]
+lto = "thin"
+codegen-units = 1
