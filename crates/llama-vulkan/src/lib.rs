@@ -23,6 +23,7 @@ pub use resident_forward::{GpuSpan, ResidentForward, Shard};
 pub(crate) const Q8_0_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
 pub(crate) const QUANTIZE_X_SPV: &[u8] = include_bytes!(concat!(env!("QUANTIZE_X_SPV")));
 pub(crate) const Q5_K_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q5_K_MATVEC_SPV")));
+pub(crate) const Q6_K_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q6_K_MATVEC_SPV")));
 #[allow(dead_code)]
 pub(crate) const RMSNORM_SPV: &[u8] = include_bytes!(concat!(env!("RMSNORM_SPV")));
 #[allow(dead_code)]

@@ -303,6 +303,61 @@ pub fn dispatch_q5_k_matvec(
     n_in: usize,
     n_out: usize,
 ) -> Result<Vec<f32>, MatmulError> {
+    // Q5_K sobe cru: 176 bytes por superbloco já são 44 uints alinhados.
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::Q5_K_MATVEC_SPV,
+        w_bytes,
+        x_f32,
+        n_in,
+        n_out,
+    )
+}
+
+/// Matvec Q6_K. O superbloco tem 210 bytes, que não é múltiplo de 4 — cada um é alinhado
+/// em 212 bytes no upload para as leituras de 32 bits do shader ficarem alinhadas, o mesmo
+/// motivo do repack 34 → 36 do Q8_0.
+pub fn dispatch_q6_k_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    let n_sb = w_bytes.len() / 210;
+    let mut padded = vec![0u8; n_sb * 212];
+    for i in 0..n_sb {
+        padded[i * 212..i * 212 + 210].copy_from_slice(&w_bytes[i * 210..(i + 1) * 210]);
+    }
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::Q6_K_MATVEC_SPV,
+        &padded,
+        x_f32,
+        n_in,
+        n_out,
+    )
+}
+
+/// Caminho comum dos matvecs K-quant: sobe pesos e ativação f32, despacha 1 workgroup por
+/// linha e lê o resultado. `w_bytes` já vem no layout que o shader espera.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_k_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    spv: &[u8],
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+) -> Result<Vec<f32>, MatmulError> {
     use crate::pipeline::{ComputePipeline, PushConstants};
     use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
 
@@ -351,13 +406,7 @@ pub fn dispatch_q5_k_matvec(
     )?;
     let y_mem = alloc_and_bind(ctx, phys, d, y_buf, false)?;
 
-    let pipe = ComputePipeline::with(
-        d,
-        crate::Q5_K_MATVEC_SPV,
-        3,
-        size_of::<PushConstants>() as u32,
-        &[],
-    )?;
+    let pipe = ComputePipeline::with(d, spv, 3, size_of::<PushConstants>() as u32, &[])?;
     let push = PushConstants {
         n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,

@@ -1,0 +1,93 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Matvec Q6_K: y[n_out] = W[n_out x n_in] * x[n_in], com W em superblocos Q6_K.
+//
+// Superbloco = 256 elementos em 210 bytes:
+//   byte   0..127 : ql[128] — 4 bits baixos, dois elementos por byte
+//   byte 128..191 : qh[64]  — 2 bits altos, quatro elementos por byte
+//   byte 192..207 : scales[16] — i8, um por sub-bloco de 16 elementos
+//   byte 208..209 : d (f16)
+//
+// 210 nao e multiplo de 4, entao o upload alinha cada superbloco em 212 bytes (53 uints)
+// para as leituras de 32 bits ficarem alinhadas — mesmo motivo do repack 34 -> 36 do Q8_0.
+//
+// Paralelizacao: 16 sub-blocos de 16 elementos por superbloco. Cada lane cuida de um
+// sub-bloco, entao 4 superblocos por wave de 64 lanes.
+//
+// O valor de um elemento e `d * scale[sub] * (q - 32)`, com q de 6 bits montado a partir
+// de 4 bits de ql e 2 de qh. O agrupamento segue o ggml: dentro de cada metade de 128
+// elementos, l percorre 0..31 e produz os elementos l, l+32, l+64, l+96.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint w[]; } weight_buf;
+layout(set = 0, binding = 1) readonly buffer ActBuf { float x[]; } act_buf;
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float y[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint row_offset;
+} pc;
+
+const uint WG = 64u;
+const uint UINTS_PER_SB = 53u;  // 212 bytes alinhados (210 uteis)
+
+uint sb_byte(uint base_u, uint i) {
+    return (weight_buf.w[base_u + (i >> 2u)] >> (8u * (i & 3u))) & 0xFFu;
+}
+
+// scales[] sao i8 com sinal.
+int sb_scale(uint base_u, uint j) {
+    return int(sb_byte(base_u, 192u + j) << 24u) >> 24;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_out) { return; }
+
+    uint n_sb = pc.n_in / 256u;
+    uint row_u = row * n_sb * UINTS_PER_SB;
+
+    uint sub = lane & 15u;        // qual sub-bloco de 16 elementos (0..15)
+    uint sb_in_grp = lane >> 4u;  // qual superbloco do grupo de 4
+
+    float acc = 0.0;
+    for (uint sb0 = 0u; sb0 < n_sb; sb0 += 4u) {
+        uint sbi = sb0 + sb_in_grp;
+        if (sbi >= n_sb) { continue; }
+
+        uint base_u = row_u + sbi * UINTS_PER_SB;
+        float d = unpackHalf2x16(weight_buf.w[base_u + 52u]).x; // bytes 208..209
+        float ds = d * float(sb_scale(base_u, sub));
+
+        // Sub-bloco `sub` cobre os elementos [sub*16, sub*16+16). Mapeando para o layout
+        // do ggml: metade n = sub/8 (0 ou 1, deslocando ql/qh em 64/32 bytes), e dentro
+        // dela o quarto q = (sub%8)/2, que escolhe o nibble de ql e o par de bits de qh.
+        uint half_i = sub >> 3u;          // 0 ou 1
+        uint quarter = (sub >> 1u) & 3u;  // 0..3 -> q1..q4 do laco do ggml
+        uint idx16 = (sub & 1u) * 16u;    // metade inferior/superior dos 32 `l`
+
+        uint ql_off = half_i * 64u + ((quarter & 1u) * 32u);
+        uint qh_off = 128u + half_i * 32u;
+        uint shift = quarter * 2u;              // 0,2,4,6
+        bool hi_nibble = quarter >= 2u;
+        uint x_base = sbi * 256u + sub * 16u;
+
+        for (uint t = 0u; t < 16u; t++) {
+            uint l = idx16 + t;
+            uint qlb = sb_byte(base_u, ql_off + l);
+            uint q4 = hi_nibble ? (qlb >> 4u) : (qlb & 0xFu);
+            uint qhb = sb_byte(base_u, qh_off + l);
+            int q = int(q4 | (((qhb >> shift) & 3u) << 4u)) - 32;
+            acc += ds * float(q) * act_buf.x[x_base + t];
+        }
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        out_buf.y[row] = acc;
+    }
+}
