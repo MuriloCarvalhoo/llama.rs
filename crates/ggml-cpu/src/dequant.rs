@@ -14,6 +14,7 @@ pub fn dequant_to_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>, DequantErr
         GgmlType::Q8_0 => dequant_q8_0(bytes),
         GgmlType::Q4_0 => dequant_q4_0(bytes),
         GgmlType::Q4_K => dequant_q4_k(bytes),
+        GgmlType::Q5_K => dequant_q5_k(bytes),
         GgmlType::Q6_K => dequant_q6_k(bytes),
         other => Err(DequantError::UnsupportedType(format!("{other:?}"))),
     }
@@ -143,6 +144,60 @@ fn dequant_q4_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     Ok(out)
 }
+/// Q5_K: superbloco de 256 elementos em 176 bytes —
+/// `d(f16) | dmin(f16) | scales[12] | qh[32] | qs[128]`.
+///
+/// Mesmo esquema de escalas do Q4_K (6 bits por sub-bloco de 32, via `get_scale_min_k4`),
+/// acrescido de um 5º bit por elemento vindo de `qh`: o bit `l` de `qh[l]` pertence ao
+/// primeiro grupo de 32 e o bit seguinte ao segundo, avançando 2 bits a cada 64 elementos.
+fn dequant_q5_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
+    const BLOCK: usize = 176; // 2+2+12+32+128
+    if !bytes.len().is_multiple_of(BLOCK) {
+        return Err(DequantError::BadSize {
+            ty: "Q5_K",
+            block_bytes: BLOCK,
+            got: bytes.len(),
+        });
+    }
+    let n_blocks = bytes.len() / BLOCK;
+    let mut out = vec![0.0f32; n_blocks * 256];
+
+    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+        let d_val = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        let min_val = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+        let scales = &b[4..16];
+        let qh = &b[16..48];
+        let qs = &b[48..176];
+        let base = bi * 256;
+        let mut qs_off = 0usize;
+        let mut is = 0usize;
+        // Máscaras do bit alto: avançam duas posições a cada grupo de 64 elementos.
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+
+        for j_step in [0usize, 64, 128, 192] {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d_val * f32::from(sc1);
+            let m1f = min_val * f32::from(m1);
+            let d2 = d_val * f32::from(sc2);
+            let m2f = min_val * f32::from(m2);
+            for l in 0..32 {
+                let q = qs[qs_off + l];
+                let hi1 = u8::from(qh[l] & u1 != 0) * 16;
+                let hi2 = u8::from(qh[l] & u2 != 0) * 16;
+                out[base + j_step + l] = d1 * f32::from((q & 0xF) + hi1) - m1f;
+                out[base + j_step + l + 32] = d2 * f32::from((q >> 4) + hi2) - m2f;
+            }
+            qs_off += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    Ok(out)
+}
+
 fn dequant_q6_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     const BLOCK: usize = 210; // 128+64+16+2
     if !bytes.len().is_multiple_of(BLOCK) {
@@ -407,5 +462,83 @@ mod tests {
     #[test]
     fn q6_k_bad_size_returns_error() {
         assert!(dequant_to_f32(&[0u8; 209], GgmlType::Q6_K).is_err());
+    }
+}
+
+#[cfg(test)]
+mod q5k_tests {
+    use super::*;
+
+    // Primeiro superbloco de `token_embd.weight` do Qwen2.5-32B-Instruct-Q5_K_M, e os
+    // valores correspondentes produzidos pelo `gguf-py` do llama.cpp — o oráculo do
+    // formato. Fixture pequeno de propósito: pega qualquer erro de manipulação de bits
+    // (nibble trocado, bit alto no grupo errado, escala mal desempacotada) sem depender
+    // do modelo estar presente na máquina.
+    const RAW: [u8; 176] = [
+        60, 6, 128, 24, 217, 160, 160, 90, 213, 88, 91, 81, 255, 251, 235, 6, 222, 227, 191, 124,
+        150, 29, 213, 59, 219, 255, 241, 30, 63, 145, 57, 124, 125, 249, 241, 221, 55, 146, 83,
+        162, 124, 217, 252, 247, 247, 222, 117, 127, 55, 187, 228, 65, 208, 180, 35, 129, 127, 108,
+        196, 99, 69, 252, 126, 159, 119, 251, 254, 205, 146, 62, 9, 159, 125, 184, 201, 15, 42, 8,
+        10, 17, 214, 240, 97, 144, 166, 101, 29, 95, 52, 147, 233, 198, 44, 143, 174, 246, 7, 131,
+        232, 20, 231, 252, 88, 238, 184, 91, 170, 8, 236, 187, 169, 30, 231, 32, 16, 75, 214, 171,
+        246, 8, 230, 5, 204, 181, 104, 109, 93, 170, 55, 57, 28, 217, 103, 218, 220, 78, 37, 248,
+        31, 99, 249, 10, 40, 33, 195, 21, 143, 105, 11, 176, 65, 126, 82, 68, 105, 177, 190, 92,
+        217, 240, 193, 134, 65, 251, 28, 47, 3, 13, 216, 38, 161, 1, 31, 2, 149, 170,
+    ];
+
+    const SPOTS: [(usize, f32); 24] = [
+        (0, -2.9495001e-02),
+        (1, 1.8069506e-02),
+        (2, 1.4219284e-03),
+        (3, -4.3764353e-02),
+        (4, -4.6142578e-02),
+        (5, 1.4219284e-03),
+        (6, -9.5629692e-04),
+        (7, -5.7127476e-03),
+        (124, -2.7265549e-03),
+        (125, 2.9427052e-02),
+        (126, -1.2619972e-02),
+        (127, 4.6935081e-03),
+        (128, -5.8579445e-04),
+        (129, -1.3842773e-01),
+        (130, -4.2537689e-02),
+        (131, 2.3386717e-02),
+        (248, -7.9493523e-03),
+        (249, 2.5148392e-03),
+        (250, 1.9257545e-02),
+        (251, -1.6708374e-03),
+        (252, 4.2200088e-04),
+        (253, -1.6708374e-03),
+        (254, -1.6320705e-02),
+        (255, -1.4227867e-02),
+    ];
+
+    /// Soma dos 256 valores, para detectar erro em posições fora das amostradas.
+    const SOMA: f64 = 1.0147691e-01;
+
+    #[test]
+    fn q5_k_bate_com_o_oraculo_do_llama_cpp() {
+        let got = dequant_to_f32(&RAW, GgmlType::Q5_K).expect("dequant Q5_K");
+        assert_eq!(got.len(), 256, "um superbloco = 256 elementos");
+
+        for (i, esperado) in SPOTS {
+            let d = (got[i] - esperado).abs();
+            assert!(
+                d < 1e-6,
+                "indice {i}: obtido {}, esperado {esperado}",
+                got[i]
+            );
+        }
+
+        let soma: f64 = got.iter().map(|&v| f64::from(v)).sum();
+        assert!(
+            (soma - SOMA).abs() < 1e-5,
+            "soma dos 256 valores: obtida {soma:.9e}, esperada {SOMA:.9e}"
+        );
+    }
+
+    #[test]
+    fn q5_k_rejeita_tamanho_invalido() {
+        assert!(dequant_to_f32(&RAW[..175], GgmlType::Q5_K).is_err());
     }
 }
