@@ -172,9 +172,16 @@ pub fn run_generate(
         init_numa_before_load();
     }
 
+    #[cfg(feature = "profiling")]
+    let trace_guard = args.trace.clone().map(crate::trace::init);
+
     let bytes = map_model(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
-    let model = Model::load_with_config(&f, &bytes, model_config(&f, args)?)?;
+    let model = {
+        #[cfg(feature = "profiling")]
+        let _s = tracing::info_span!("carregar_modelo").entered();
+        Model::load_with_config(&f, &bytes, model_config(&f, args)?)?
+    };
     // Criar pool rayon DEPOIS do load: workers herdam afinidade e política de memória.
     init_rayon_after_model_load();
     // Acordar todos os workers rayon com um broadcast noop — evita latência de
@@ -229,6 +236,12 @@ pub fn run_generate(
                         n_tokens += 1;
                     },
                 )?;
+                #[cfg(feature = "profiling")]
+                if let Some(g) = trace_guard.as_ref() {
+                    for (track, spans) in backend.gpu_spans_by_track() {
+                        g.add_gpu_spans(&track, &spans);
+                    }
+                }
                 true
             }
             Ok(_) => {
@@ -267,6 +280,10 @@ pub fn run_generate(
                 )?;
                 // No-op sem LLAMA_RS_PROFILE=1.
                 backend.print_profile();
+                #[cfg(feature = "profiling")]
+                if let Some(g) = trace_guard.as_ref() {
+                    g.add_gpu_spans(&backend.device_name(), &backend.gpu_spans());
+                }
                 true
             }
             Ok(_) => {

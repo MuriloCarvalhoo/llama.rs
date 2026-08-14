@@ -18,9 +18,13 @@ clap = { version = "4", features = ["derive"] }
 rayon.workspace = true
 llama-vulkan = { path = "../llama-vulkan", optional = true }
 memmap2 = "0.9"
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "fmt"], optional = true }
 
 [features]
 gpu = ["llama-vulkan", "llama-model/gpu"]
+# Timeline CPU+GPU (--trace). Fora dela nenhum codigo de instrumentacao entra no binario.
+profiling = ["gpu", "dep:tracing", "dep:tracing-subscriber", "llama-vulkan/profiling"]
 
 [lints]
 workspace = true

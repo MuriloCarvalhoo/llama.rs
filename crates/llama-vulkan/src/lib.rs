@@ -18,7 +18,7 @@ pub use dual_gpu::DualGpuMatmul;
 pub use layer_split::LayerSplitForward;
 pub use model_gpu::GpuWeights;
 pub use resident::ResidentGpu;
-pub use resident_forward::{ResidentForward, Shard};
+pub use resident_forward::{GpuSpan, ResidentForward, Shard};
 
 pub(crate) const Q8_0_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
 pub(crate) const QUANTIZE_X_SPV: &[u8] = include_bytes!(concat!(env!("QUANTIZE_X_SPV")));

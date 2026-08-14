@@ -252,6 +252,18 @@ pub(crate) struct Prof {
     /// Nanossegundos acumulados por índice de op do plano.
     pub accum: RefCell<Vec<u64>>,
     pub tokens: std::cell::Cell<usize>,
+    /// Zonas absolutas para a timeline (`--trace`). Vazio quando não se pede trace.
+    pub spans: RefCell<Vec<GpuSpan>>,
+    /// Limite de tokens gravados, para o arquivo não crescer sem fim.
+    pub max_trace_tokens: usize,
+}
+
+/// Uma operação de GPU posicionada no relógio da CPU, para a timeline.
+#[derive(Clone, Debug)]
+pub struct GpuSpan {
+    pub name: &'static str,
+    pub start: std::time::Instant,
+    pub end: std::time::Instant,
 }
 
 /// Backend de decode GPU-resident (1 GPU). Construído via `ResidentForward::new`.
@@ -515,6 +527,10 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Backend cobrindo apenas `shard.first_layer..shard.end_layer`, no device do shard.
     /// Só o primeiro shard faz embedding; só o último faz a norma final e os logits.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip_all, name = "subir_pesos")
+    )]
     pub fn new_shard(
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
@@ -716,6 +732,11 @@ impl<'ctx> ResidentForward<'ctx> {
                 period_ns: props.limits.timestamp_period,
                 accum: RefCell::new(Vec::new()),
                 tokens: std::cell::Cell::new(0),
+                spans: RefCell::new(Vec::new()),
+                max_trace_tokens: std::env::var("LLAMA_RS_TRACE_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8),
             })
         } else {
             None
@@ -1023,6 +1044,10 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Grava a stack inteira do token em `cmd` (já em `begin`). Push/offsets dependem de token/pos.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip_all, name = "gravar_cmdbuf")
+    )]
     fn record_token(&self, cmd: vk::CommandBuffer, token: u32, pos: usize, x_in: Option<&[f32]>) {
         let d = &self.dev.device;
         let st = self
@@ -1601,7 +1626,50 @@ impl<'ctx> ResidentForward<'ctx> {
             accum[i] += ns;
         }
         pf.tokens.set(pf.tokens.get() + 1);
+
+        // Zonas absolutas para a timeline. O fence acabou de ser aguardado, então `agora`
+        // é o instante do ÚLTIMO timestamp — dá para ancorar o token inteiro sem submit
+        // extra nem VK_EXT_calibrated_timestamps, e sem drift acumulado entre tokens.
+        if pf.tokens.get() <= pf.max_trace_tokens {
+            let now = std::time::Instant::now();
+            let last = ticks[n - 1];
+            let at = |tick: u64| -> std::time::Instant {
+                #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+                let back = (last.saturating_sub(tick) as f64 * f64::from(pf.period_ns)) as u64;
+                now - std::time::Duration::from_nanos(back)
+            };
+            let mut spans = pf.spans.borrow_mut();
+            for i in 0..n - 1 {
+                let name = match st.plan.get(i) {
+                    Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
+                    Some(PlannedOp::Embed) => "embed",
+                    Some(PlannedOp::KvAppend { .. }) => "kv_append",
+                    None => continue,
+                };
+                spans.push(GpuSpan {
+                    name,
+                    start: at(ticks[i]),
+                    end: at(ticks[i + 1]),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Zonas de GPU coletadas, para a timeline. Vazio sem profiling.
+    pub fn gpu_spans(&self) -> Vec<GpuSpan> {
+        self.state
+            .as_ref()
+            .and_then(|st| st.prof.as_ref())
+            .map(|pf| pf.spans.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// Nome do device deste backend, para rotular a trilha na timeline.
+    pub fn device_name(&self) -> String {
+        self.ctx.amd_compute_devices()[self.phys_idx]
+            .name()
+            .to_owned()
     }
 
     /// Imprime o perfil agregado por tipo de op (stderr). No-op sem profiling.
@@ -1658,6 +1726,7 @@ impl<'ctx> ResidentForward<'ctx> {
     /// Executa este shard para um token. `x_in` é a stream residual vinda do shard
     /// anterior (`None` no primeiro, que faz o embedding lookup). Retorna os logits no
     /// último shard, ou a stream residual a repassar nos demais.
+    #[cfg_attr(feature = "profiling", tracing::instrument(skip_all, name = "shard"))]
     pub fn decode_shard(
         &self,
         token: u32,
@@ -1686,6 +1755,10 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip_all, name = "submit+fence")
+    )]
     fn record_and_submit(
         &self,
         token: u32,

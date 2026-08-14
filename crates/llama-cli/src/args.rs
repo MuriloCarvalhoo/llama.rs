@@ -65,4 +65,9 @@ pub struct Args {
     /// Para modelos que não cabem numa GPU só. Requer feature "gpu".
     #[arg(long = "gpu-layer-split", default_value_t = false)]
     pub gpu_layer_split: bool,
+
+    /// Grava uma timeline cronológica de CPU e GPU no arquivo dado (formato Chrome Trace,
+    /// abre em https://ui.perfetto.dev). Requer feature "profiling".
+    #[arg(long = "trace", value_name = "ARQUIVO")]
+    pub trace: Option<PathBuf>,
 }

@@ -9,6 +9,7 @@ half = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 llama-model = { workspace = true, features = ["gpu"] }
+tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]
 gguf = { workspace = true }
@@ -21,3 +22,7 @@ shaderc = "0.8"
 
 [lints.rust]
 unsafe_code = "allow"
+
+[features]
+# Instrumentacao da timeline (ver llama-cli --trace).
+profiling = ["dep:tracing"]

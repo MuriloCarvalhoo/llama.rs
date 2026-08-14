@@ -84,6 +84,20 @@ impl<'ctx> LayerSplitForward<'ctx> {
         out
     }
 
+    /// Zonas de GPU de cada shard, com o rótulo da trilha (device + faixa de camadas).
+    pub fn gpu_spans_by_track(&self) -> Vec<(String, Vec<crate::GpuSpan>)> {
+        self.shards
+            .iter()
+            .map(|s| {
+                let sh = s.shard();
+                (
+                    format!("GPU{} ({}..{})", sh.device, sh.first_layer, sh.end_layer),
+                    s.gpu_spans(),
+                )
+            })
+            .collect()
+    }
+
     /// Distribuição efetiva, para log: `(device, primeira, última+1)`.
     pub fn layout(&self) -> Vec<(usize, usize, usize)> {
         self.shards
