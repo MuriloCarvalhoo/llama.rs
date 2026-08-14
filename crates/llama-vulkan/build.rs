@@ -5,6 +5,7 @@ fn main() {
     let shaders = [
         ("q8_0_matvec.comp", "Q8_0_MATVEC_SPV"),
         ("quantize_x.comp", "QUANTIZE_X_SPV"),
+        ("q5_k_matvec.comp", "Q5_K_MATVEC_SPV"),
         ("rmsnorm.comp", "RMSNORM_SPV"),
         ("rope.comp", "ROPE_SPV"),
         ("attention.comp", "ATTENTION_SPV"),

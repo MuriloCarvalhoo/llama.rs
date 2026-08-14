@@ -287,3 +287,206 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
 
     Ok(result)
 }
+
+/// Matvec Q5_K numa GPU: `y = W * x`, com W em superblocos Q5_K crus (176 B / 256 elementos).
+///
+/// Diferente do caminho Q8_0, os pesos sobem **sem repack**: o superbloco Q5_K já tem 176
+/// bytes = 44 uints, então as leituras de 32 bits ficam alinhadas naturalmente. E a ativação
+/// vai em f32 — as escalas por sub-bloco do K-quant tornariam o dot empacotado em int8 bem
+/// mais complicado, e o ganho dele foi medido em ~0% neste kernel.
+pub fn dispatch_q5_k_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    use crate::pipeline::{ComputePipeline, PushConstants};
+    use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
+
+    if n_in % 256 != 0 {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let d = &dev.device;
+
+    // Sobe um slice de bytes para um STORAGE_BUFFER device-local via staging descartável.
+    let upload = |bytes: &[u8]| -> Result<(vk::Buffer, vk::DeviceMemory), MatmulError> {
+        let size = bytes.len() as vk::DeviceSize;
+        let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
+        unsafe {
+            // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
+            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            d.unmap_memory(staging_mem);
+        }
+        let buf = create_buf(
+            d,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let mem = alloc_and_bind(ctx, phys, d, buf, false)?;
+        one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buf, size)?;
+        unsafe {
+            // SAFETY: staging já copiado; ambos criados por nós.
+            d.destroy_buffer(staging, None);
+            d.free_memory(staging_mem, None);
+        }
+        Ok((buf, mem))
+    };
+
+    let (w_buf, w_mem) = upload(w_bytes)?;
+    // SAFETY: Vec<f32> é POD contíguo; reinterpretar como bytes é válido.
+    let x_bytes =
+        unsafe { std::slice::from_raw_parts(x_f32.as_ptr().cast::<u8>(), size_of_val(x_f32)) };
+    let (x_buf, x_mem) = upload(x_bytes)?;
+
+    let y_size = (n_out * size_of::<f32>()) as vk::DeviceSize;
+    let y_buf = create_buf(
+        d,
+        y_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+    )?;
+    let y_mem = alloc_and_bind(ctx, phys, d, y_buf, false)?;
+
+    let pipe = ComputePipeline::with(
+        d,
+        crate::Q5_K_MATVEC_SPV,
+        3,
+        size_of::<PushConstants>() as u32,
+        &[],
+    )?;
+    let push = PushConstants {
+        n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
+        n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
+        row_offset: 0,
+    };
+    // Descriptor pool + set com os 3 bindings (pesos, ativação, saída).
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 3,
+    }];
+    let pool_info = vk::DescriptorPoolCreateInfo {
+        max_sets: 1,
+        pool_size_count: 1,
+        p_pool_sizes: pool_sizes.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: d válido; pool_info aponta para dados vivos nesta frame.
+    let desc_pool = unsafe { d.create_descriptor_pool(&pool_info, None)? };
+    let set_alloc = vk::DescriptorSetAllocateInfo {
+        descriptor_pool: desc_pool,
+        descriptor_set_count: 1,
+        p_set_layouts: &pipe.desc_set_layout,
+        ..Default::default()
+    };
+    // SAFETY: pool e layout válidos.
+    let desc_set = unsafe { d.allocate_descriptor_sets(&set_alloc)? }[0];
+
+    let infos = [
+        vk::DescriptorBufferInfo {
+            buffer: w_buf,
+            offset: 0,
+            range: w_bytes.len() as vk::DeviceSize,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: x_buf,
+            offset: 0,
+            range: x_bytes.len() as vk::DeviceSize,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: y_buf,
+            offset: 0,
+            range: y_size,
+        },
+    ];
+    let writes: Vec<vk::WriteDescriptorSet> = infos
+        .iter()
+        .enumerate()
+        .map(|(b, i)| vk::WriteDescriptorSet {
+            dst_set: desc_set,
+            dst_binding: b as u32,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: i,
+            ..Default::default()
+        })
+        .collect();
+    // SAFETY: writes aponta para `infos`, vivo nesta frame.
+    unsafe { d.update_descriptor_sets(&writes, &[]) };
+
+    let cb_alloc = vk::CommandBufferAllocateInfo {
+        command_pool: dev.cmd_pool,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+        ..Default::default()
+    };
+    // SAFETY: device e pool válidos; cmd gravado e liberado aqui.
+    let out = unsafe {
+        let cmd = d.allocate_command_buffers(&cb_alloc)?[0];
+        d.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            },
+        )?;
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            pipe.layout,
+            0,
+            &[desc_set],
+            &[],
+        );
+        d.cmd_push_constants(
+            cmd,
+            pipe.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&push).cast::<u8>(),
+                size_of::<PushConstants>(),
+            ),
+        );
+        // 1 workgroup por linha de saída.
+        d.cmd_dispatch(cmd, push.n_out, 1, 1);
+        d.end_command_buffer(cmd)?;
+        let submit = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        d.queue_submit(dev.queue, &[submit], vk::Fence::null())?;
+        d.queue_wait_idle(dev.queue)?;
+        d.free_command_buffers(dev.cmd_pool, &[cmd]);
+
+        // Readback.
+        let read = create_buf(d, y_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        let read_mem = alloc_and_bind(ctx, phys, d, read, true)?;
+        one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, read, y_size)?;
+        let ptr = d.map_memory(read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
+        let mut v = vec![0f32; n_out];
+        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), n_out);
+        d.unmap_memory(read_mem);
+        d.destroy_buffer(read, None);
+        d.free_memory(read_mem, None);
+        d.destroy_descriptor_pool(desc_pool, None);
+        Ok(v)
+    };
+
+    unsafe {
+        // SAFETY: GPU ociosa após o readback; handles criados por nós.
+        pipe.destroy(d);
+        d.destroy_buffer(w_buf, None);
+        d.free_memory(w_mem, None);
+        d.destroy_buffer(x_buf, None);
+        d.free_memory(x_mem, None);
+        d.destroy_buffer(y_buf, None);
+        d.free_memory(y_mem, None);
+    }
+    out
+}

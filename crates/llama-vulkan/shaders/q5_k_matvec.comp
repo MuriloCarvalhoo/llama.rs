@@ -1,0 +1,104 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Matvec Q5_K: y[n_out] = W[n_out x n_in] * x[n_in], com W em superblocos Q5_K.
+//
+// Superbloco = 256 elementos em 176 bytes = 44 uints:
+//   uint 0      : d (f16 baixo) | dmin (f16 alto)
+//   uint 1..3   : scales[12] — 8 pares (escala, minimo) de 6 bits
+//   uint 4..11  : qh[32]     — o 5o bit de cada elemento
+//   uint 12..43 : qs[128]    — 4 bits baixos, dois elementos por byte
+//
+// Paralelizacao: o superbloco tem 8 sub-blocos de 32 elementos, cada um com escala e
+// minimo proprios — entao 8 lanes cobrem um superbloco e as 64 lanes do wave cobrem 8.
+// Cada lane acumula em f32 e o subgroupAdd fecha a linha.
+//
+// Diferente do caminho Q8_0, aqui a ativacao e lida em f32 direto: o ganho do dot
+// empacotado em int8 foi medido em ~0% neste kernel, e as escalas por sub-bloco do K-quant
+// tornariam o empacotamento bem mais complicado sem retorno.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint w[]; } weight_buf;
+layout(set = 0, binding = 1) readonly buffer ActBuf { float x[]; } act_buf;
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float y[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint row_offset; // vestigial (saida indexada por row absoluta)
+} pc;
+
+const uint WG = 64u;
+const uint UINTS_PER_SB = 44u;   // 176 bytes
+const uint SUB_PER_SB = 8u;      // 8 sub-blocos de 32 elementos
+const uint NUM_ROWS = 1u;
+
+// Byte `i` do superbloco, lido do array de uints.
+uint sb_byte(uint base_u, uint i) {
+    return (weight_buf.w[base_u + (i >> 2u)] >> (8u * (i & 3u))) & 0xFFu;
+}
+
+// Escala e minimo de 6 bits do sub-bloco `j` (0..7), do mesmo esquema do Q4_K.
+void scale_min(uint base_u, uint j, out uint sc, out uint m) {
+    // scales[] ocupa os bytes 4..15 do superbloco.
+    if (j < 4u) {
+        sc = sb_byte(base_u, 4u + j) & 63u;
+        m  = sb_byte(base_u, 4u + j + 4u) & 63u;
+    } else {
+        uint a = sb_byte(base_u, 4u + j + 4u);
+        uint b = sb_byte(base_u, 4u + j - 4u);
+        uint c = sb_byte(base_u, 4u + j);
+        sc = (a & 0xFu) | ((b >> 6u) << 4u);
+        m  = (a >> 4u)  | ((c >> 6u) << 4u);
+    }
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_out) { return; }
+
+    uint n_sb = pc.n_in / 256u;              // superblocos por linha
+    uint row_u = row * n_sb * UINTS_PER_SB;  // inicio da linha, em uints
+
+    uint sub_in_sb = lane & 7u;   // qual sub-bloco de 32
+    uint sb_in_grp = lane >> 3u;  // qual superbloco do grupo de 8
+
+    float acc = 0.0;
+    for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
+        uint sb = sb0 + sb_in_grp;
+        if (sb >= n_sb) { continue; }
+
+        uint base_u = row_u + sb * UINTS_PER_SB;
+        uint d_pack = weight_buf.w[base_u];
+        vec2 dm = unpackHalf2x16(d_pack);   // .x = d, .y = dmin
+
+        uint sc, m;
+        scale_min(base_u, sub_in_sb, sc, m);
+        float d1 = dm.x * float(sc);
+        float m1 = dm.y * float(m);
+
+        // O sub-bloco j cobre os elementos [j*32, j*32+32). Nos bytes de qs, os
+        // sub-blocos pares usam o nibble baixo e os impares o alto do mesmo byte,
+        // dentro de grupos de 64 elementos.
+        uint grp = sub_in_sb >> 1u;          // 0..3 — grupo de 64 elementos
+        bool hi_nibble = (sub_in_sb & 1u) != 0u;
+        uint qs_base = 48u + grp * 32u;      // qs[] comeca no byte 48 (apos d,dmin,scales,qh)
+        uint qh_mask = 1u << sub_in_sb;      // bit alto correspondente
+        uint x_base = sb * 256u + sub_in_sb * 32u;
+
+        for (uint l = 0u; l < 32u; l++) {
+            uint qb = sb_byte(base_u, qs_base + l);
+            uint q4 = hi_nibble ? (qb >> 4u) : (qb & 0xFu);
+            uint qh = sb_byte(base_u, 16u + l);  // qh[] comeca no byte 16
+            uint q = q4 + (((qh & qh_mask) != 0u) ? 16u : 0u);
+            acc += (d1 * float(q) - m1) * act_buf.x[x_base + l];
+        }
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        out_buf.y[row] = acc;
+    }
+}

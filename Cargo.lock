@@ -444,6 +444,7 @@ name = "llama-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ggml-cpu",
  "gguf",
  "half",
  "llama-model",

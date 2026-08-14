@@ -16,6 +16,8 @@ gguf = { workspace = true }
 llama-tokenizer = { workspace = true }
 llama-sampling = { workspace = true }
 rand = { workspace = true }
+ggml-cpu = { path = "../ggml-cpu" }
+half.workspace = true
 
 [build-dependencies]
 shaderc = "0.8"

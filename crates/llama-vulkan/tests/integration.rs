@@ -996,3 +996,65 @@ fn gpu_matvec_k_tiling_n_in_maior_que_uma_janela_lds() {
         );
     }
 }
+
+#[test]
+fn q5_k_matvec_gpu_bate_com_a_referencia_de_cpu() {
+    // O shader Q5_K desempacota os superblocos direto na GPU. A referência é o
+    // `ggml_cpu::dequant_to_f32` (validado contra o gguf-py do llama.cpp) seguido de um
+    // matmul f32 ingênuo — se a manipulação de bits do shader divergir, aparece aqui.
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let dev = llama_vulkan::VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    let n_in = 512usize; // 2 superblocos por linha
+    let n_out = 16usize;
+    let sb_per_row = n_in / 256;
+    // Bytes pseudoaleatórios mas determinísticos: cobre todos os nibbles, bits de qh e
+    // escalas de 6 bits. As escalas f16 (bytes 0..3 de cada superbloco) são fixadas em
+    // valores sãos para o resultado não estourar.
+    let mut w = vec![0u8; n_out * sb_per_row * 176];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (i.wrapping_mul(101).wrapping_add(i / 7) % 251) as u8;
+    }
+    for sb in 0..n_out * sb_per_row {
+        let o = sb * 176;
+        w[o..o + 2].copy_from_slice(&half::f16::from_f32(0.0123).to_le_bytes()); // d
+        w[o + 2..o + 4].copy_from_slice(&half::f16::from_f32(0.0045).to_le_bytes()); // dmin
+    }
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+        .collect();
+
+    let gpu = llama_vulkan::matmul::dispatch_q5_k_matvec(&ctx, &phys[0], &dev, &w, &x, n_in, n_out)
+        .expect("dispatch Q5_K");
+
+    // Referência: desquantiza cada linha e faz o produto interno em f32.
+    let row_bytes = sb_per_row * 176;
+    let mut cpu = vec![0f32; n_out];
+    for (r, out) in cpu.iter_mut().enumerate() {
+        let deq =
+            ggml_cpu::dequant_to_f32(&w[r * row_bytes..(r + 1) * row_bytes], gguf::GgmlType::Q5_K)
+                .expect("dequant");
+        *out = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+    }
+
+    let max_abs = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let max_rel = gpu
+        .iter()
+        .zip(&cpu)
+        .fold(0f32, |m, (&a, &b)| m.max((a - b).abs() / max_abs));
+    eprintln!("Q5_K matvec: erro relativo maximo = {max_rel:.3e}");
+    assert!(
+        max_rel < 1e-5,
+        "shader Q5_K divergiu da referencia de CPU (erro rel {max_rel})\ngpu={:?}\ncpu={:?}",
+        &gpu[..4],
+        &cpu[..4]
+    );
+}
