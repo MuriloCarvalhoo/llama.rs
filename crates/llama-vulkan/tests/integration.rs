@@ -289,12 +289,11 @@ fn forward_gpu_real_matches_f32_cpu_reference() {
     let w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
     let backend = llama_vulkan::DualGpuBackend::new(&ctx).expect("backend falhou");
 
-    // Referência CPU do MESMO algoritmo da GPU (ativações f32, sem quantização).
-    // Isola "a GPU computa o decode corretamente" de "quantização de ativação muda o
-    // argmax". A GPU (wave64 subgroupAdd) e esta referência (soma sequencial) diferem
-    // apenas na ordem de soma f32 (~1e-5) — o token decodificado deve ser idêntico.
-    struct CpuF32ActMatmul;
-    impl llama_model::GpuMatmul for CpuF32ActMatmul {
+    // Referência CPU do MESMO algoritmo da GPU, incluindo a quantização int8 da
+    // ativação que o shader faz. A GPU (wave64 subgroupAdd) e esta referência (soma
+    // sequencial) diferem só na ordem de soma f32 — o token deve ser idêntico.
+    struct CpuInt8ActMatmul;
+    impl llama_model::GpuMatmul for CpuInt8ActMatmul {
         fn matvec_q8_0(
             &self,
             w_bytes: &[u8],
@@ -302,29 +301,68 @@ fn forward_gpu_real_matches_f32_cpu_reference() {
             n_in: usize,
             n_out: usize,
         ) -> Result<Vec<f32>, llama_model::ModelError> {
-            Ok(cpu_ref_q8_0_f32act(w_bytes, x, n_in, n_out))
+            Ok(cpu_ref_q8_0_int8act(w_bytes, x, n_in, n_out))
         }
     }
 
     let prompt = [cfg.bos_id];
     let gpu_tok = model.decode_one_gpu_owned(&prompt, &backend, &w).unwrap();
     let ref_tok = model
-        .decode_one_gpu_owned(&prompt, &CpuF32ActMatmul, &w)
+        .decode_one_gpu_owned(&prompt, &CpuInt8ActMatmul, &w)
         .unwrap();
     // Token do caminho CPU quantizado (ativações Q8_0) — informativo: pode diferir, pois
     // é uma aproximação distinta (mais perdas) que a via f32 da GPU.
     let cpu_quant_tok = model.decode_one_cpu_owned(&prompt).unwrap();
 
     eprintln!(
-        "Forward GPU real: gpu_tok={gpu_tok} ref_f32_tok={ref_tok} cpu_quant_tok={cpu_quant_tok}"
+        "Forward GPU real: gpu_tok={gpu_tok} ref_int8_tok={ref_tok} cpu_quant_tok={cpu_quant_tok}"
     );
     assert_eq!(
         gpu_tok, ref_tok,
-        "GPU deve igualar a referência CPU do mesmo algoritmo (ativações f32)"
+        "GPU deve igualar a referência CPU do mesmo algoritmo (ativação int8)"
     );
 }
 
-// Referência CPU do matvec Q8_0 com ativações f32 (mesmo algoritmo do shader GPU).
+/// Referência CPU que espelha **o que o shader realmente computa**: a ativação é
+/// quantizada para int8 simétrico por bloco de 32 (como em `q8_0_matvec.comp`), e o
+/// produto interno é feito em inteiros. Difere de `cpu_ref_q8_0_f32act` (ativação f32)
+/// por ~0.14% — diferença suficiente para virar o argmax em logits quase degenerados,
+/// por isso os testes de igualdade de token usam esta referência, não a f32.
+fn cpu_ref_q8_0_int8act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
+    let n_blocks = n_in / 32;
+    let row_bytes = n_blocks * 34;
+
+    // Quantização da ativação: uma vez por matvec, compartilhada por todas as linhas.
+    let mut xq = vec![0i32; n_in];
+    let mut xd = vec![0f32; n_blocks];
+    for b in 0..n_blocks {
+        let blk = &x[b * 32..b * 32 + 32];
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d_x = amax / 127.0;
+        let inv = if d_x > 0.0 { 1.0 / d_x } else { 0.0 };
+        xd[b] = d_x;
+        for i in 0..32 {
+            xq[b * 32 + i] = (blk[i] * inv).round().clamp(-127.0, 127.0) as i32;
+        }
+    }
+
+    let mut y = vec![0f32; n_out];
+    for row in 0..n_out {
+        let mut acc = 0f32;
+        for b in 0..n_blocks {
+            let off = row * row_bytes + b * 34;
+            let d_w = half::f16::from_le_bytes([w[off], w[off + 1]]).to_f32();
+            let mut isum = 0i32;
+            for i in 0..32 {
+                isum += i32::from(w[off + 2 + i] as i8) * xq[b * 32 + i];
+            }
+            acc += d_w * xd[b] * isum as f32;
+        }
+        y[row] = acc;
+    }
+    y
+}
+
 fn cpu_ref_q8_0_f32act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
     let n_blocks = n_in / 32;
     let row_bytes = n_blocks * 34;
@@ -490,10 +528,11 @@ fn resident_gpu_decode_matches_cpu_ref() {
     let w = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
     let backend = llama_vulkan::ResidentGpu::new(&ctx).expect("ResidentGpu falhou");
 
-    // Mesma referência CPU-f32 usada pelo teste dual: isola "GPU computa correto"
-    // de "quantização de ativação muda o argmax". O token deve ser idêntico.
-    struct CpuF32ActMatmul;
-    impl llama_model::GpuMatmul for CpuF32ActMatmul {
+    // Referência com a MESMA matemática do shader (ativação quantizada em int8).
+    // Usar a referência de ativação f32 aqui compararia contra um kernel diferente
+    // do que roda na GPU desde a quantização int8 da ativação.
+    struct CpuInt8ActMatmul;
+    impl llama_model::GpuMatmul for CpuInt8ActMatmul {
         fn matvec_q8_0(
             &self,
             w_bytes: &[u8],
@@ -501,19 +540,19 @@ fn resident_gpu_decode_matches_cpu_ref() {
             n_in: usize,
             n_out: usize,
         ) -> Result<Vec<f32>, llama_model::ModelError> {
-            Ok(cpu_ref_q8_0_f32act(w_bytes, x, n_in, n_out))
+            Ok(cpu_ref_q8_0_int8act(w_bytes, x, n_in, n_out))
         }
     }
 
     let prompt = [cfg.bos_id];
     let gpu_tok = model.decode_one_gpu_owned(&prompt, &backend, &w).unwrap();
     let ref_tok = model
-        .decode_one_gpu_owned(&prompt, &CpuF32ActMatmul, &w)
+        .decode_one_gpu_owned(&prompt, &CpuInt8ActMatmul, &w)
         .unwrap();
-    eprintln!("ResidentGpu decode: gpu_tok={gpu_tok} ref_f32_tok={ref_tok}");
+    eprintln!("ResidentGpu decode: gpu_tok={gpu_tok} ref_int8_tok={ref_tok}");
     assert_eq!(
         gpu_tok, ref_tok,
-        "ResidentGpu deve igualar a referência f32 (mesmo shader q8_0_matvec)"
+        "ResidentGpu deve igualar a referência int8 (mesma matemática do shader)"
     );
 }
 
@@ -896,4 +935,64 @@ fn resident_matvec_int8_logits_dentro_da_tolerancia() {
         "erro relativo máximo {max_rel} deve ser < 0.05 (5%)"
     );
     assert_eq!(argmax_cpu, argmax_gpu, "argmax CPU == GPU");
+}
+
+#[test]
+fn gpu_matvec_k_tiling_n_in_maior_que_uma_janela_lds() {
+    // O shader cacheia a ativação quantizada em LDS numa janela de MAX_BLOCKS=160
+    // blocos (n_in <= 5120) e faz tiling da dimensão K acima disso. Nenhum modelo de
+    // teste local exercita n_in > 5120 (o 0.5B tem n_ff=4864), mas o 14B tem
+    // n_ff=13824 (432 blocos = 3 janelas). Este teste cobre o caminho multi-janela.
+    use llama_model::GpuMatmul;
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let backend = llama_vulkan::ResidentGpu::new(&ctx).expect("ResidentGpu");
+
+    // 1 janela (n_in=4864), exatamente na borda (5120) e 3 janelas (13824 = n_ff do 14B).
+    // Os pesos de todos os casos são criados ANTES do loop e mantidos vivos: o
+    // `ResidentGpu` indexa o cache de peso pelo endereço do slice, e Vecs criados e
+    // dropados em sequência podem reusar o mesmo endereço (cache hit falso).
+    let n_out = 64usize;
+    let casos: Vec<(usize, Vec<u8>, Vec<f32>)> = [4864usize, 5120, 13824]
+        .iter()
+        .map(|&n_in| {
+            let n_blocks = n_in / 32;
+            let w: Vec<u8> = (0..n_out * n_blocks * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00, // escala f16 = 1.0 -> bytes [0x00, 0x3c]
+                    1 => 0x3c,
+                    _ => (i.wrapping_mul(37) % 251) as u8,
+                })
+                .collect();
+            let x: Vec<f32> = (0..n_in).map(|i| ((i % 23) as f32 - 11.0) * 0.03).collect();
+            (n_in, w, x)
+        })
+        .collect();
+
+    for (n_in, w, x) in &casos {
+        let (n_in, n_blocks) = (*n_in, n_in / 32);
+        let gpu = backend.matvec_q8_0(w, x, n_in, n_out).expect("matvec GPU");
+        let cpu = cpu_ref_q8_0_int8act(w, x, n_in, n_out);
+
+        let max_abs = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
+        let max_rel = gpu
+            .iter()
+            .zip(&cpu)
+            .fold(0f32, |m, (&a, &b)| m.max((a - b).abs() / max_abs));
+        eprintln!(
+            "k-tiling n_in={n_in} ({n_blocks} blocos, {} janelas): erro rel max = {max_rel:.6}",
+            n_blocks.div_ceil(160)
+        );
+        // Só a ordem de soma f32 difere (lane-strided + subgroupAdd vs sequencial).
+        assert!(
+            max_rel < 1e-4,
+            "n_in={n_in}: GPU divergiu da referência int8 (erro rel {max_rel})"
+        );
+    }
 }
