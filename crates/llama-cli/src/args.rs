@@ -60,4 +60,9 @@ pub struct Args {
     /// Backend Vulkan com decode 100% na GPU (Fase 1C). Requer feature "gpu".
     #[arg(long = "gpu-resident", default_value_t = false)]
     pub gpu_resident: bool,
+
+    /// Layer-split: divide as camadas entre as GPUs proporcionalmente à VRAM livre.
+    /// Para modelos que não cabem numa GPU só. Requer feature "gpu".
+    #[arg(long = "gpu-layer-split", default_value_t = false)]
+    pub gpu_layer_split: bool,
 }

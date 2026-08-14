@@ -70,6 +70,47 @@ impl Buf {
     }
 }
 
+/// Faixa de camadas que uma GPU executa no layer-split, e o papel dela no pipeline.
+///
+/// Layer-split divide o modelo por **camadas** entre as GPUs: a GPU do primeiro shard roda
+/// `0..split`, a do segundo roda `split..n_layer`. Entre elas passa apenas a stream residual
+/// (`n_embd` floats), uma vez por token — contra as 96 sincronizacoes/token que o
+/// tensor-parallel exigiria. É o que torna executáveis modelos que não cabem numa GPU.
+#[derive(Clone, Copy, Debug)]
+pub struct Shard {
+    /// Índice do device Vulkan (posição em `amd_compute_devices`).
+    pub device: usize,
+    /// Primeira camada global deste shard.
+    pub first_layer: usize,
+    /// Uma além da última camada global deste shard.
+    pub end_layer: usize,
+    /// Total de camadas do modelo (para saber se este shard é o último).
+    pub n_layer_total: usize,
+}
+
+impl Shard {
+    /// Shard único cobrindo o modelo inteiro (caminho single-GPU).
+    pub fn whole(device: usize, n_layer: usize) -> Self {
+        Self {
+            device,
+            first_layer: 0,
+            end_layer: n_layer,
+            n_layer_total: n_layer,
+        }
+    }
+    /// Faz o embedding lookup (só o primeiro shard).
+    pub fn is_first(&self) -> bool {
+        self.first_layer == 0
+    }
+    /// Faz a norma final e a projeção de logits (só o último shard).
+    pub fn is_last(&self) -> bool {
+        self.end_layer == self.n_layer_total
+    }
+    pub fn n_layers(&self) -> usize {
+        self.end_layer - self.first_layer
+    }
+}
+
 /// Escalares de arquitetura necessários ao decode.
 pub(crate) struct Cfg {
     pub n_embd: usize,
@@ -83,6 +124,8 @@ pub(crate) struct Cfg {
     pub vocab: usize,
     pub ctx: usize,
     pub rms_eps: f32,
+    /// Faixa de camadas deste shard. `n_layer` acima é a contagem LOCAL.
+    pub shard: Shard,
 }
 
 /// Pesos Q8_0 residentes de uma camada.
@@ -381,16 +424,14 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Constrói só device + pipelines + descriptor pool (sem pesos/buffers). Para micro-testes.
-    pub fn new_pipelines_only(ctx: &'ctx VulkanContext) -> Result<Self, MatmulError> {
+    /// Índice do device com mais VRAM livre; `LLAMA_RS_GPU` força um valor.
+    ///
+    /// A GPU que roda o display já tem ~1.6 GB ocupados, e num modelo que quase enche a
+    /// VRAM o driver realoca o excedente em GTT (memória do host, via PCIe): medimos
+    /// 95 GB/s no matvec do 14B na GPU do display contra 714 GB/s na outra.
+    pub fn pick_device(ctx: &VulkanContext) -> usize {
         let phys = ctx.amd_compute_devices();
-        if phys.is_empty() {
-            return Err(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
-        }
-        // Escolhe a GPU com mais VRAM livre; LLAMA_RS_GPU força um índice.
-        // A GPU que roda o display já tem ~1.6 GB ocupados, e num modelo que quase enche
-        // a VRAM o driver realoca o excedente em GTT (memória do host, via PCIe): medimos
-        // 95 GB/s no matvec do 14B na GPU do display contra 714 GB/s na outra.
-        let idx = std::env::var("LLAMA_RS_GPU")
+        std::env::var("LLAMA_RS_GPU")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|i| *i < phys.len())
@@ -401,7 +442,21 @@ impl<'ctx> ResidentForward<'ctx> {
                     .max_by_key(|&(_, f)| f)
                     .map(|(i, _)| i)
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    pub fn new_pipelines_only(ctx: &'ctx VulkanContext) -> Result<Self, MatmulError> {
+        Self::new_pipelines_only_on(ctx, Self::pick_device(ctx))
+    }
+
+    pub fn new_pipelines_only_on(
+        ctx: &'ctx VulkanContext,
+        idx: usize,
+    ) -> Result<Self, MatmulError> {
+        let phys = ctx.amd_compute_devices();
+        if phys.is_empty() {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
         let dev = VulkanDevice::create(ctx, &phys[idx])?;
         let d = &dev.device;
         let matvec = ComputePipeline::new(d)?;
@@ -447,11 +502,25 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Constrói o backend GPU-resident: sobe todos os pesos (Q8_0 + aux f32) e aloca
     /// as ativações e o KV-cache em VRAM. Após retornar, `raw`/`aux` podem ser descartados.
+    /// Backend cobrindo o modelo inteiro numa GPU (escolhida por VRAM livre).
     pub fn new(
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
         aux: &GpuAuxWeights<'_>,
+    ) -> Result<Self, MatmulError> {
+        let dev = Self::pick_device(ctx);
+        Self::new_shard(ctx, config, raw, aux, Shard::whole(dev, config.n_layer))
+    }
+
+    /// Backend cobrindo apenas `shard.first_layer..shard.end_layer`, no device do shard.
+    /// Só o primeiro shard faz embedding; só o último faz a norma final e os logits.
+    pub fn new_shard(
+        ctx: &'ctx VulkanContext,
+        config: &LlamaConfig,
+        raw: &GpuRawWeights,
+        aux: &GpuAuxWeights<'_>,
+        shard: Shard,
     ) -> Result<Self, MatmulError> {
         if config.head_dim > 256 {
             // Shader de attention distribui head_dim entre 64 lanes com no máximo
@@ -460,7 +529,7 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         // O matvec faz tiling da dimensão K em janelas de MATVEC_MAX_BLOCKS blocos,
         // então n_in é livre. (Antes havia um limite de n_in <= MATVEC_MAX_BLOCKS*32.)
-        let mut me = Self::new_pipelines_only(ctx)?;
+        let mut me = Self::new_pipelines_only_on(ctx, shard.device)?;
         let kv_dim = config.n_head_kv * config.head_dim;
 
         // Bloco que constrói todo o estado residente emprestando `me` imutavelmente;
@@ -473,7 +542,7 @@ impl<'ctx> ResidentForward<'ctx> {
 
             let cfg = Cfg {
                 n_embd: config.n_embd,
-                n_layer: config.n_layer,
+                n_layer: shard.n_layers(),
                 n_head: config.n_head,
                 n_head_kv: config.n_head_kv,
                 head_dim: config.head_dim,
@@ -483,6 +552,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 vocab: config.vocab,
                 ctx: config.ctx,
                 rms_eps: config.rms_eps,
+                shard,
             };
 
             let up_q =
@@ -491,7 +561,7 @@ impl<'ctx> ResidentForward<'ctx> {
                         .map_err(MatmulError::from)
                 };
             let mut qw = Vec::with_capacity(cfg.n_layer);
-            for lw in &raw.layers {
+            for lw in &raw.layers[shard.first_layer..shard.end_layer] {
                 qw.push(LayerQ {
                     attn_q: up_q(&lw.attn_q, cfg.n_embd, cfg.n_embd)?,
                     attn_k: up_q(&lw.attn_k, cfg.n_embd, kv_dim)?,
@@ -538,7 +608,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
             };
             let mut aux_buf = Vec::with_capacity(cfg.n_layer);
-            for al in &aux.layers {
+            for al in &aux.layers[shard.first_layer..shard.end_layer] {
                 aux_buf.push(LayerAux {
                     attn_norm: mk(&al.attn_norm)?,
                     ffn_norm: mk(&al.ffn_norm)?,
@@ -580,7 +650,13 @@ impl<'ctx> ResidentForward<'ctx> {
                 aux: aux_buf,
                 output_norm_buf,
                 freq_buf,
-                token_embd: aux.token_embd.to_vec(),
+                // Só o primeiro shard faz o embedding lookup; nos demais a tabela seria
+                // 3.1 GB de RAM sem uso (14B) — o suficiente para matar o processo por OOM.
+                token_embd: if shard.is_first() {
+                    aux.token_embd.to_vec()
+                } else {
+                    Vec::new()
+                },
                 embd_stage,
                 kcache,
                 vcache,
@@ -597,7 +673,17 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_logits: nf(config.vocab)?,
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
-                logits_host: Buf::host(ctx, phys, d, (config.vocab * 4) as vk::DeviceSize)?,
+                // Saída deste shard: logits no último, stream residual nos demais.
+                logits_host: Buf::host(
+                    ctx,
+                    phys,
+                    d,
+                    (if shard.is_last() {
+                        config.vocab
+                    } else {
+                        config.n_embd
+                    } * 4) as vk::DeviceSize,
+                )?,
                 len: RefCell::new(0),
                 plan: Vec::new(),
                 token_cmd,
@@ -937,7 +1023,7 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Grava a stack inteira do token em `cmd` (já em `begin`). Push/offsets dependem de token/pos.
-    fn record_token(&self, cmd: vk::CommandBuffer, token: u32, pos: usize) {
+    fn record_token(&self, cmd: vk::CommandBuffer, token: u32, pos: usize, x_in: Option<&[f32]>) {
         let d = &self.dev.device;
         let st = self
             .state
@@ -959,10 +1045,12 @@ impl<'ctx> ResidentForward<'ctx> {
         for (op_idx, op) in st.plan.iter().enumerate() {
             match op {
                 PlannedOp::Embed => {
-                    // Copia a linha do token da tabela host para o staging e daí para b_x.
+                    // Fonte: a linha do token (primeiro shard) ou a stream residual que
+                    // veio da GPU anterior. Vai para `embd_stage` e daí para b_x.
                     let row = token as usize * c.n_embd;
                     let bytes = (c.n_embd * 4) as vk::DeviceSize;
-                    if let Some(src) = st.token_embd.get(row..row + c.n_embd) {
+                    let from_table = st.token_embd.get(row..row + c.n_embd);
+                    if let Some(src) = x_in.or(from_table) {
                         // SAFETY: embd_stage é host-visible/coherent com `bytes`;
                         // o ponteiro é válido até unmap e a cópia respeita n_embd floats.
                         unsafe {
@@ -1091,16 +1179,22 @@ impl<'ctx> ResidentForward<'ctx> {
             }
         }
 
-        // Logits para o staging host-visible no mesmo command buffer (o full_barrier da
-        // ultima op ja ordena a escrita de b_logits antes desta copia).
+        // Saída deste shard para o staging host-visible, no mesmo command buffer (o
+        // full_barrier da última op já ordena a escrita antes desta cópia). O último shard
+        // entrega logits; os demais entregam a stream residual, que segue para a próxima GPU.
+        let (src, n_out) = if c.shard.is_last() {
+            (&st.b_logits, c.vocab)
+        } else {
+            (&st.b_x, c.n_embd)
+        };
         let region = vk::BufferCopy {
             src_offset: 0,
             dst_offset: 0,
-            size: (c.vocab * 4) as vk::DeviceSize,
+            size: (n_out * 4) as vk::DeviceSize,
         };
         // SAFETY: cmd em gravação; ambos os buffers vivem no state.
         unsafe {
-            d.cmd_copy_buffer(cmd, st.b_logits.buffer, st.logits_host.buffer, &[region]);
+            d.cmd_copy_buffer(cmd, src.buffer, st.logits_host.buffer, &[region]);
         }
     }
 
@@ -1208,6 +1302,9 @@ impl<'ctx> ResidentForward<'ctx> {
 
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
 
+        // Presente em todos os shards: no primeiro copia a linha do token da tabela de
+        // embedding; nos demais copia a stream residual vinda da GPU anterior. Nos dois
+        // casos o host escreve em `embd_stage` e a cópia entra no command buffer do token.
         plan.push(PlannedOp::Embed);
 
         for l in 0..c.n_layer {
@@ -1442,37 +1539,39 @@ impl<'ctx> ResidentForward<'ctx> {
             )?);
         }
 
-        plan.push(mk(
-            PipeId::Rmsnorm,
-            &[
-                (st.b_x.buffer, 0, nb(c.n_embd)),
-                (st.output_norm_buf.buffer, 0, st.output_norm_buf.size),
-                (st.b_normed.buffer, 0, nb(c.n_embd)),
-            ],
-            1,
-            PushSpec::Static(rms_push()),
-        )?);
-        plan.push(mk(
-            PipeId::QuantizeX,
-            &[
-                (st.b_normed.buffer, 0, nb(c.n_embd)),
-                (st.b_xq.buffer, 0, st.b_xq.size),
-                (st.b_xd.buffer, 0, st.b_xd.size),
-            ],
-            qx_groups(c.n_embd),
-            PushSpec::Static(qx_push(c.n_embd)),
-        )?);
-        plan.push(mk(
-            PipeId::Matvec,
-            &[
-                (st.output_w.buffer, 0, st.output_w.size_bytes),
-                (st.b_xq.buffer, 0, st.b_xq.size),
-                (st.b_xd.buffer, 0, st.b_xd.size),
-                (st.b_logits.buffer, 0, nb(c.vocab)),
-            ],
-            mv_groups(c.vocab),
-            PushSpec::Static(mv_push(c.n_embd, c.vocab)),
-        )?);
+        if c.shard.is_last() {
+            plan.push(mk(
+                PipeId::Rmsnorm,
+                &[
+                    (st.b_x.buffer, 0, nb(c.n_embd)),
+                    (st.output_norm_buf.buffer, 0, st.output_norm_buf.size),
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                ],
+                1,
+                PushSpec::Static(rms_push()),
+            )?);
+            plan.push(mk(
+                PipeId::QuantizeX,
+                &[
+                    (st.b_normed.buffer, 0, nb(c.n_embd)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                qx_groups(c.n_embd),
+                PushSpec::Static(qx_push(c.n_embd)),
+            )?);
+            plan.push(mk(
+                PipeId::Matvec,
+                &[
+                    (st.output_w.buffer, 0, st.output_w.size_bytes),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                    (st.b_logits.buffer, 0, nb(c.vocab)),
+                ],
+                mv_groups(c.vocab),
+                PushSpec::Static(mv_push(c.n_embd, c.vocab)),
+            )?);
+        }
 
         Ok(plan)
     }
@@ -1556,8 +1655,43 @@ impl<'ctx> ResidentForward<'ctx> {
         eprintln!("{:<12} {:>10.3}", "leitura", ms(h[2]));
     }
 
+    /// Executa este shard para um token. `x_in` é a stream residual vinda do shard
+    /// anterior (`None` no primeiro, que faz o embedding lookup). Retorna os logits no
+    /// último shard, ou a stream residual a repassar nos demais.
+    pub fn decode_shard(
+        &self,
+        token: u32,
+        pos: usize,
+        x_in: Option<&[f32]>,
+    ) -> Result<Vec<f32>, MatmulError> {
+        let out = self.record_and_submit(token, pos, x_in)?;
+        if let Some(st) = self.state.as_ref() {
+            *st.len.borrow_mut() = pos + 1;
+        }
+        Ok(out)
+    }
+
+    /// Faixa de camadas e papel deste backend.
+    pub fn shard(&self) -> Shard {
+        self.state
+            .as_ref()
+            .map_or(Shard::whole(0, 0), |st| st.cfg.shard)
+    }
+
+    /// Zera o comprimento do KV-cache (início de nova sequência).
+    pub fn reset_len(&self) {
+        if let Some(st) = self.state.as_ref() {
+            *st.len.borrow_mut() = 0;
+        }
+    }
+
     /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
-    fn record_and_submit(&self, token: u32, pos: usize) -> Result<Vec<f32>, MatmulError> {
+    fn record_and_submit(
+        &self,
+        token: u32,
+        pos: usize,
+        x_in: Option<&[f32]>,
+    ) -> Result<Vec<f32>, MatmulError> {
         let st = self
             .state
             .as_ref()
@@ -1576,7 +1710,7 @@ impl<'ctx> ResidentForward<'ctx> {
             d.begin_command_buffer(cmd, &begin)?;
         }
         let t0 = std::time::Instant::now();
-        self.record_token(cmd, token, pos);
+        self.record_token(cmd, token, pos, x_in);
         // SAFETY: cmd em gravação.
         unsafe {
             d.end_command_buffer(cmd)?;
@@ -1599,7 +1733,11 @@ impl<'ctx> ResidentForward<'ctx> {
         let t2 = std::time::Instant::now();
         self.collect_prof(st)?;
 
-        let len = st.cfg.vocab;
+        let len = if st.cfg.shard.is_last() {
+            st.cfg.vocab
+        } else {
+            st.cfg.n_embd
+        };
         let bytes = (len * 4) as vk::DeviceSize;
         // SAFETY: logits_host é host-coherent com `bytes` e a copia ja terminou (fence
         // aguardado acima); ptr válido até unmap.
@@ -1623,7 +1761,7 @@ impl<'ctx> ResidentForward<'ctx> {
 impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, llama_model::ModelError> {
         let logits = self
-            .record_and_submit(token, pos)
+            .record_and_submit(token, pos, None)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = pos + 1;
