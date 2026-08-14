@@ -14,9 +14,6 @@ use std::cell::RefCell;
 pub(crate) const MATVEC_NUM_ROWS: u32 = 2;
 /// local_size_x do matvec (wave64 no MI50).
 pub(crate) const MATVEC_WG: u32 = 64;
-/// Máximo de blocos Q8_0 (n_in/32) que o shader matvec cacheia em LDS (`MAX_BLOCKS` em
-/// q8_0_matvec.comp). n_in > MATVEC_MAX_BLOCKS*32 escreveria OOB no LDS → rejeitado em `new`.
-pub(crate) const MATVEC_MAX_BLOCKS: usize = 160;
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
@@ -152,7 +149,11 @@ pub(crate) struct ResidentState {
     pub aux: Vec<LayerAux>,
     pub output_norm_buf: Buf,
     pub freq_buf: Buf,
-    pub token_embd_buf: Buf,
+    /// Tabela de embedding f32 no host. Manter em VRAM custaria vocab*n_embd*4
+    /// (3.1 GB no 14B) para ler **uma** linha por token; a linha (n_embd f32,
+    /// ~20 KB) sobe por `embd_stage` a cada passo, ao custo de poucos µs.
+    pub token_embd: Vec<f32>,
+    pub embd_stage: Buf,
     pub kcache: Buf,
     pub vcache: Buf,
     pub b_x: Buf,
@@ -391,15 +392,13 @@ impl<'ctx> ResidentForward<'ctx> {
         raw: &GpuRawWeights,
         aux: &GpuAuxWeights<'_>,
     ) -> Result<Self, MatmulError> {
-        if config.head_dim > 64 {
-            // Shader de attention assume head_dim <= subgroup (64).
+        if config.head_dim > 256 {
+            // Shader de attention distribui head_dim entre 64 lanes com no máximo
+            // MAX_DPL=4 dimensões por lane.
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
-        // O matvec quantiza x (n_in floats) em LDS dimensionado por MATVEC_MAX_BLOCKS.
-        // n_in > MATVEC_MAX_BLOCKS*32 (maior matvec = max(n_embd, n_ff)) causaria OOB no LDS.
-        if config.n_embd.max(config.n_ff).div_ceil(32) > MATVEC_MAX_BLOCKS {
-            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
-        }
+        // O matvec faz tiling da dimensão K em janelas de MATVEC_MAX_BLOCKS blocos,
+        // então n_in é livre. (Antes havia um limite de n_in <= MATVEC_MAX_BLOCKS*32.)
         let mut me = Self::new_pipelines_only(ctx)?;
         let kv_dim = config.n_head_kv * config.head_dim;
 
@@ -489,7 +488,7 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             let output_norm_buf = mk(&aux.output_norm)?;
             let freq_buf = mk(&aux.freq_table)?;
-            let token_embd_buf = mk(aux.token_embd)?;
+            let embd_stage = Buf::host(ctx, phys, d, (config.n_embd * 4) as vk::DeviceSize)?;
 
             let kv_elems = (cfg.n_layer * cfg.ctx * kv_dim) as vk::DeviceSize;
             let kcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
@@ -520,7 +519,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 aux: aux_buf,
                 output_norm_buf,
                 freq_buf,
-                token_embd_buf,
+                token_embd: aux.token_embd.to_vec(),
+                embd_stage,
                 kcache,
                 vcache,
                 b_x: nf(config.n_embd)?,
@@ -857,14 +857,36 @@ impl<'ctx> ResidentForward<'ctx> {
         for op in &st.plan {
             match op {
                 PlannedOp::Embed => {
+                    // Copia a linha do token da tabela host para o staging e daí para b_x.
+                    let row = token as usize * c.n_embd;
+                    let bytes = (c.n_embd * 4) as vk::DeviceSize;
+                    if let Some(src) = st.token_embd.get(row..row + c.n_embd) {
+                        // SAFETY: embd_stage é host-visible/coherent com `bytes`;
+                        // o ponteiro é válido até unmap e a cópia respeita n_embd floats.
+                        unsafe {
+                            if let Ok(ptr) = d.map_memory(
+                                st.embd_stage.mem,
+                                0,
+                                bytes,
+                                vk::MemoryMapFlags::empty(),
+                            ) {
+                                std::ptr::copy_nonoverlapping(
+                                    src.as_ptr(),
+                                    ptr as *mut f32,
+                                    c.n_embd,
+                                );
+                                d.unmap_memory(st.embd_stage.mem);
+                            }
+                        }
+                    }
                     let region = vk::BufferCopy {
-                        src_offset: (token as usize * c.n_embd * 4) as vk::DeviceSize,
+                        src_offset: 0,
                         dst_offset: 0,
-                        size: (c.n_embd * 4) as vk::DeviceSize,
+                        size: bytes,
                     };
                     // SAFETY: cmd em gravação; buffers vivos; offsets dentro do tamanho.
                     unsafe {
-                        d.cmd_copy_buffer(cmd, st.token_embd_buf.buffer, st.b_x.buffer, &[region]);
+                        d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
                     }
                     self.full_barrier(cmd);
                 }
@@ -1357,7 +1379,7 @@ impl Drop for ResidentForward<'_> {
             for b in [
                 &st.output_norm_buf,
                 &st.freq_buf,
-                &st.token_embd_buf,
+                &st.embd_stage,
                 &st.kcache,
                 &st.vcache,
                 &st.b_x,

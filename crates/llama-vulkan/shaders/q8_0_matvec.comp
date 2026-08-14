@@ -23,8 +23,10 @@ layout(push_constant) uniform PC {
 } pc;
 
 // Ativacao x quantizada int8 simetrica por bloco, reutilizada por todas as
-// NUM_ROWS linhas deste workgroup. Dimensionada para o maior matvec do 0.5B
-// (n_ff=4864 -> n_blocks=152), com pequena margem -> 160 blocos.
+// NUM_ROWS linhas deste workgroup. O LDS cobre uma JANELA de MAX_BLOCKS blocos;
+// n_in maior que isso e processado em varias janelas (tiling da dimensao K),
+// o que permite n_in arbitrario sem crescer o LDS. Ex.: o 14B tem n_ff=13824
+// (432 blocos) -> 3 janelas de 160.
 // Footprint: sxq = 160*8*4 = 5120 B, sxd = 160*4 = 640 B  => ~5.6 KB de LDS,
 // bem abaixo dos ~20 KB que derrubaram a ocupacao na Task 3.
 const uint MAX_BLOCKS = 160u;
@@ -37,58 +39,80 @@ void main() {
     uint n_blocks = pc.n_in / 32u;
     uint row_stride = n_blocks * 9u; // uints por linha de peso (9 uints/bloco)
 
-    // --- Quantizacao cooperativa de x em int8 simetrico, uma vez por workgroup ---
-    // Cada lane processa blocos lane-strided. Para o bloco blk: amax sobre 32
-    // elementos, d_x = amax/127, e empacota 4 quantizados por int (little-endian
-    // de bytes: o byte j vai para o lane 8*j -> bit pattern i8 em complemento de 2).
-    for (uint blk = lane; blk < n_blocks; blk += WG) {
-        uint base = blk * 32u;
-        float amax = 0.0;
-        for (uint i = 0u; i < 32u; i++) {
-            amax = max(amax, abs(act_buf.x[base + i]));
-        }
-        float d_x = amax / 127.0;
-        float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
-        sxd[blk] = d_x;
-        for (uint g = 0u; g < 8u; g++) {
-            int packed = 0;
-            for (uint j = 0u; j < 4u; j++) {
-                int q = int(round(act_buf.x[base + g * 4u + j] * inv));
-                q = clamp(q, -127, 127);
-                packed |= (q & 0xff) << (8u * j);
+    // Acumulador por linha, vivo entre as janelas de K.
+    float acc[NUM_ROWS];
+    for (uint r = 0u; r < NUM_ROWS; r++) { acc[r] = 0.0; }
+
+    // --- Tiling da dimensao K: uma janela de ate MAX_BLOCKS blocos por vez ---
+    // `win` nao depende de lane, entao todo o workgroup faz o mesmo numero de
+    // iteracoes e os barriers abaixo sao uniformes.
+    for (uint win = 0u; win < n_blocks; win += MAX_BLOCKS) {
+        uint win_end = min(win + MAX_BLOCKS, n_blocks);
+
+        // Espera as leituras do LDS da janela anterior antes de sobrescrever.
+        barrier();
+
+        // --- Quantizacao cooperativa de x em int8 simetrico, uma vez por janela ---
+        // Cada lane processa blocos lane-strided. Para o bloco blk: amax sobre 32
+        // elementos, d_x = amax/127, e empacota 4 quantizados por int (little-endian
+        // de bytes: o byte j vai para o lane 8*j -> bit pattern i8 em complemento de 2).
+        for (uint blk = win + lane; blk < win_end; blk += WG) {
+            uint base = blk * 32u;
+            uint s = blk - win; // indice dentro da janela
+            float amax = 0.0;
+            for (uint i = 0u; i < 32u; i++) {
+                amax = max(amax, abs(act_buf.x[base + i]));
             }
-            sxq[blk * 8u + g] = packed;
+            float d_x = amax / 127.0;
+            float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+            sxd[s] = d_x;
+            for (uint g = 0u; g < 8u; g++) {
+                int packed = 0;
+                for (uint j = 0u; j < 4u; j++) {
+                    int q = int(round(act_buf.x[base + g * 4u + j] * inv));
+                    q = clamp(q, -127, 127);
+                    packed |= (q & 0xff) << (8u * j);
+                }
+                sxq[s * 8u + g] = packed;
+            }
+        }
+        barrier();
+
+        // Cada linha mantem a mesma ordem de acumulacao do kernel original
+        // (lane-strided sobre blocos). Com n_blocks <= MAX_BLOCKS ha uma unica
+        // janela e a ordem e bit-identica a versao anterior.
+        for (uint r = 0u; r < NUM_ROWS; r++) {
+            uint row = base_row + r;
+            // `row` cresce monotonicamente com r; uma vez fora do range, todas as linhas
+            // seguintes deste workgroup tambem estao -> break (nao continue) e correto e evita
+            // iteracoes inuteis. `row` independe de lane, logo o break e uniforme no subgroup.
+            if (row >= pc.n_out) { break; }
+            uint roff = row * row_stride;
+            for (uint b = win + lane; b < win_end; b += WG) {
+                uint boff = roff + b * 9u;
+                uint s = b - win;
+                // uint[boff] = scale f16 nos 16 bits baixos (pad nos altos, ignorado).
+                float d_w = unpackHalf2x16(weight_buf.w[boff]).x;
+                // Soma dos 32 produtos i8(peso) * i8(x) via dot empacotado (4 MAC/instr).
+                // Os 4 bytes de cada uint sao os 4 qs i8 consecutivos (little-endian:
+                // byte 0 = primeiro elemento, igual ao empacotamento de sxq).
+                int isum = 0;
+                for (uint g = 0u; g < 8u; g++) {
+                    int wp = int(weight_buf.w[boff + 1u + g]);
+                    isum = dotPacked4x8AccSatEXT(wp, sxq[s * 8u + g], isum);
+                }
+                acc[r] += d_w * sxd[s] * float(isum);
+            }
         }
     }
-    barrier();
 
-    // Cada linha mantem a mesma ordem de acumulacao do kernel original
-    // (lane-strided sobre blocos + subgroupAdd).
+    // Reducao final: um subgroupAdd por linha, depois de todas as janelas.
     for (uint r = 0u; r < NUM_ROWS; r++) {
         uint row = base_row + r;
-        // `row` cresce monotonicamente com r; uma vez fora do range, todas as linhas
-        // seguintes deste workgroup tambem estao -> break (nao continue) e correto e evita
-        // iteracoes inuteis. `row` independe de lane, logo o break e uniforme no subgroup.
         if (row >= pc.n_out) { break; }
-        uint roff = row * row_stride;
-        float acc = 0.0;
-        for (uint b = lane; b < n_blocks; b += WG) {
-            uint boff = roff + b * 9u;
-            // uint[boff] = scale f16 nos 16 bits baixos (pad nos altos, ignorado).
-            float d_w = unpackHalf2x16(weight_buf.w[boff]).x;
-            // Soma dos 32 produtos i8(peso) * i8(x) via dot empacotado (4 MAC/instr).
-            // Os 4 bytes de cada uint sao os 4 qs i8 consecutivos (little-endian:
-            // byte 0 = primeiro elemento, igual ao empacotamento de sxq).
-            int isum = 0;
-            for (uint g = 0u; g < 8u; g++) {
-                int wp = int(weight_buf.w[boff + 1u + g]);
-                isum = dotPacked4x8AccSatEXT(wp, sxq[b * 8u + g], isum);
-            }
-            acc += d_w * sxd[b] * float(isum);
-        }
-        acc = subgroupAdd(acc);
+        float s = subgroupAdd(acc[r]);
         if (gl_SubgroupInvocationID == 0u) {
-            out_buf.y[row] = acc;
+            out_buf.y[row] = s;
         }
     }
 }

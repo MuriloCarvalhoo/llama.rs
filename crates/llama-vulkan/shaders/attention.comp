@@ -1,6 +1,5 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
-// 1 workgroup por head; 1 lane por dimensão do head (exige head_dim <= 64).
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;   // [n_head*head_dim]
@@ -13,32 +12,56 @@ layout(push_constant) uniform PC {
     uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos f32
 } pc;
 
+const uint WG = 64u;      // local_size_x (wave64 no MI50)
+const uint MAX_DPL = 4u;  // dimensoes por lane -> suporta head_dim ate 256
+
+// 1 workgroup por head. Cada lane cuida das dimensoes lane, lane+WG, lane+2*WG...
+// Com head_dim <= WG e uma dimensao por lane e o kernel e bit-identico a versao
+// anterior (dpl=1, subgroupAdd de um unico produto por lane).
 void main() {
     uint h = gl_WorkGroupID.x;
-    uint d = gl_LocalInvocationID.x;
+    uint lane = gl_LocalInvocationID.x;
     if (h >= pc.n_head) return;
     uint n_rep = pc.n_head / pc.n_head_kv;
     uint kv_h = h / n_rep;
     float scale = inversesqrt(float(pc.head_dim));
-    bool lane_ok = d < pc.head_dim;
-    float qd = lane_ok ? qb.q[h * pc.head_dim + d] : 0.0;
+    uint dpl = (pc.head_dim + WG - 1u) / WG; // dimensoes por lane (1 para head_dim<=64)
+
+    float qd[MAX_DPL];
+    float acc[MAX_DPL];
+    for (uint i = 0u; i < MAX_DPL; i++) { qd[i] = 0.0; acc[i] = 0.0; }
+    for (uint i = 0u; i < dpl; i++) {
+        uint d = lane + i * WG;
+        qd[i] = (d < pc.head_dim) ? qb.q[h * pc.head_dim + d] : 0.0;
+    }
 
     float m = -1.0e30;   // max corrente
     float l = 0.0;       // soma corrente de exp
-    float acc = 0.0;     // saída da dimensão d (online softmax)
     for (uint j = 0u; j < pc.total_len; j++) {
         uint kvbase = pc.kv_layer_off + j * pc.kv_dim + kv_h * pc.head_dim;
-        float prod = lane_ok ? qd * kb.k[kvbase + d] : 0.0;
-        float s = subgroupAdd(prod) * scale;   // score uniforme em todas as lanes
+        // Produto interno q.k do head: soma parcial por lane sobre suas dimensoes,
+        // depois reducao no subgroup -> score uniforme em todas as lanes.
+        float partial = 0.0;
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            partial += (d < pc.head_dim) ? qd[i] * kb.k[kvbase + d] : 0.0;
+        }
+        float s = subgroupAdd(partial) * scale;
         float m_new = max(m, s);
         float corr = exp(m - m_new);
         float p = exp(s - m_new);
         l = l * corr + p;
-        float vd = lane_ok ? vb.v[kvbase + d] : 0.0;
-        acc = acc * corr + p * vd;
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            float vd = (d < pc.head_dim) ? vb.v[kvbase + d] : 0.0;
+            acc[i] = acc[i] * corr + p * vd;
+        }
         m = m_new;
     }
-    if (lane_ok) {
-        ob.o[h * pc.head_dim + d] = acc / l;
+    for (uint i = 0u; i < dpl; i++) {
+        uint d = lane + i * WG;
+        if (d < pc.head_dim) {
+            ob.o[h * pc.head_dim + d] = acc[i] / l;
+        }
     }
 }
