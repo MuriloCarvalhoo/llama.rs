@@ -133,8 +133,30 @@ E uma segunda correção: o 27B denso é **compute-bound** nesta placa (42 ms/to
 teto de banda; gfx906 não tem matrix cores). Isso enfraquece a aposta em Q4_K, que troca bytes por
 ALU justamente onde a placa é fraca.
 
-**Próximo passo revisado: layer-split**, antes de quantização. Detalhes e evidências em
-`docs/estrategia-inferencia-mi50.md` §7.
+### Layer-split implementado (2026-08-14)
+
+`--gpu-layer-split`. Divide as camadas entre as GPUs **proporcionalmente à VRAM livre** (mesma
+política do llama.cpp), com uma cópia da stream residual na fronteira — 1 sincronização por token.
+Saída idêntica ao caminho single-GPU.
+
+| Modelo | 1 GPU | layer-split |
+|---|---|---|
+| Qwen2.5-0.5B Q8_0 | 111.2 | 95.1 tok/s |
+| Qwen2.5-14B Q8_0 | 28.0 | 20.79 tok/s |
+
+Mais lento nos dois porque **ambos cabem numa GPU** — dividir só acrescenta a fronteira. O custo
+(−26% no 14B) é menor que o do próprio llama.cpp no mesmo modelo (−33%). O ganho é **capacidade**:
+modelos de 20–28 GiB, a faixa do Qwen3.6-27B, não cabem nos 16 GiB de uma MI50.
+
+**Ainda não validado no caso que justifica a feature**: não há modelo Q8_0 acima de 16 GiB
+localmente (o 32B disponível é Q5_K_M, formato que o llama-rs não lê). Provar o ganho de capacidade
+depende de suporte a K-quants ou de um Q8_0 maior.
+
+### Próximo passo
+
+Suporte a **K-quants** (Q4_K/Q5_K/Q6_K) — destrava tanto os modelos locais de 20–22 GiB quanto a
+validação real do layer-split. Expectativa calibrada: o ganho de velocidade é sublinear porque o
+gfx906 vira compute-bound em K-quants (ver acima).
 
 ---
 
