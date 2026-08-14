@@ -1,10 +1,60 @@
 # Progresso — llama-rs
 
-**Última atualização:** 2026-08-13
+**Última atualização:** 2026-08-13 (sessão Fase 0 + desbloqueios do 14B)
 
 ## Resumo em uma frase
 
-CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente em **1 GPU** é numericamente correto mas ~3.7× mais lento que o llama.cpp; o **row-split real entre as 2 GPUs** — o objetivo central do projeto — ainda não foi implementado.
+CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente em **1 GPU** é numericamente correto mas ~4× mais lento que o llama.cpp; a **Fase 0 foi concluída** (baseline do 14B + spike de all-reduce, risco nº1 resolvido) e vários bloqueios do 14B foram removidos, mas o **row-split real entre as 2 GPUs** — o objetivo central — ainda não foi implementado, e o 14B ainda não carrega por consumo de RAM no lado CPU.
+
+---
+
+## Sessão 2026-08-13 — o que mudou
+
+### Fase 0 concluída (era o próximo passo nº1)
+
+- **Baseline llama.cpp Vulkan no 14B** (`bench-results/fase8-0-baseline-14b-e-allreduce.md`):
+  **1× MI50 = 40.59 tok/s** (o alvo), 2× layer-split = 27.34, 2× row-split = **não suportado**
+  (`device Vulkan0 does not support split buffers`) — confirma a premissa fundadora do projeto.
+  O 14B **cabe em 1 GPU**, e 1 GPU é mais rápida que 2 em layer-split.
+- **Spike de all-reduce** (`crates/llama-vulkan/src/spike.rs`): o risco nº1 da spec era real no
+  caminho ingênuo (247 µs/transferência → teto de 42 tok/s), mas **~63 µs de cada transferência é
+  submit+fence**; com as 96 transferências de um token num único command buffer o custo cai para
+  **0.121 ms/token (teto ~8250 tok/s)** — 196× melhor. P2P disponível
+  (`external_memory_fd` + `dma_buf` + `external_semaphore_fd` nas duas GPUs).
+  **Regra que decorre:** nunca um submit/fence por all-reduce.
+
+### Os dois testes que falhavam: não eram bug
+
+`resident_gpu_decode_matches_cpu_ref` e `forward_gpu_real_matches_f32_cpu_reference` falhavam com
+"token-lixo 89012". Causa real: o commit `2649fe5` passou a **quantizar a ativação para int8** no
+shader, mas os testes continuaram comparando contra uma referência de ativação **f32**. O kernel
+diverge dessa referência em **0.1389%** (medido), o bastante para virar o argmax de um prompt de um
+único BOS. Com uma referência que modela a matemática real do shader (`cpu_ref_q8_0_int8act`), a GPU
+produz **exatamente o mesmo token**. Testes corrigidos — **22/22 verdes**.
+
+### Bloqueios do 14B removidos
+
+| Bloqueio | Correção |
+|---|---|
+| `n_ff=13824` rejeitado (LDS de 160 blocos) | **Tiling da dimensão K** no `q8_0_matvec.comp` — janelas de 160 blocos, `n_in` livre, LDS inalterado (5.6 KB). Validado com teste novo em 1, 1-na-borda e 3 janelas (erro 1e-6) |
+| `head_dim=128` rejeitado (shader assumia ≤ 64) | `attention.comp` distribui até 4 dimensões por lane (head_dim ≤ 256); bit-idêntico para head_dim ≤ 64 |
+| `fs::read` do modelo (15 GB de RAM anônima) | `memmap2` no `llama-cli` — vira page cache recuperável |
+| KV-cache dimensionado pelo `context_length` do GGUF (131072 → **51 GB de VRAM**) | flag `--ctx` (padrão 4096), limitada ao do modelo |
+| `MPOL_BIND` no nó NUMA 0 matando o processo | Só aplicado no caminho CPU — no caminho GPU restringia as alocações a metade da RAM |
+| Tabela de embedding f32 na VRAM (3.1 GB para ler 1 linha/token) | Mantida no host; sobe só a linha do token (~20 KB, ~4 µs) |
+| `GpuRawWeights` copiando todos os pesos (`raw.to_vec()`, 14.6 GB) | Passou a **emprestar** do mmap (`GpuRawWeights<'a>`) |
+
+### O 14B ainda não roda — bloqueio restante (medido)
+
+Com `--gpu-resident`, o processo ainda é morto por OOM. Causa dominante já localizada:
+`Weights::from_gguf` chama `tensor_raw_repack` para **todo** peso, que faz `raw.to_vec()` (cópia
+integral) e depois `repack_q8_0_8rows` (**segunda** cópia, layout `block_q8_0x8` de CPU) antes de
+descartar a primeira. São **~14.6 GB de pesos de CPU que o caminho GPU-residente nunca usa**, mais
+`token_embd` dequantizado para f32 (3.11 GB) e uma segunda cópia dele em `ResidentState` (3.11 GB).
+
+**Próximo passo concreto:** tornar o repack de CPU preguiçoso (ou não construir os pesos de CPU no
+caminho GPU) e parar de materializar `token_embd` em f32. Ver o documento de pesquisa
+`docs/rust-memoria-e-desempenho.md` para as técnicas avaliadas.
 
 ---
 
