@@ -2,6 +2,32 @@
 
 **Última atualização:** 2026-08-13 (sessão Fase 0 + desbloqueios do 14B)
 
+## Estado em números (2026-08-13, fim da sessão de otimização)
+
+| Config | llama-rs | llama.cpp Vulkan | razão |
+|---|---|---|---|
+| Qwen2.5-14B Q8_0, 1× MI50 | **28.0 tok/s** | 40.59 tok/s | **0.69×** |
+| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 tok/s | 0.37× |
+
+O 14B saiu de **4.77 → 28.0 tok/s (5.9×)** nesta sessão. Perfil atual do 14B
+(`LLAMA_RS_PROFILE=1`): GPU 27.8 ms/token, host 3.0 ms/token.
+
+| op | ms/token | % |
+|---|---|---|
+| matvec | 21.57 | 77.7% |
+| rmsnorm | 2.02 | 7.3% |
+| attention | 1.85 | 6.6% |
+| add | 0.89 | 3.2% |
+| quantize_x | 0.77 | 2.8% |
+| demais | 0.67 | 2.4% |
+
+**O matvec lê 15.5 GiB a 717 GB/s — perto do máximo alcançável na MI50.** O ganho
+restante não vem de mais ocupação; vem de **ler menos bytes**: o padding de 36 B por
+bloco Q8_0 (contra 34 B do formato) custa 5.9%, e Q4_K quase metade. Ver
+`docs/estrategia-inferencia-mi50.md`.
+
+---
+
 ## Resumo em uma frase
 
 CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente em **1 GPU** é numericamente correto mas ~4× mais lento que o llama.cpp; a **Fase 0 foi concluída** (baseline do 14B + spike de all-reduce, risco nº1 resolvido) e vários bloqueios do 14B foram removidos, mas o **row-split real entre as 2 GPUs** — o objetivo central — ainda não foi implementado, e o 14B ainda não carrega por consumo de RAM no lado CPU.
@@ -52,9 +78,25 @@ integral) e depois `repack_q8_0_8rows` (**segunda** cópia, layout `block_q8_0x8
 descartar a primeira. São **~14.6 GB de pesos de CPU que o caminho GPU-residente nunca usa**, mais
 `token_embd` dequantizado para f32 (3.11 GB) e uma segunda cópia dele em `ResidentState` (3.11 GB).
 
-**Próximo passo concreto:** tornar o repack de CPU preguiçoso (ou não construir os pesos de CPU no
-caminho GPU) e parar de materializar `token_embd` em f32. Ver o documento de pesquisa
-`docs/rust-memoria-e-desempenho.md` para as técnicas avaliadas.
+**Resolvido nesta sessão** (repack preguiçoso + `RawTensor<'a>` emprestando do mmap).
+
+---
+
+## Gate de decisão (Etapa 4 do plano)
+
+O plano previa: *se o single-GPU chegar a ~1.5× do llama.cpp, o row-split passa a valer; se não,
+row-split multiplica um número ruim.* Onde paramos: **0.69×** (28.0 vs 40.59).
+
+A leitura honesta é que **o gate não foi atingido, mas o diagnóstico mudou**. O matvec não está
+lento por arquitetura de paralelismo — está a 717 GB/s, perto do teto da placa. Isso significa:
+
+- **Row-split não é o próximo passo.** Ele divide bytes entre 2 GPUs, mas cada GPU já lê perto da
+  banda máxima; o ganho seria real (~1.4–1.7×, ver `docs/estrategia-inferencia-mi50.md`) porém
+  aplicado sobre um número que ainda perde para o llama.cpp em 1 GPU.
+- **O lever agora é ler menos bytes**, na ordem: (1) bloco Q8_0 de 36 B → 34 B, recuperando 5.9%
+  de banda sem perda numérica; (2) suporte a **Q4_K**, que quase divide os bytes pela metade e é o
+  único caminho para o 32B/27B caber; (3) fusão das ops pequenas (add de bias no matvec).
+- Só depois disso o row-split se justifica — e aí sobre uma base competitiva.
 
 ---
 
