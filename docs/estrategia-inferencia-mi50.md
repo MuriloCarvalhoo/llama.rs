@@ -49,12 +49,18 @@ o que medimos no nosso próprio spike (§ `bench-results/fase8-0-baseline-14b-e-
 
 ---
 
-## 1. O argumento que muda tudo: quantização
+## 1. Quantização: o ganho é real, mas menor do que a conta sugere
+
+> **Correção de 2026-08-14.** A versão original desta seção projetava Q4_K_M em ~71 tok/s assumindo
+> `tok/s ∝ 1/bytes`. Os benchmarks da própria máquina (`/home/murilo/llama.cpp/ORNITH-GFX906-NOTES.md`)
+> mostram que **isso não vale para K-quants aqui**: o Qwen3.6-27B denso roda a 42 ms/token contra um
+> teto de banda de ~15 ms — **compute-bound**, porque a Radeon Pro VII tem HBM2 rápida e pouco
+> compute (sem matrix cores), e K-quants custam mais ALU para desquantizar que o Q8_0.
+>
+> Ou seja: trocar Q8_0 → Q4_K troca bytes por ALU exatamente onde esta placa é fraca. As linhas
+> abaixo são o **limite superior otimista**, não previsão.
 
 Nossa baseline: **40.59 tok/s** com Qwen2.5-14B **Q8_0** (15.7 GB) em 1 MI50.
-
-Como decode batch-1 é memory-bound, `tok/s ∝ 1/bytes lidos`. Trocar a quantização é ganho linear e
-garantido, sem escrever código:
 
 | Quant | Tamanho | tok/s estimado¹ | Δ qualidade² |
 |---|---|---|---|
@@ -64,7 +70,8 @@ garantido, sem escrever código:
 | **Q4_K_M** | **8.9 GB** | **~71** | **−0.32 pt** |
 | Q4_0 | 8.2 GB | ~77 | −1.49 pt ← evitar |
 
-¹ derivado de 1024 GB/s × 62% MBU medido ÷ tamanho.
+¹ **limite superior**: derivado de 1024 GB/s × 62% MBU ÷ tamanho, supondo memory-bound. Para
+K-quants nesta placa a realidade fica abaixo disso (ver correção no topo da seção).
 ² [arXiv 2601.14277](https://arxiv.org/html/2601.14277v1), Llama-3.1-8B, média de 5 benchmarks.
 
 **Note o degrau Q4_K_M (−0.32) vs Q4_0 (−1.49): K-quants importam.**
@@ -72,7 +79,7 @@ garantido, sem escrever código:
 E há um ganho colateral grande: com Q8_0 sobra ~1.2 GB de VRAM → **~6k tokens de contexto**. Com
 Q4_K_M sobram ~8 GB → **~40k tokens**. Ganha-se velocidade **e** contexto.
 
-### A comparação incômoda
+### A comparação (com o teto otimista)
 
 | Caminho | tok/s | Esforço | Risco |
 |---|---|---|---|
@@ -187,24 +194,65 @@ Sinal relevante: existem ao menos 4–5 projetos "engine LLM em Rust + Vulkan do
 
 ---
 
-## 7. Veredito honesto sobre o rumo
+## 7. Veredito, revisado com os benchmarks da própria máquina
 
-**Se o objetivo é tokens/s: o caminho atual não é o de maior retorno.** A ordem racional seria:
+> Esta seção foi **reescrita em 2026-08-14** depois de ler
+> `/home/murilo/llama.cpp/{ORNITH-GFX906-NOTES.md,BUILD-GFX906.md,benches/radeon-pro-vii-gfx906/}`,
+> que medem este hardware exato. Duas conclusões anteriores caíram.
 
-1. Quantização (minutos, ~71 tok/s)
-2. Speculative decoding com draft na GPU2 (dias, ×1.4–1.85)
-3. Reuso de command buffer / eliminar `queue_wait_idle` (dias, +10–22%)
-4. Só então TP — e talvez contribuindo para o
-   [PR #25051](https://github.com/ggml-org/llama.cpp/pull/25051) / [issue #22648](https://github.com/ggml-org/llama.cpp/issues/22648),
-   onde o trabalho está mapeado e o mantenedor pediu ajuda explicitamente.
+### O que roda mais rápido nesta máquina (medido, não estimado)
 
-**Se o objetivo é aprender GPU programming, Vulkan e inferência distribuída** — construir do zero é
-uma excelente escolha e o argumento de ROI não se aplica.
+| Modelo | VRAM | Multi-GPU | Decode |
+|---|---|---|---|
+| **Qwen3.6-35B-A3B (MoE) + `draft-dflash n-max 3`** | 28.64 GiB | **layer-split** | **77.1 tok/s** @128k |
+| Ornith-1.0-35B MTP (MoE) | 28.75 GiB | layer-split | 69.6 tok/s @64k |
+| Qwen3.6-27B **denso** | — | layer-split | **23.8 tok/s** |
+| ThinkingCap-Qwen3.6-27B Q6_K | 20.88 GiB | layer-split (14.55 + 12.43) | 19.5 tok/s |
 
-**O que não funciona é misturar as duas justificativas.** Dizer "é para aprender" e ao mesmo tempo
-justificar decisões de escopo com "vai dobrar a banda efetiva" leva a escolhas ruins, porque o
-número final honesto (57–69 tok/s) é **pior** que trocar um argumento de linha de comando. Escolher
-uma justificativa e ser consistente com ela é o que mantém o escopo saudável.
+**Nada disso cabe em 16 GiB.** O layer-split não é uma otimização aqui — é o que torna esses
+modelos executáveis.
+
+### Correção 1 — layer-split é essencial, não inútil
+
+O bench inicial deste projeto mediu layer-split no Qwen2.5-14B Q8_0 (que **cabe** em 1 GPU) e viu
+27.34 contra 40.59 tok/s. A conclusão registrada — "layer-split serializa, multi-GPU não ajuda" —
+é verdadeira só para esse caso e foi indevidamente generalizada.
+
+O custo real do layer-split é **1 sincronização por token** (a fronteira entre as camadas de cada
+GPU), contra **96** do tensor-parallel. A 59.3 µs medidos, são **0.06 ms/token** — ruído. É ~100×
+mais barato que o TP e destrava a faixa de 20–28 GiB.
+
+### Correção 2 — a aposta em Q4_K é mais fraca do que esta doc dizia
+
+Ver a correção no topo da §1: o 27B denso já é **compute-bound** nesta placa (42 ms/token contra
+~15 ms de teto de banda). Q4_K troca bytes por ALU onde o gfx906 é fraco. O ganho existe, mas não é
+o ~1.8× que a conta de banda pura sugeria.
+
+### O que continua valendo
+
+- **Tensor-parallel está descartado** — e agora por três evidências independentes: sem P2P de VRAM
+  (medido aqui, §3), `-sm row` falha também no ROCm (`NO_PEER_COPY=1`), e o balanço de 96 syncs
+  × 59.3 µs come o ganho.
+- **Speculative decoding só compensa em MoE esparso.** Medido nesta máquina: +23% no 35B A3B, e
+  **net-negative no 27B denso** (23.77 → 21.95/16.57/15.67 conforme `n-max` sobe). A razão é a
+  mesma da Correção 2: se batch-1 já satura o compute, verificar N tokens custa ~N×.
+
+### Ordem recomendada (revisada)
+
+1. **Layer-split entre as 2 GPUs.** Barato (1 sync/token), e é o único caminho para rodar qualquer
+   coisa acima de 16 GiB — inclusive o Qwen3.6-27B, que era o alvo original do projeto.
+2. **Quantização K-quant**, com expectativa calibrada (ganho sublinear, pode virar compute-bound).
+3. Fusão de ops pequenas e redução de dispatches, que atacam o lado compute — o que de fato limita
+   este hardware em K-quants.
+4. ~~Tensor-parallel~~ — descartado por medição.
+5. ~~Speculative decoding~~ — só se o alvo virar um MoE esparso.
+
+### A ressalva que continua de pé
+
+Se o objetivo é **aprender** GPU/Vulkan/inferência, construir do zero é ótima escolha e nada disso
+se aplica. O que não funciona é misturar as justificativas: o alvo honesto para "bater o llama.cpp
+no Qwen3.6-27B" é **23.8 tok/s**, não os 40.59 do Qwen2.5-14B Q8_0 que este documento usava como
+referência — são modelos, quantizações e arquiteturas diferentes.
 
 ---
 

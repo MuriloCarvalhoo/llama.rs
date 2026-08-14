@@ -3,15 +3,17 @@
 **Data:** 2026-06-03
 **Status:** Aprovado para planejamento de implementação (Fase 0)
 
-> **Reorientação (2026-06): foco em multi-GPU tensor-parallel.** O objetivo do projeto
-> passou a ser **rodar modelos pesados com os tensores paralelizados entre todas as GPUs
-> (todas a ~100% de utilização)**. Em consequência:
-> - **Velocidade single-GPU não é mais meta.** O backend single-GPU residente serve apenas
->   como esqueleto correto (bit-exact vs CPU) reutilizado pelo forward multi-GPU.
-> - **CPU é somente referência de teste** (oráculo de correção), **não** alvo de
->   performance. Metas de throughput de CPU abaixo (ex.: Fase 5) estão **superadas**.
-> - O roadmap ativo é a spec **`2026-06-16-fase8-decode-gpu-persistente-rowsplit-design.md`**
->   (Fase 0 baseline+all-reduce → Fase 1 ✅ → **Fase 2 row-split tensor-parallel** → Fase 3 kernel).
+> **Reorientação (2026-08-14): tensor-parallel descartado, single-GPU é o caminho principal.**
+> A reorientação anterior (2026-06) apostava em paralelizar os tensores entre as GPUs. Isso foi
+> **refutado por medição**: não há P2P de VRAM entre estas MI50 e o custo de sincronização (96
+> all-reduces × 59.3 µs = 5.69 ms/token) supera o ganho. Em consequência:
+> - **Velocidade single-GPU voltou a ser a meta** — e é onde está o resultado: 28 tok/s no
+>   Qwen2.5-14B Q8_0 contra 40.59 do llama.cpp Vulkan.
+> - **Multi-GPU serve para capacidade, não velocidade**: layer-split (1 sync/token) é o que
+>   torna executáveis os modelos de 20–28 GiB que não cabem em 16 GiB.
+> - **CPU segue sendo só oráculo de correção**, não alvo de performance.
+> - Roadmap ativo: **`docs/estrategia-inferencia-mi50.md` §7** e **`PROGRESS.md`**. A spec
+>   `2026-06-16-...-rowsplit-design.md` está **superada** (banner no topo dela).
 
 ## Objetivo
 

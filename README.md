@@ -1,25 +1,23 @@
 # llama-rs
 
-Reescrita do zero em Rust do runtime de inferência LLM, com foco no backend **Vulkan** para 2× GPUs AMD MI50 em tensor-parallel.
+Reescrita do zero em Rust do runtime de inferência LLM, com foco no backend **Vulkan** para 2× GPUs AMD MI50.
 
-O projeto resolve limitações arquiteturais conhecidas do llama.cpp nessas GPUs: dequantização elemento-a-elemento ineficiente no Vulkan, incompatibilidade com wave64 (AMD), ausência de row-split em multi-GPU e overhead de CPU redundante por token gerado.
+O projeto constrói a pipeline completa em Rust (tokenizer → forward pass → sampling) com um backend Vulkan próprio, para ter controle total sobre os shaders SPIR-V e o agendamento de memória neste hardware.
 
-> **Estado do backend Vulkan:** em desenvolvimento ativo — correção validada em 1 GPU, row-split real entre as 2 GPUs ainda não implementado. Ver [`PROGRESS.md`](PROGRESS.md) para o estado detalhado e os próximos passos.
+> **Estado do backend Vulkan:** decode residente em 1 GPU funcionando e validado — **28 tok/s no Qwen2.5-14B Q8_0** contra 40.59 do llama.cpp Vulkan. Multi-GPU ainda não existe. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ---
 
 ## Motivação
 
-O llama.cpp tem quatro problemas confirmados que afetam diretamente a MI50:
+A premissa original era corrigir quatro fraquezas do llama.cpp em gfx906 (dequantização por elemento no Vulkan, Flash Attention incompatível com wave64, `WARP_SIZE` fixo em 32, e multi-GPU sem row-split).
 
-| Problema | Impacto no hardware alvo |
-|---|---|
-| Dequantização Vulkan por elemento | Overhead algorítmico puro em cargas memory-bound |
-| Flash Attention incompatível com wave64 | 2× mais lento em AMD RDNA/GCN com FA ativo |
-| `WARP_SIZE` fixo em 32 | Output corrompido em gfx906 (MI50) para modelos MoE |
-| Multi-GPU sem row-split | 3× mais lento vs ROCm no mesmo hardware |
+**Duas dessas premissas não sobreviveram à medição** e ficam registradas para não serem refeitas:
 
-Este projeto constrói a pipeline completa em Rust (tokenizer → forward pass → sampling) como base para um backend Vulkan que corrija esses problemas com controle total sobre os shaders SPIR-V e o agendamento de memória.
+- **"Multi-GPU sem row-split" não é uma falha do llama.cpp — é limite deste hardware.** Não há P2P de VRAM entre estas MI50 (medido em `crates/llama-vulkan/src/spike.rs`), e o `-sm row` falha igualmente no ROCm (`NO_PEER_COPY=1`). O que funciona multi-GPU aqui é **layer-split**.
+- **Decode batch-1 nem sempre é memory-bound aqui.** Vale para Q8_0 (nosso matvec lê a 717 GB/s, perto do teto); **não vale para K-quants**, onde o gfx906 vira compute-bound por não ter matrix cores.
+
+Ver [`docs/estrategia-inferencia-mi50.md`](docs/estrategia-inferencia-mi50.md) para as evidências.
 
 ---
 
@@ -34,12 +32,19 @@ A pipeline **CPU** está funcional e bit-exact contra o llama.cpp:
 - [x] Sampling: temperatura, top-p, greedy
 - [x] CLI de geração com timings
 
-O backend **Vulkan** (1× MI50) está correto, mas não competitivo em velocidade; o multi-GPU real ainda não existe:
+O backend **Vulkan** em 1 GPU está correto e razoavelmente rápido; o multi-GPU ainda não existe:
 
 - [x] Decode residente em 1 GPU, bit-exact vs CPU (`--gpu-resident`)
 - [x] 1 command buffer/token, pipelines e descriptors persistentes
-- [ ] Kernel matvec competitivo (~91 tok/s vs ~314 do llama.cpp na mesma MI50 — gate não atingido)
-- [ ] Tensor-parallel row-split real entre as 2 MI50 (`--gpu` hoje usa um row-split ingênuo e não-residente, ~145× mais lento que o llama.cpp 2×MI50)
+- [x] Seleção automática da GPU com mais VRAM livre (evita spill para GTT, que custava 7× de banda)
+- [x] Perfil por operação (`LLAMA_RS_PROFILE=1`): ms/token por op + custo de host por fase
+
+| Modelo | llama-rs | llama.cpp Vulkan | razão |
+|---|---|---|---|
+| Qwen2.5-14B Q8_0, 1× MI50 | **28.0 tok/s** | 40.59 | 0.69× |
+| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 | 0.37× |
+
+- [ ] Layer-split entre as 2 MI50, para rodar modelos acima de 16 GiB (`--gpu` hoje é um row-split ingênuo e não-residente, ~18× mais lento que 1 GPU residente)
 
 Detalhes, benchmarks e próximos passos em [`PROGRESS.md`](PROGRESS.md).
 
@@ -51,9 +56,9 @@ Detalhes, benchmarks e próximos passos em [`PROGRESS.md`](PROGRESS.md).
 |---|---|---|---|
 | AMD MI50 (× 2) | GCN 5.1 / gfx906 | 16 GB HBM2 cada | Vulkan 1.2 |
 
-As duas GPUs são **memory-bandwidth bound** em token generation (batch-1). O teto de performance é determinado pela largura de banda, não pelos FLOPS — isso torna a dequantização eficiente e o row-split multi-GPU críticos.
+Em token generation (batch-1) com **Q8_0** o limite é a banda de memória — nosso matvec lê a 717 GB/s, perto do teto da placa. Com **K-quants** o gfx906 vira **compute-bound** (sem matrix cores), o que muda quais otimizações valem a pena. Os 16 GiB por GPU são o outro limite duro: modelos de 20–28 GiB só rodam com layer-split entre as duas.
 
-> **NVIDIA Tesla K80 — fora de escopo (decisão deliberada).** O backend enumera só devices AMD (`crates/llama-vulkan/src/device.rs`). A K80 (Kepler, wave32) é incompatível com os shaders wave64 escritos para o gfx906 e é mais lenta que uma única MI50; suportá-la exigiria uma segunda família de kernels sem ganho líquido. Ela também não poderia participar de tensor-parallel simétrico com as MI50 (sem P2P entre vendors diferentes) — no máximo serviria como worker isolado de layer-split, fora do design atual.
+> **NVIDIA Tesla K80 — fora de escopo (decisão deliberada).** O backend enumera só devices AMD (`crates/llama-vulkan/src/device.rs`). A K80 (Kepler, wave32) é incompatível com os shaders wave64 escritos para o gfx906 e é mais lenta que uma única MI50; suportá-la exigiria uma segunda família de kernels sem ganho líquido. Ela também não poderia dividir tensores com as MI50 (sem P2P entre vendors diferentes) — no máximo serviria como worker isolado de layer-split, fora do design atual.
 
 ---
 
@@ -115,9 +120,10 @@ O gap no Qwen2 é esperado: llama.cpp usa kernels AVX2 vetorizados para Q8\_0×Q
 2. [x] **Dequantização packed-int** — ativação int8 + `dotPacked4x8` (gate validado em RADV/gfx906; ganho medido ~0%, kernel não é ALU-bound)
 3. [x] **Shaders wave64** — subgroup ops corretas para gfx906 (MI50), corrigindo o bug de WARP\_SIZE=32 upstream
 4. [x] **Contextos de grafo persistentes** — 1 command buffer/token, pipelines e descriptors persistentes (Fase 8.1)
-5. [ ] **Kernel matvec competitivo** — gate de ~314 tok/s (1× MI50) não atingido (~91 tok/s); gargalo é ocupação/paralelização estrutural do matvec, não ALU nem banda. Requer profiling (`rocprof`) e redesenho do particionamento antes de mais ajustes incrementais
-6. [ ] **Row-split multi-GPU real (tensor-parallel)** — layout Megatron (column/row-parallel + all-reduce) entre as duas MI50. O `--gpu` atual é um row-split ingênuo e não-residente, não a arquitetura final
-7. **NVIDIA Tesla K80 — fora de escopo**, ver seção "Hardware alvo"
+5. [x] **Kernel matvec** — o gargalo não era ocupação nem ALU, como se supunha: era **spill para GTT** na GPU do display (95 GB/s contra 714 GB/s na GPU livre). Com a colocação correta, quantização da ativação em dispatch próprio e rmsnorm paralelo: 4.77 → 28 tok/s no 14B. O matvec agora lê a 717 GB/s, perto do teto — o resto vem de ler menos bytes, não de mais paralelismo
+6. [ ] **Layer-split entre as 2 MI50** — camadas `0..N/2` numa GPU e `N/2..N` na outra, com **1 sincronização por token** na fronteira (0.06 ms pelos 59.3 µs medidos). É o que torna executáveis os modelos de 20–28 GiB que não cabem em 16 GiB — a faixa do Qwen3.6-27B
+7. ~~**Row-split / tensor-parallel**~~ — **descartado por medição**: não há P2P de VRAM entre estas placas (`OPAQUE_FD` falha no import; `DMA_BUF` importa como host-visible e lê a 10.2 GB/s contra 717 GB/s locais), e os 96 all-reduces por token custam 5.69 ms contra os 10.8 ms economizados. O mesmo limite aparece no ROCm (`NO_PEER_COPY=1`). Ver `docs/estrategia-inferencia-mi50.md` §3 e §7
+8. **NVIDIA Tesla K80 — fora de escopo**, ver seção "Hardware alvo"
 
 Estado detalhado, benchmarks e ordem recomendada dos próximos passos: [`PROGRESS.md`](PROGRESS.md).
 

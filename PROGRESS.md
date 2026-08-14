@@ -39,9 +39,10 @@ CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50
 ### Fase 0 concluída (era o próximo passo nº1)
 
 - **Baseline llama.cpp Vulkan no 14B** (`bench-results/fase8-0-baseline-14b-e-allreduce.md`):
-  **1× MI50 = 40.59 tok/s** (o alvo), 2× layer-split = 27.34, 2× row-split = **não suportado**
-  (`device Vulkan0 does not support split buffers`) — confirma a premissa fundadora do projeto.
-  O 14B **cabe em 1 GPU**, e 1 GPU é mais rápida que 2 em layer-split.
+  **1× MI50 = 40.59 tok/s**, 2× layer-split = 27.34, 2× row-split = falha ao carregar
+  (`device Vulkan0 does not support split buffers` — é limitação do hardware, não do backend:
+  o mesmo ocorre no ROCm com `NO_PEER_COPY=1`). O 14B **cabe em 1 GPU**, e por isso layer-split
+  ali só atrapalha — o que **não** generaliza para modelos maiores (ver o gate revisado abaixo).
 - **Spike de all-reduce** (`crates/llama-vulkan/src/spike.rs`): o risco nº1 da spec era real no
   caminho ingênuo (247 µs/transferência → teto de 42 tok/s), mas **~63 µs de cada transferência é
   submit+fence**; com as 96 transferências de um token num único command buffer o custo cai para
@@ -94,9 +95,8 @@ lento por arquitetura de paralelismo — está a 717 GB/s, perto do teto da plac
   banda máxima; o ganho seria real (~1.4–1.7×, ver `docs/estrategia-inferencia-mi50.md`) porém
   aplicado sobre um número que ainda perde para o llama.cpp em 1 GPU.
 - **O lever agora é ler menos bytes**, na ordem: (1) bloco Q8_0 de 36 B → 34 B, recuperando 5.9%
-  de banda sem perda numérica; (2) suporte a **Q4_K**, que quase divide os bytes pela metade e é o
-  único caminho para o 32B/27B caber; (3) fusão das ops pequenas (add de bias no matvec).
-- Só depois disso o row-split se justifica — e aí sobre uma base competitiva.
+  de banda sem perda numérica; (2) suporte a **Q4_K**; (3) fusão das ops pequenas.
+- Row-split não se justifica em nenhum cenário aqui (medido, ver abaixo).
 
 ### O row-split foi medido, não estimado (2026-08-14)
 
@@ -113,6 +113,28 @@ exigem 96 submits por GPU, e os 5.69 ms não descem.
 
 Balanço no 14B: economiza 10.8 ms (matvec pela metade), custa 5.9 ms → **~38 tok/s**,
 abaixo dos 40.59 do llama.cpp. **Tensor-parallel não é o caminho neste hardware.**
+
+### Layer-split, por outro lado, é o caminho (revisão de 2026-08-14)
+
+Os benchmarks da própria máquina (`/home/murilo/llama.cpp/benches/radeon-pro-vii-gfx906/` e
+`ORNITH-GFX906-NOTES.md`) mostram que **tudo que roda rápido aqui usa layer-split entre as 2 GPUs**,
+porque não cabe em 16 GiB:
+
+| Modelo | VRAM | Decode |
+|---|---|---|
+| Qwen3.6-35B-A3B (MoE) + speculative | 28.64 GiB | **77.1 tok/s** |
+| Qwen3.6-27B **denso** | — | **23.8 tok/s** ← alvo real do projeto |
+| ThinkingCap-Qwen3.6-27B Q6_K | 20.88 GiB | 19.5 tok/s |
+
+Custo do layer-split: **1 sincronização por token** (a fronteira entre as camadas de cada GPU) =
+0.06 ms pelos 59.3 µs medidos. Contra 96 syncs / 5.69 ms do tensor-parallel — **~100× mais barato**.
+
+E uma segunda correção: o 27B denso é **compute-bound** nesta placa (42 ms/token contra ~15 ms de
+teto de banda; gfx906 não tem matrix cores). Isso enfraquece a aposta em Q4_K, que troca bytes por
+ALU justamente onde a placa é fraca.
+
+**Próximo passo revisado: layer-split**, antes de quantização. Detalhes e evidências em
+`docs/estrategia-inferencia-mi50.md` §7.
 
 ---
 

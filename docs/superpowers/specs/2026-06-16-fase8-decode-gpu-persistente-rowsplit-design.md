@@ -1,3 +1,18 @@
+> # ⚠️ SUPERADA EM 2026-08-14 — NÃO USAR COMO ROADMAP
+>
+> A tese central deste documento (**tensor-parallel row-split entre as 2 MI50**) foi **refutada por
+> medição**. Mantido só como histórico da Fase 1, que foi implementada e continua válida.
+>
+> | Afirmação original | O que a medição mostrou |
+> |---|---|
+> | Row-split dá banda efetiva de ~2 TB/s, teto de ~2× | Não há **P2P de VRAM** entre estas placas: `OPAQUE_FD` falha no import, `DMA_BUF` importa como host-visible e lê a **10.2 GB/s** contra 717 GB/s locais |
+> | "Comunicação é trivial: ~2 MB/token" | O volume é trivial; o custo é **latência**. 96 all-reduces × 59.3 µs = **5.69 ms/token**, contra 10.8 ms economizados → ~38 tok/s, abaixo do llama.cpp |
+> | "O Vulkan do llama.cpp é fraco por não ter row-split" | `-sm row` falha **também no ROCm** (`NO_PEER_COPY=1`) — é limite do gfx906, não do backend |
+> | "Modelo grande não cabe em 1 GPU → row-split" | O caminho correto para >16 GiB é **layer-split**: 1 sincronização por token (0.06 ms) em vez de 96 |
+>
+> **Roadmap atual:** [`docs/estrategia-inferencia-mi50.md`](../../estrategia-inferencia-mi50.md) §7
+> e [`PROGRESS.md`](../../../PROGRESS.md).
+
 # Fase 8 — Decode GPU persistente + tensor-parallel row-split (bater o llama.cpp multi-GPU)
 
 - **Data:** 2026-06-16

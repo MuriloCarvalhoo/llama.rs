@@ -20,14 +20,23 @@
 
 ### Dois achados que reorientam a Fase 2
 
-**(a) O backend Vulkan do llama.cpp não implementa row-split.** Erro literal:
+**(a) Row-split não carrega neste hardware — em nenhum backend.** Erro literal:
 
 ```
 llama_model_load: error loading model: device Vulkan0 does not support split buffers
 ```
 
-Isso confirma a premissa fundadora do projeto (README: "Multi-GPU sem row-split"). Tensor-parallel
-em Vulkan é espaço genuinamente vazio — não há com quem empatar, só o layer-split para superar.
+> **Correção (2026-08-14).** A leitura original disto — "o Vulkan do llama.cpp não implementa
+> row-split, logo é espaço vazio a ocupar" — estava **errada** em duas frentes:
+>
+> 1. O `-sm row` existe, foi **deprecado** em favor de `-sm tensor`, e o tensor-parallel
+>    backend-agnóstico foi mergeado em abril/2026 (PR #19378).
+> 2. O erro não é falta de implementação: é o **hardware**. O mesmo `-sm row` falha no ROCm desta
+>    máquina com `device ROCm0 does not support split buffers` / `NO_PEER_COPY=1`
+>    (`/home/murilo/llama.cpp/ORNITH-GFX906-NOTES.md`). Medimos a causa depois: não há P2P de VRAM
+>    entre estas MI50 (ver §2).
+>
+> O que de fato roda multi-GPU aqui é **layer-split**, e é ele que viabiliza os modelos de 20–28 GiB.
 
 **(b) O 14B cabe em 1 MI50, e 1 GPU é MAIS RÁPIDA que 2 em layer-split** (40.59 vs 27.34).
 Batch-1 com layer-split deixa só uma GPU ativa por vez e ainda paga sincronização — exatamente o
@@ -35,6 +44,12 @@ que a spec §3 previa. Consequência: a premissa da spec ("modelo grande que nã
 **não vale para o 14B**; ele é campo de prova, e o alvo honesto é o número single-GPU (40.59).
 
 ### Teto físico (contexto para a meta)
+
+> **Ressalva (2026-08-14):** "decode batch-1 é memory-bound" vale para **Q8_0** neste hardware
+> (nosso matvec lê a 717 GB/s, perto do teto). **Não vale para K-quants**: o llama.cpp mede o
+> Qwen3.6-27B denso a 42 ms/token contra um teto de banda de ~15 ms, ou seja **compute-bound** —
+> a Radeon Pro VII tem HBM2 rápida e pouco compute (sem matrix cores), e K-quants custam mais ALU
+> para desquantizar. Isso enfraquece a aposta em Q4_K (ver `docs/estrategia-inferencia-mi50.md`).
 
 Decode batch-1 é memory-bandwidth bound. 14.62 GiB de pesos lidos por token:
 
