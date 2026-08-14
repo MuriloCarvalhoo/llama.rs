@@ -98,6 +98,22 @@ lento por arquitetura de paralelismo — está a 717 GB/s, perto do teto da plac
   único caminho para o 32B/27B caber; (3) fusão das ops pequenas (add de bias no matvec).
 - Só depois disso o row-split se justifica — e aí sobre uma base competitiva.
 
+### O row-split foi medido, não estimado (2026-08-14)
+
+| Mecanismo | por sincronização | 96 all-reduces/token |
+|---|---|---|
+| host-mediado (fence de cada lado) | 101 µs | 19.4 ms |
+| semáforo externo, pipelinado | **59.3 µs** | **5.69 ms** |
+
+P2P de VRAM **não existe** entre estas MI50: `OPAQUE_FD` falha no import
+(`ERROR_INVALID_EXTERNAL_HANDLE`), `DMA_BUF` importa mas o memory type é
+`HOST_VISIBLE|HOST_COHERENT` e lê a **10.2 GB/s** contra 717 GB/s do HBM local
+(issue ROCm #4793). Semáforo externo funciona, mas é por submit — 96 all-reduces
+exigem 96 submits por GPU, e os 5.69 ms não descem.
+
+Balanço no 14B: economiza 10.8 ms (matvec pela metade), custa 5.9 ms → **~38 tok/s**,
+abaixo dos 40.59 do llama.cpp. **Tensor-parallel não é o caminho neste hardware.**
+
 ---
 
 ## O que funciona hoje
