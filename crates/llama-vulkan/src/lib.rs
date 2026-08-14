@@ -7,6 +7,8 @@ mod model_gpu;
 pub(crate) mod pipeline;
 mod resident;
 mod resident_forward;
+#[cfg(test)]
+mod spike;
 pub mod tensor;
 
 pub use backend::DualGpuBackend;
