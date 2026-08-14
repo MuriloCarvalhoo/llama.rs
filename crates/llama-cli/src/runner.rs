@@ -3,13 +3,31 @@
 use std::time::Instant;
 
 use gguf::GgufFile;
-use llama_model::Model;
+use llama_model::{Model, ModelError};
 use llama_sampling::Sampler;
 use llama_tokenizer::Tokenizer;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::args::Args;
+
+/// Mapeia o `.gguf` em memória em vez de copiá-lo para a RAM. Um `fs::read` do
+/// 14B Q8_0 aloca 15 GB de RAM anônima antes mesmo dos pesos serem extraídos;
+/// com mmap as páginas ficam no page cache e são recuperáveis sob pressão.
+fn map_model(path: &std::path::Path) -> Result<memmap2::Mmap, std::io::Error> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: mapeamento read-only de um arquivo tratado como imutável durante a
+    // execução. Modificação externa do .gguf enquanto mapeado seria UB — mesma
+    // premissa que o llama.cpp adota para o seu mmap de modelo.
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
+/// Config do modelo com o contexto limitado por `--ctx` (nunca acima do que o GGUF declara).
+fn model_config(f: &GgufFile, args: &Args) -> Result<llama_model::LlamaConfig, ModelError> {
+    let mut config = llama_model::LlamaConfig::from_gguf(f)?;
+    config.ctx = config.ctx.min(args.ctx);
+    Ok(config)
+}
 
 /// Lê a lista de CPUs de um nó NUMA (ex.: "0-13,28-41") e retorna Vec<usize>.
 #[cfg(target_os = "linux")]
@@ -147,11 +165,16 @@ pub fn run_generate(
 ) -> Result<Timing, Box<dyn std::error::Error>> {
     // Pinar CPU + política MPOL_BIND ANTES de ler o modelo: pesos ficam na RAM
     // local do node 0 (acesso ~10 ns para as threads do socket 0).
-    init_numa_before_load();
+    // Só no caminho CPU: MPOL_BIND restringe as alocações à RAM de um único nó, e
+    // nos backends GPU (onde os pesos vão para a VRAM) isso apenas corta pela metade
+    // a memória disponível — um modelo de 15 GB é morto por OOM com RAM livre no nó 1.
+    if !(args.gpu || args.gpu_single || args.gpu_resident) {
+        init_numa_before_load();
+    }
 
-    let bytes = std::fs::read(&args.model)?;
+    let bytes = map_model(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
-    let model = Model::load(&f, &bytes)?;
+    let model = Model::load_with_config(&f, &bytes, model_config(&f, args)?)?;
     // Criar pool rayon DEPOIS do load: workers herdam afinidade e política de memória.
     init_rayon_after_model_load();
     // Acordar todos os workers rayon com um broadcast noop — evita latência de
@@ -336,7 +359,7 @@ pub fn run_generate(
 /// Carrega o modelo e retorna o texto completo como String (sem streaming).
 /// Mantém compatibilidade com `greedy_gate.rs` e outros testes de integracao.
 pub fn generate_text(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(&args.model)?;
+    let bytes = map_model(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
     let model = Model::load(&f, &bytes)?;
     let tokenizer = Tokenizer::from_gguf(&f)?;

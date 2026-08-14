@@ -5,30 +5,34 @@ use crate::config::LlamaConfig;
 use crate::error::ModelError;
 use gguf::{GgmlType, GgufFile};
 
-/// Pesos Q8_0 por camada, em bytes raw lidos do GGUF (cópia própria da GPU).
-pub struct GpuLayerRaw {
-    pub attn_q: Vec<u8>,
-    pub attn_k: Vec<u8>,
-    pub attn_v: Vec<u8>,
-    pub attn_output: Vec<u8>,
-    pub ffn_gate: Vec<u8>,
-    pub ffn_up: Vec<u8>,
-    pub ffn_down: Vec<u8>,
+/// Pesos Q8_0 por camada, emprestados do buffer do GGUF (sem cópia).
+pub struct GpuLayerRaw<'a> {
+    pub attn_q: &'a [u8],
+    pub attn_k: &'a [u8],
+    pub attn_v: &'a [u8],
+    pub attn_output: &'a [u8],
+    pub ffn_gate: &'a [u8],
+    pub ffn_up: &'a [u8],
+    pub ffn_down: &'a [u8],
 }
 
 /// Todos os pesos Q8_0 que o decode envia à GPU.
-pub struct GpuRawWeights {
-    pub layers: Vec<GpuLayerRaw>,
-    pub output: Vec<u8>,
+///
+/// Os slices apontam para o buffer do modelo (tipicamente um mmap): copiá-los
+/// custaria uma segunda imagem inteira dos pesos em RAM — 14.6 GB no 14B Q8_0,
+/// o suficiente para o processo ser morto por OOM antes de chegar à VRAM.
+pub struct GpuRawWeights<'a> {
+    pub layers: Vec<GpuLayerRaw<'a>>,
+    pub output: &'a [u8],
 }
 
-impl GpuRawWeights {
+impl<'a> GpuRawWeights<'a> {
     /// Lê e valida os pesos Q8_0 do GGUF. Erro se algum tensor não for Q8_0
     /// ou tiver `n_in % 32 != 0` (incompatível com o shader matvec wave64).
-    pub fn from_gguf(f: &GgufFile, bytes: &[u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+    pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
 
-        let read = |name: &str, n_in: usize, n_out: usize| -> Result<Vec<u8>, ModelError> {
+        let read = |name: &str, n_in: usize, n_out: usize| -> Result<&'a [u8], ModelError> {
             let info = f
                 .tensors
                 .iter()
@@ -55,7 +59,7 @@ impl GpuRawWeights {
                     raw.len()
                 )));
             }
-            Ok(raw.to_vec())
+            Ok(raw)
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
@@ -111,7 +115,7 @@ use crate::model::Model;
 use crate::ops::{embedding_lookup, rmsnorm_and_scale, rope_norm, swiglu};
 
 #[cfg(feature = "gpu")]
-impl Model {
+impl Model<'_> {
     /// Igual a `generate_streaming`, mas o **decode** roda na GPU via `gpu`.
     /// O **prefill** do prompt (n_tok>1) permanece na CPU (shader é matvec).
     #[allow(clippy::too_many_arguments)]

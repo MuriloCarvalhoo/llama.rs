@@ -22,18 +22,22 @@ fn add_bias(x: &mut [f32], bias: &[f32], dim: usize, n_tok: usize) {
 }
 
 /// Modelo carregado: config + pesos raw (quantizados ou f32).
-pub struct Model {
+///
+/// Os pesos são emprestados do buffer do GGUF (`bytes`), que precisa viver mais que o
+/// `Model` — tipicamente um mmap mantido pelo chamador. Copiá-los custaria uma segunda
+/// imagem inteira dos pesos em RAM (14.6 GB no Qwen2.5-14B Q8_0).
+pub struct Model<'a> {
     pub config: LlamaConfig,
-    pub(crate) weights: Weights,
+    pub(crate) weights: Weights<'a>,
     /// Otimização 3 — tabela de frequências RoPE pré-computada.
     /// `freq_table[i] = freq_base^(-2i/rope_dim)` para i em 0..rope_dim/2.
     /// Elimina `powf` no loop interno da RoPE.
     pub(crate) freq_table: Vec<f32>,
 }
 
-impl Model {
+impl<'a> Model<'a> {
     /// Carrega de um GGUF já parseado + bytes do arquivo.
-    pub fn load(f: &GgufFile, bytes: &[u8]) -> Result<Self, ModelError> {
+    pub fn load(f: &GgufFile, bytes: &'a [u8]) -> Result<Self, ModelError> {
         let config = LlamaConfig::from_gguf(f)?;
         let weights = Weights::from_gguf(f, bytes, &config)?;
         let freq_table = build_freq_table(config.freq_base, config.rope_dim);
@@ -47,7 +51,7 @@ impl Model {
     /// Carrega com config já validada externamente.
     pub fn load_with_config(
         f: &GgufFile,
-        bytes: &[u8],
+        bytes: &'a [u8],
         config: LlamaConfig,
     ) -> Result<Self, ModelError> {
         let weights = Weights::from_gguf(f, bytes, &config)?;
@@ -345,10 +349,13 @@ mod tests {
     use crate::ops::{embedding_lookup, matmul, mul_rows, rmsnorm, rope_norm};
     use std::path::Path;
 
-    fn load_model() -> Option<Model> {
+    /// O `Model` empresta os bytes do GGUF, então eles precisam viver tanto quanto ele.
+    /// Em teste, vazar o buffer é mais simples que devolver um par auto-referencial.
+    fn load_model() -> Option<Model<'static>> {
         let bytes = std::fs::read(Path::new("../../models/stories260K.gguf")).ok()?;
-        let f = GgufFile::parse(&bytes).ok()?;
-        Model::load(&f, &bytes).ok()
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let f = GgufFile::parse(bytes).ok()?;
+        Model::load(&f, bytes).ok()
     }
 
     #[test]

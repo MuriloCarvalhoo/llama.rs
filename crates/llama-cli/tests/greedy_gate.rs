@@ -30,6 +30,10 @@ fn greedy_matches_oracle_reference() {
         top_p: 1.0,
         no_display_prompt: true,
         timings: false,
+        ctx: 4096,
+        gpu: false,
+        gpu_single: false,
+        gpu_resident: false,
     };
 
     let output = generate_text(&args).expect("generate_text falhou");
@@ -59,6 +63,10 @@ fn topp_sampler_does_not_panic() {
         top_p: 0.8,
         no_display_prompt: true,
         timings: false,
+        ctx: 4096,
+        gpu: false,
+        gpu_single: false,
+        gpu_resident: false,
     };
     generate_text(&args).expect("nao deve falhar com TopP");
 }
@@ -79,6 +87,10 @@ fn run_generate_streaming_does_not_panic() {
         top_p: 1.0,
         no_display_prompt: true,
         timings: false,
+        ctx: 4096,
+        gpu: false,
+        gpu_single: false,
+        gpu_resident: false,
     };
     let mut pieces: Vec<String> = Vec::new();
     run_generate(&args, &mut |p| pieces.push(p.to_owned())).expect("run_generate nao deve falhar");

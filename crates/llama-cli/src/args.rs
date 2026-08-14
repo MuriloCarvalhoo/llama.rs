@@ -35,6 +35,12 @@ pub struct Args {
     #[arg(long, default_value_t = 42)]
     pub seed: u64,
 
+    /// Tamanho maximo do contexto (KV-cache). Limitado ao do modelo.
+    /// O KV-cache residente custa n_layer*ctx*kv_dim*2*4 bytes de VRAM — usar o
+    /// context_length do GGUF (ex.: 131072 no Qwen2.5-14B) pediria dezenas de GB.
+    #[arg(long, default_value_t = 4096)]
+    pub ctx: usize,
+
     /// Suprimir o prompt da saida
     #[arg(long)]
     pub no_display_prompt: bool,

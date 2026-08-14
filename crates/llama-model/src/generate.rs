@@ -7,7 +7,7 @@ use rand::Rng;
 use crate::error::ModelError;
 use crate::model::Model;
 
-impl Model {
+impl Model<'_> {
     /// Gera até `n_tokens` chamando `on_token` a cada token decodificado individualmente.
     /// Para em EOS ou quando `n_tokens` for atingido.
     pub fn generate_streaming(
@@ -161,10 +161,13 @@ mod generate_tests {
     use rand::rngs::SmallRng;
     use std::path::Path;
 
-    fn load() -> Option<(Model, llama_tokenizer::Tokenizer)> {
+    /// O `Model` empresta os bytes do GGUF; em teste, vazar o buffer é mais simples
+    /// que devolver um par auto-referencial.
+    fn load() -> Option<(Model<'static>, llama_tokenizer::Tokenizer)> {
         let bytes = std::fs::read(Path::new("../../models/stories260K.gguf")).ok()?;
-        let f = gguf::GgufFile::parse(&bytes).ok()?;
-        let model = Model::load(&f, &bytes).ok()?;
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let f = gguf::GgufFile::parse(bytes).ok()?;
+        let model = Model::load(&f, bytes).ok()?;
         let tok = llama_tokenizer::Tokenizer::from_gguf(&f).ok()?;
         Some((model, tok))
     }

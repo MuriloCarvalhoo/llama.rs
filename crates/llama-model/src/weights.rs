@@ -16,64 +16,62 @@ use crate::error::ModelError;
 /// Tensor raw: bytes tal como lidos do GGUF + tipo de dado para dequant.
 /// Primeira chamada a `dequant_to_f32` dequantiza e cacheia em memória;
 /// chamadas subsequentes retornam `&[f32]` sem realocar.
-pub(crate) struct RawTensor {
-    pub bytes: Vec<u8>,
+pub(crate) struct RawTensor<'a> {
+    /// Bytes emprestados do buffer do GGUF (tipicamente um mmap) — nunca copiados.
+    /// Copiá-los custaria uma segunda imagem dos pesos em RAM: 14.6 GB no 14B Q8_0.
+    pub bytes: &'a [u8],
     pub ty: gguf::GgmlType,
     f32_cache: OnceLock<Vec<f32>>,
-    /// Pesos Q8_0 reempacotados em block_q8_0x8 (272 bytes por grupo de 8 linhas por bloco).
-    /// Some apenas quando ty==Q8_0, n_out%8==0, n_in%32==0.
-    repacked: Option<Vec<u8>>,
-    n_out_packed: usize,
+    /// Dimensões `(n_in, n_out_packed)` do repack Q8_0 → block_q8_0x8, quando aplicável.
+    /// `None` quando o repack não se aplica (tipo ≠ Q8_0 ou n_in não múltiplo de 32).
+    repack_dims: Option<(usize, usize)>,
+    /// Repack materializado sob demanda: só o caminho de matmul da CPU o consome, então
+    /// o backend GPU-residente não paga por ele.
+    repacked: OnceLock<Vec<u8>>,
 }
 
-impl RawTensor {
-    pub(crate) fn new(bytes: Vec<u8>, ty: gguf::GgmlType) -> Self {
+impl<'a> RawTensor<'a> {
+    pub(crate) fn new(bytes: &'a [u8], ty: gguf::GgmlType) -> Self {
         Self {
             bytes,
             ty,
             f32_cache: OnceLock::new(),
-            repacked: None,
-            n_out_packed: 0,
+            repack_dims: None,
+            repacked: OnceLock::new(),
         }
     }
 
-    /// Constrói RawTensor com pesos Q8_0 reempacotados para melhor eficiência de cache.
-    /// Executado uma vez no carregamento do modelo; n_in e n_out são dimensões da matriz de pesos.
+    /// Constrói RawTensor registrando as dimensões do repack Q8_0 (block_q8_0x8).
+    /// O repack em si é adiado até o primeiro matmul de CPU — ver `repacked()`.
     pub(crate) fn new_with_repack(
-        bytes: Vec<u8>,
+        bytes: &'a [u8],
         ty: gguf::GgmlType,
         n_in: usize,
         n_out: usize,
     ) -> Self {
-        if ty == gguf::GgmlType::Q8_0 && n_out % 8 == 0 && n_in % 32 == 0 {
-            let packed = repack_q8_0_8rows(&bytes, n_in, n_out);
-            // Descarta bytes originais: apenas o packed é usado em matmul, liberar reduz
-            // pressão de memória e melhora eficiência do cache durante inferência.
-            Self {
-                bytes: Vec::new(),
-                ty,
-                f32_cache: OnceLock::new(),
-                repacked: Some(packed),
-                n_out_packed: n_out,
-            }
-        } else if ty == gguf::GgmlType::Q8_0 && n_in % 32 == 0 {
-            // n_out não múltiplo de 8 — repack apenas as primeiras linhas completas
+        let repack_dims = if ty == gguf::GgmlType::Q8_0 && n_in % 32 == 0 {
+            // n_out não múltiplo de 8: repack só as linhas completas; o resto vai pelo tail.
             let n_out_packed = (n_out / 8) * 8;
-            if n_out_packed > 0 {
-                let packed = repack_q8_0_8rows(&bytes, n_in, n_out_packed);
-                Self {
-                    bytes,
-                    ty,
-                    f32_cache: OnceLock::new(),
-                    repacked: Some(packed),
-                    n_out_packed,
-                }
-            } else {
-                Self::new(bytes, ty)
-            }
+            (n_out_packed > 0).then_some((n_in, n_out_packed))
         } else {
-            Self::new(bytes, ty)
+            None
+        };
+        Self {
+            bytes,
+            ty,
+            f32_cache: OnceLock::new(),
+            repack_dims,
+            repacked: OnceLock::new(),
         }
+    }
+
+    /// Repack materializado sob demanda. Retorna `(bytes_repacked, n_out_packed)`.
+    fn repacked(&self) -> Option<(&[u8], usize)> {
+        let (n_in, n_out_packed) = self.repack_dims?;
+        let packed = self
+            .repacked
+            .get_or_init(|| repack_q8_0_8rows(self.bytes, n_in, n_out_packed));
+        Some((packed.as_slice(), n_out_packed))
     }
 
     /// Número de elementos lógicos (não de bytes).
@@ -98,7 +96,7 @@ impl RawTensor {
         if let Some(cached) = self.f32_cache.get() {
             return Ok(cached.as_slice());
         }
-        let v = dequant_impl(&self.bytes, self.ty).map_err(ModelError::from)?;
+        let v = dequant_impl(self.bytes, self.ty).map_err(ModelError::from)?;
         let _ = self.f32_cache.set(v);
         // SAFETY: we just set the value above; get() is guaranteed to return Some.
         Ok(self.f32_cache.get().map_or(&[], Vec::as_slice))
@@ -155,90 +153,88 @@ impl RawTensor {
         n_out: usize,
         n_tok: usize,
     ) -> Vec<f32> {
-        if let Some(packed) = &self.repacked {
-            let n_packed = self.n_out_packed;
+        if let Some((packed, n_packed)) = self.repacked() {
             let const_b: usize = 34;
             let row_bytes = (n_in / 32) * const_b;
             let tail_start = n_packed * row_bytes;
-            // bytes pode ser vazio (descartado após repack completo) — tail só existe quando
-            // n_out_packed < n_out (repack parcial), o que implica bytes ainda estão presentes.
+            // `bytes` mantém a matriz inteira; quando o repack cobre todas as linhas
+            // (n_out_packed == n_out) o tail sai vazio naturalmente.
             let w_tail = self.bytes.get(tail_start..).unwrap_or(&[]);
             matmul_q8_0_actq_packed(packed, w_tail, x_q8, n_in, n_out, n_packed, n_tok)
         } else {
-            matmul_q8_0_actq(&self.bytes, x_q8, n_in, n_out, n_tok)
+            matmul_q8_0_actq(self.bytes, x_q8, n_in, n_out, n_tok)
         }
     }
 }
 
 /// Pesos de uma camada transformer.
-pub(crate) struct LayerWeights {
-    pub attn_norm: RawTensor,
-    pub attn_q: RawTensor,
-    pub attn_k: RawTensor,
-    pub attn_v: RawTensor,
+pub(crate) struct LayerWeights<'a> {
+    pub attn_norm: RawTensor<'a>,
+    pub attn_q: RawTensor<'a>,
+    pub attn_k: RawTensor<'a>,
+    pub attn_v: RawTensor<'a>,
     /// Bias de atenção Q/K/V — presente em Qwen2, ausente em Llama.
-    pub attn_q_bias: Option<RawTensor>,
-    pub attn_k_bias: Option<RawTensor>,
-    pub attn_v_bias: Option<RawTensor>,
-    pub attn_output: RawTensor,
-    pub ffn_norm: RawTensor,
-    pub ffn_gate: RawTensor,
-    pub ffn_up: RawTensor,
-    pub ffn_down: RawTensor,
+    pub attn_q_bias: Option<RawTensor<'a>>,
+    pub attn_k_bias: Option<RawTensor<'a>>,
+    pub attn_v_bias: Option<RawTensor<'a>>,
+    pub attn_output: RawTensor<'a>,
+    pub ffn_norm: RawTensor<'a>,
+    pub ffn_gate: RawTensor<'a>,
+    pub ffn_up: RawTensor<'a>,
+    pub ffn_down: RawTensor<'a>,
 }
 
 /// Todos os pesos do modelo, em bytes raw.
-pub(crate) struct Weights {
-    pub token_embd: RawTensor,
-    pub layers: Vec<LayerWeights>,
-    pub output_norm: RawTensor,
-    pub output: RawTensor,
+pub(crate) struct Weights<'a> {
+    pub token_embd: RawTensor<'a>,
+    pub layers: Vec<LayerWeights<'a>>,
+    pub output_norm: RawTensor<'a>,
+    pub output: RawTensor<'a>,
 }
 
-fn tensor_raw(f: &GgufFile, bytes: &[u8], name: &str) -> Result<RawTensor, ModelError> {
+fn tensor_raw<'a>(f: &GgufFile, bytes: &'a [u8], name: &str) -> Result<RawTensor<'a>, ModelError> {
     let info: &TensorInfo = f
         .tensors
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| ModelError::MissingTensor(name.to_owned()))?;
     let raw = f.tensor_data(bytes, info)?;
-    Ok(RawTensor::new(raw.to_vec(), info.ggml_type))
+    Ok(RawTensor::new(raw, info.ggml_type))
 }
 
-fn tensor_raw_repack(
+fn tensor_raw_repack<'a>(
     f: &GgufFile,
-    bytes: &[u8],
+    bytes: &'a [u8],
     name: &str,
     n_in: usize,
     n_out: usize,
-) -> Result<RawTensor, ModelError> {
+) -> Result<RawTensor<'a>, ModelError> {
     let info: &TensorInfo = f
         .tensors
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| ModelError::MissingTensor(name.to_owned()))?;
     let raw = f.tensor_data(bytes, info)?;
-    Ok(RawTensor::new_with_repack(
-        raw.to_vec(),
-        info.ggml_type,
-        n_in,
-        n_out,
-    ))
+    Ok(RawTensor::new_with_repack(raw, info.ggml_type, n_in, n_out))
 }
 
-fn tensor_raw_opt(f: &GgufFile, bytes: &[u8], name: &str) -> Result<Option<RawTensor>, ModelError> {
+fn tensor_raw_opt<'a>(
+    f: &GgufFile,
+    bytes: &'a [u8],
+    name: &str,
+) -> Result<Option<RawTensor<'a>>, ModelError> {
     match f.tensors.iter().find(|t| t.name == name) {
         Some(info) => {
             let raw = f.tensor_data(bytes, info)?;
-            Ok(Some(RawTensor::new(raw.to_vec(), info.ggml_type)))
+            Ok(Some(RawTensor::new(raw, info.ggml_type)))
         }
         None => Ok(None),
     }
 }
 
-impl Weights {
+impl<'a> Weights<'a> {
     /// Lê todos os tensores (qualquer tipo suportado pelo dispatcher de dequant).
-    pub fn from_gguf(f: &GgufFile, bytes: &[u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+    pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
         let n_embd = cfg.n_embd;
         let n_ff = cfg.n_ff;
         let n_kv_dim = cfg.n_head_kv * cfg.head_dim;
