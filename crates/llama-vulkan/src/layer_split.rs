@@ -35,11 +35,24 @@ impl<'ctx> LayerSplitForward<'ctx> {
         if devs.len() < 2 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
-        let free: Vec<u64> = devs
-            .iter()
-            .map(|p| p.free_device_memory(ctx).unwrap_or(1))
-            .collect();
-        let boundaries = Self::split_points(&free, config.n_layer);
+        // `LLAMA_RS_SPLIT=N` fixa a fronteira entre as duas GPUs em vez de derivá-la da VRAM
+        // livre. A VRAM livre varia com o que mais estiver no device, então o ponto de corte
+        // muda entre execuções (30/34 numa, 31/33 na outra) e desloca o tempo por token em
+        // alguns por cento — o bastante para afogar o efeito do que se está medindo.
+        let boundaries = match std::env::var("LLAMA_RS_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n < config.n_layer && devs.len() == 2)
+        {
+            Some(n) => vec![(0, n), (n, config.n_layer)],
+            None => {
+                let free: Vec<u64> = devs
+                    .iter()
+                    .map(|p| p.free_device_memory(ctx).unwrap_or(1))
+                    .collect();
+                Self::split_points(&free, config.n_layer)
+            }
+        };
 
         let mut shards = Vec::with_capacity(boundaries.len());
         for (i, &(first, end)) in boundaries.iter().enumerate() {
@@ -112,7 +125,10 @@ impl<'ctx> LayerSplitForward<'ctx> {
 
     /// Rótulos das ops do plano do shard `s`.
     pub fn dbg_plano(&self, s: usize) -> Vec<&'static str> {
-        self.shards.get(s).map(|x| x.dbg_plano()).unwrap_or_default()
+        self.shards
+            .get(s)
+            .map(|x| x.dbg_plano())
+            .unwrap_or_default()
     }
 
     /// Stream residual do shard `s`, para diagnóstico.

@@ -275,6 +275,39 @@ impl PipeId {
             PipeId::GateMul => "gate_mul",
         }
     }
+
+    /// Índices dos bindings que o shader **lê** e dos que ele **escreve**. Um binding
+    /// declarado `inout` no GLSL (sem `readonly`/`writeonly`) aparece nas duas listas.
+    ///
+    /// É o que permite decidir se dois dispatches vizinhos podem rodar concorrentes —
+    /// ver `marcar_barreiras`. A tabela espelha os qualificadores dos `.comp`: trocar um
+    /// `readonly` por `writeonly` lá obriga a mexer aqui, ou a barreira some e o resultado
+    /// passa a depender do escalonamento.
+    fn acessos(self) -> (&'static [usize], &'static [usize]) {
+        match self {
+            // weight, xq, xd → out
+            PipeId::Matvec | PipeId::MatvecQ5K | PipeId::MatvecQ6K | PipeId::Attention => {
+                (&[0, 1, 2], &[3])
+            }
+            PipeId::QuantizeX => (&[0], &[1, 2]),
+            PipeId::Rmsnorm | PipeId::Swiglu => (&[0, 1], &[2]),
+            // x é inout: o RoPE gira em cima do próprio buffer, o Add acumula nele.
+            PipeId::Rope | PipeId::Add | PipeId::GateMul => (&[0, 1], &[0]),
+            // o estado recorrente (binding 0) é lido e reescrito no mesmo dispatch.
+            PipeId::DeltaNet => (&[0, 1, 2, 3, 4], &[0, 5]),
+            PipeId::DnConv => (&[0, 1, 2], &[0, 3]),
+            PipeId::DnGates => (&[0, 1, 2, 3], &[4]),
+            PipeId::DnNorm => (&[0, 1, 2], &[3]),
+        }
+    }
+}
+
+/// Trecho de um buffer que uma op toca: (buffer, offset em bytes, bytes).
+pub(crate) type Faixa = (vk::Buffer, vk::DeviceSize, vk::DeviceSize);
+
+/// Duas faixas colidem quando são do mesmo buffer e os intervalos se cruzam.
+fn sobrepoe(a: &Faixa, b: &Faixa) -> bool {
+    a.0 == b.0 && a.1 < b.1 + b.2 && b.1 < a.1 + a.2
 }
 
 /// Como obter os bytes de push-constant de um dispatch no momento da gravação.
@@ -294,6 +327,10 @@ pub(crate) enum PlannedOp {
         set: vk::DescriptorSet,
         groups: u32,
         push: PushSpec,
+        /// Faixas de memória lidas e escritas, derivadas dos bindings e de `PipeId::acessos`.
+        /// Só servem a `marcar_barreiras`, no build.
+        le: Vec<Faixa>,
+        esc: Vec<Faixa>,
     },
     /// Embedding lookup: copia a linha `token` de `token_embd` para `b_x`.
     Embed,
@@ -346,6 +383,9 @@ pub(crate) struct ResidentState {
     pub logits_ptr: *mut std::ffi::c_void,
     pub len: RefCell<usize>,
     pub plan: Vec<PlannedOp>,
+    /// Paralelo a `plan`: se a op precisa de uma barreira de memória **antes** dela.
+    /// Calculado uma vez em `marcar_barreiras`.
+    pub barreiras: Vec<bool>,
     pub token_cmd: vk::CommandBuffer,
     pub token_fence: vk::Fence,
     /// Perfilamento por op via timestamp queries. `Some` só com LLAMA_RS_PROFILE=1.
@@ -760,9 +800,10 @@ impl<'ctx> ResidentForward<'ctx> {
                         attn_gate,
                         ssm_out,
                     } => {
-                        let dn = config.delta_net.as_ref().ok_or(MatmulError::Vulkan(
-                            vk::Result::ERROR_FEATURE_NOT_PRESENT,
-                        ))?;
+                        let dn = config
+                            .delta_net
+                            .as_ref()
+                            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
                         let value_dim = dn.head_v_dim() * dn.n_v_heads;
                         MixerQ::Delta {
                             attn_qkv: up_q(attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
@@ -839,10 +880,7 @@ impl<'ctx> ResidentForward<'ctx> {
                                 // Estado recorrente e janela da convolução começam
                                 // zerados — é o "contexto vazio" desta arquitetura.
                                 estado: mk(&vec![0f32; dn.state_len()])?,
-                                janela: mk(&vec![
-                                    0f32;
-                                    conv_dim_de(dn) * (dn.d_conv - 1)
-                                ])?,
+                                janela: mk(&vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)])?,
                             })
                         }
                         _ => None,
@@ -963,6 +1001,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 logits_ptr,
                 len: RefCell::new(0),
                 plan: Vec::new(),
+                barreiras: Vec::new(),
                 token_cmd,
                 token_fence,
                 prof: None,
@@ -1003,6 +1042,15 @@ impl<'ctx> ResidentForward<'ctx> {
             None
         };
         if let Some(st) = me.state.as_mut() {
+            st.barreiras = Self::marcar_barreiras(&plan, st);
+            if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
+                let n = st.barreiras.iter().filter(|b| **b).count();
+                eprintln!(
+                    "[prof] {} ops/token, {n} barreiras ({:.0}% das ops rodam agrupadas)",
+                    plan.len(),
+                    100.0 * (1.0 - n as f64 / plan.len() as f64)
+                );
+            }
             st.plan = plan;
             st.prof = prof;
         }
@@ -1095,7 +1143,6 @@ impl<'ctx> ResidentForward<'ctx> {
         ob.destroy(d);
         Ok(out)
     }
-
 
     /// Emite as ops de uma camada de atenção linear (qwen35), deixando o resultado em
     /// `b_proj` — o mesmo lugar onde a camada de atenção deixa o dela, para que o fecho
@@ -1521,6 +1568,57 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
+    /// Para cada op do plano, se ela precisa de uma barreira de memória **antes**.
+    ///
+    /// Ops entre duas barreiras podem rodar concorrentes na GPU. Uma barreira só faz falta
+    /// quando a op conflita com o que o grupo corrente já fez: lê o que foi escrito (RAW),
+    /// escreve o que foi lido (WAR) ou escreve o que já foi escrito (WAW).
+    ///
+    /// Antes emitíamos uma barreira depois de **todo** dispatch, e isso custa um "tail" por
+    /// op: nenhum workgroup do próximo começa antes que o último do anterior termine, e o
+    /// fim de um matvec ocupa poucas waves de 240 SIMDs. Numa camada densa do Qwen2.5 as
+    /// projeções Q/K/V leem a mesma ativação e escrevem buffers distintos — assim como
+    /// `ffn_gate`/`ffn_up` —, então não havia dependência nenhuma a respeitar entre elas.
+    ///
+    /// O critério é conservador em dois pontos, de propósito: compara as faixas **inteiras**
+    /// dos bindings (não o que o shader de fato toca) e trata o KV-cache como um buffer só,
+    /// já que o offset do append depende de `pos` e não é conhecido aqui.
+    fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState) -> Vec<bool> {
+        // `LLAMA_RS_NO_GROUP=1` volta ao comportamento antigo (uma barreira por op) para
+        // poder medir o efeito do agrupamento no mesmo binário.
+        if std::env::var("LLAMA_RS_NO_GROUP").is_ok_and(|v| v != "0") {
+            return vec![true; plan.len()];
+        }
+        let tudo = |b: &Buf| -> Faixa { (b.buffer, 0, b.size) };
+        let mut grupo_le: Vec<Faixa> = Vec::new();
+        let mut grupo_esc: Vec<Faixa> = Vec::new();
+        let mut out = Vec::with_capacity(plan.len());
+
+        for op in plan {
+            let (le, esc): (Vec<Faixa>, Vec<Faixa>) = match op {
+                PlannedOp::Dispatch { le, esc, .. } => (le.clone(), esc.clone()),
+                PlannedOp::Embed => (vec![tudo(&st.embd_stage)], vec![tudo(&st.b_x)]),
+                PlannedOp::KvAppend { .. } => (
+                    vec![tudo(&st.b_k), tudo(&st.b_v)],
+                    vec![tudo(&st.kcache), tudo(&st.vcache)],
+                ),
+            };
+            let raw = le.iter().any(|f| grupo_esc.iter().any(|g| sobrepoe(f, g)));
+            let war_waw = esc.iter().any(|f| {
+                grupo_esc.iter().any(|g| sobrepoe(f, g)) || grupo_le.iter().any(|g| sobrepoe(f, g))
+            });
+            let precisa = raw || war_waw;
+            if precisa {
+                grupo_le.clear();
+                grupo_esc.clear();
+            }
+            out.push(precisa);
+            grupo_le.extend(le);
+            grupo_esc.extend(esc);
+        }
+        out
+    }
+
     /// Barreira de memória global entre dispatches/cópias do mesmo command buffer.
     fn full_barrier(&self, cmd: vk::CommandBuffer) {
         let mb = vk::MemoryBarrier {
@@ -1568,6 +1666,12 @@ impl<'ctx> ResidentForward<'ctx> {
         }
 
         for (op_idx, op) in st.plan.iter().enumerate() {
+            // Com o perfil ligado, serializa tudo: sem barreira as ops de um mesmo grupo se
+            // sobrepõem e os timestamps de fim passam a medir a soma, não cada op. O TOTAL
+            // impresso fica então acima do tempo real de um token.
+            if st.barreiras[op_idx] || st.prof.is_some() {
+                self.full_barrier(cmd);
+            }
             match op {
                 PlannedOp::Embed => {
                     // Fonte: a linha do token (primeiro shard) ou a stream residual que
@@ -1603,7 +1707,6 @@ impl<'ctx> ResidentForward<'ctx> {
                     unsafe {
                         d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
                     }
-                    self.full_barrier(cmd);
                 }
                 PlannedOp::KvAppend { layer } => {
                     let off = ((layer * c.ctx + pos) * c.kv_dim * 4) as vk::DeviceSize;
@@ -1618,13 +1721,13 @@ impl<'ctx> ResidentForward<'ctx> {
                         d.cmd_copy_buffer(cmd, st.b_k.buffer, st.kcache.buffer, &[rk]);
                         d.cmd_copy_buffer(cmd, st.b_v.buffer, st.vcache.buffer, &[rk]);
                     }
-                    self.full_barrier(cmd);
                 }
                 PlannedOp::Dispatch {
                     pipe,
                     set,
                     groups,
                     push,
+                    ..
                 } => {
                     let p = self.pipe_of(*pipe);
                     let bytes: Vec<u8> = match push {
@@ -1697,7 +1800,6 @@ impl<'ctx> ResidentForward<'ctx> {
                         );
                         d.cmd_dispatch(cmd, *groups, 1, 1);
                     }
-                    self.full_barrier(cmd);
                 }
             }
             if let Some(pf) = &st.prof {
@@ -1713,9 +1815,12 @@ impl<'ctx> ResidentForward<'ctx> {
             }
         }
 
-        // Saída deste shard para o staging host-visible, no mesmo command buffer (o
-        // full_barrier da última op já ordena a escrita antes desta cópia). O último shard
-        // entrega logits; os demais entregam a stream residual, que segue para a próxima GPU.
+        // Fecha o último grupo de ops antes de ler o que ele escreveu.
+        self.full_barrier(cmd);
+
+        // Saída deste shard para o staging host-visible, no mesmo command buffer. O último
+        // shard entrega logits; os demais entregam a stream residual, que segue para a
+        // próxima GPU.
         let (src, n_out) = if c.shard.is_last() {
             (&st.b_logits, c.vocab)
         } else {
@@ -1833,11 +1938,17 @@ impl<'ctx> ResidentForward<'ctx> {
                 .collect();
             // SAFETY: d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
+            let (le_idx, esc_idx) = pipe.acessos();
+            let faixas = |idx: &[usize]| -> Vec<Faixa> {
+                idx.iter().filter_map(|&i| binds.get(i).copied()).collect()
+            };
             Ok(PlannedOp::Dispatch {
                 pipe,
                 set,
                 groups,
                 push,
+                le: faixas(le_idx),
+                esc: faixas(esc_idx),
             })
         };
 
@@ -1967,171 +2078,171 @@ impl<'ctx> ResidentForward<'ctx> {
                 )?;
             }
             if !eh_delta {
-            let (w_q, w_k, w_v, w_o) = match &lq.mixer {
-                MixerQ::Attn {
-                    attn_q,
-                    attn_k,
-                    attn_v,
-                    attn_output,
-                } => (attn_q, attn_k, attn_v, attn_output),
-                MixerQ::Delta { .. } => unreachable!("tratado acima"),
-            };
-            // No qwen35 a projeção de Q sai com query e gate por cabeça (2 × head_dim),
-            // e o conjunto de cabeças (head_dim × n_head) não é n_embd.
-            let hib = c.delta_net.is_some();
-            let attn_dim = if hib { c.head_dim * c.n_head } else { c.n_embd };
-            let q_out = if hib { attn_dim * 2 } else { c.n_embd };
-            plan.push(mv(w_q, &st.b_q, c.n_embd, q_out)?);
-            plan.push(mv(w_k, &st.b_k, c.n_embd, c.kv_dim)?);
-            plan.push(mv(w_v, &st.b_v, c.n_embd, c.kv_dim)?);
-            // QK-norm: RMSNorm por cabeça, in-place. No Q as cabeças estão espaçadas de
-            // 2 × head_dim porque o gate mora ao lado da query.
-            if let (Some(qn), Some(kn)) = (&la.q_norm, &la.k_norm) {
-                let push_qk = |n_heads: u32, stride: u32| {
-                    let mut v = Vec::with_capacity(20);
-                    v.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
-                    v.extend_from_slice(&n_heads.to_le_bytes());
-                    v.extend_from_slice(&2u32.to_le_bytes()); // modo QK-norm
-                    v.extend_from_slice(&c.rms_eps.to_le_bytes());
-                    v.extend_from_slice(&stride.to_le_bytes());
-                    v
+                let (w_q, w_k, w_v, w_o) = match &lq.mixer {
+                    MixerQ::Attn {
+                        attn_q,
+                        attn_k,
+                        attn_v,
+                        attn_output,
+                    } => (attn_q, attn_k, attn_v, attn_output),
+                    MixerQ::Delta { .. } => unreachable!("tratado acima"),
                 };
-                plan.push(mk(
-                    PipeId::DnNorm,
-                    &[
-                        (st.b_q.buffer, 0, nb(q_out)),
-                        (qn.buffer, 0, qn.size),
-                        (st.b_q.buffer, 0, nb(q_out)),
-                        (st.b_q.buffer, 0, nb(q_out)),
-                    ],
-                    u32::try_from(c.n_head).unwrap_or(u32::MAX),
-                    PushSpec::Static(push_qk(
+                // No qwen35 a projeção de Q sai com query e gate por cabeça (2 × head_dim),
+                // e o conjunto de cabeças (head_dim × n_head) não é n_embd.
+                let hib = c.delta_net.is_some();
+                let attn_dim = if hib { c.head_dim * c.n_head } else { c.n_embd };
+                let q_out = if hib { attn_dim * 2 } else { c.n_embd };
+                plan.push(mv(w_q, &st.b_q, c.n_embd, q_out)?);
+                plan.push(mv(w_k, &st.b_k, c.n_embd, c.kv_dim)?);
+                plan.push(mv(w_v, &st.b_v, c.n_embd, c.kv_dim)?);
+                // QK-norm: RMSNorm por cabeça, in-place. No Q as cabeças estão espaçadas de
+                // 2 × head_dim porque o gate mora ao lado da query.
+                if let (Some(qn), Some(kn)) = (&la.q_norm, &la.k_norm) {
+                    let push_qk = |n_heads: u32, stride: u32| {
+                        let mut v = Vec::with_capacity(20);
+                        v.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
+                        v.extend_from_slice(&n_heads.to_le_bytes());
+                        v.extend_from_slice(&2u32.to_le_bytes()); // modo QK-norm
+                        v.extend_from_slice(&c.rms_eps.to_le_bytes());
+                        v.extend_from_slice(&stride.to_le_bytes());
+                        v
+                    };
+                    plan.push(mk(
+                        PipeId::DnNorm,
+                        &[
+                            (st.b_q.buffer, 0, nb(q_out)),
+                            (qn.buffer, 0, qn.size),
+                            (st.b_q.buffer, 0, nb(q_out)),
+                            (st.b_q.buffer, 0, nb(q_out)),
+                        ],
                         u32::try_from(c.n_head).unwrap_or(u32::MAX),
-                        u32::try_from(c.head_dim * 2).unwrap_or(u32::MAX),
-                    )),
-                )?);
-                plan.push(mk(
-                    PipeId::DnNorm,
-                    &[
-                        (st.b_k.buffer, 0, nb(c.kv_dim)),
-                        (kn.buffer, 0, kn.size),
-                        (st.b_k.buffer, 0, nb(c.kv_dim)),
-                        (st.b_k.buffer, 0, nb(c.kv_dim)),
-                    ],
-                    u32::try_from(c.n_head_kv).unwrap_or(u32::MAX),
-                    PushSpec::Static(push_qk(
+                        PushSpec::Static(push_qk(
+                            u32::try_from(c.n_head).unwrap_or(u32::MAX),
+                            u32::try_from(c.head_dim * 2).unwrap_or(u32::MAX),
+                        )),
+                    )?);
+                    plan.push(mk(
+                        PipeId::DnNorm,
+                        &[
+                            (st.b_k.buffer, 0, nb(c.kv_dim)),
+                            (kn.buffer, 0, kn.size),
+                            (st.b_k.buffer, 0, nb(c.kv_dim)),
+                            (st.b_k.buffer, 0, nb(c.kv_dim)),
+                        ],
                         u32::try_from(c.n_head_kv).unwrap_or(u32::MAX),
-                        u32::try_from(c.head_dim).unwrap_or(u32::MAX),
-                    )),
-                )?);
-            }
-            if let Some(b) = &la.q_bias {
+                        PushSpec::Static(push_qk(
+                            u32::try_from(c.n_head_kv).unwrap_or(u32::MAX),
+                            u32::try_from(c.head_dim).unwrap_or(u32::MAX),
+                        )),
+                    )?);
+                }
+                if let Some(b) = &la.q_bias {
+                    plan.push(mk(
+                        PipeId::Add,
+                        &[(st.b_q.buffer, 0, nb(c.n_embd)), (b.buffer, 0, b.size)],
+                        Self::groups_for(c.n_embd),
+                        PushSpec::Static(n_push(c.n_embd)),
+                    )?);
+                }
+                if let Some(b) = &la.k_bias {
+                    plan.push(mk(
+                        PipeId::Add,
+                        &[(st.b_k.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
+                        Self::groups_for(c.kv_dim),
+                        PushSpec::Static(n_push(c.kv_dim)),
+                    )?);
+                }
+                if let Some(b) = &la.v_bias {
+                    plan.push(mk(
+                        PipeId::Add,
+                        &[(st.b_v.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
+                        Self::groups_for(c.kv_dim),
+                        PushSpec::Static(n_push(c.kv_dim)),
+                    )?);
+                }
                 plan.push(mk(
-                    PipeId::Add,
-                    &[(st.b_q.buffer, 0, nb(c.n_embd)), (b.buffer, 0, b.size)],
-                    Self::groups_for(c.n_embd),
-                    PushSpec::Static(n_push(c.n_embd)),
-                )?);
-            }
-            if let Some(b) = &la.k_bias {
-                plan.push(mk(
-                    PipeId::Add,
-                    &[(st.b_k.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
-                    Self::groups_for(c.kv_dim),
-                    PushSpec::Static(n_push(c.kv_dim)),
-                )?);
-            }
-            if let Some(b) = &la.v_bias {
-                plan.push(mk(
-                    PipeId::Add,
-                    &[(st.b_v.buffer, 0, nb(c.kv_dim)), (b.buffer, 0, b.size)],
-                    Self::groups_for(c.kv_dim),
-                    PushSpec::Static(n_push(c.kv_dim)),
-                )?);
-            }
-            plan.push(mk(
-                PipeId::Rope,
-                &[
-                    (st.b_q.buffer, 0, nb(q_out)),
-                    (st.freq_buf.buffer, 0, st.freq_buf.size),
-                ],
-                Self::groups_for(c.n_head * (c.rope_dim / 2)),
-                PushSpec::Rope {
-                    n_head: c.n_head as u32,
-                    stride: if hib {
-                        (c.head_dim * 2) as u32
-                    } else {
-                        c.head_dim as u32
-                    },
-                },
-            )?);
-            plan.push(mk(
-                PipeId::Rope,
-                &[
-                    (st.b_k.buffer, 0, nb(c.kv_dim)),
-                    (st.freq_buf.buffer, 0, st.freq_buf.size),
-                ],
-                Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
-                PushSpec::Rope {
-                    n_head: c.n_head_kv as u32,
-                    stride: c.head_dim as u32,
-                },
-            )?);
-            plan.push(PlannedOp::KvAppend { layer: l });
-            let layer_off = (l * c.ctx * c.kv_dim) as u32;
-            plan.push(mk(
-                PipeId::Attention,
-                &[
-                    (st.b_q.buffer, 0, nb(q_out)),
-                    (st.kcache.buffer, 0, st.kcache.size),
-                    (st.vcache.buffer, 0, st.vcache.size),
-                    (st.b_attn.buffer, 0, nb(attn_dim)),
-                ],
-                c.n_head as u32,
-                PushSpec::Attention {
-                    kv_layer_off: layer_off,
-                },
-            )?);
-            if !hib {
-                plan.push(mk(
-                    PipeId::QuantizeX,
+                    PipeId::Rope,
                     &[
-                        (st.b_attn.buffer, 0, nb(c.n_embd)),
-                        (st.b_xq.buffer, 0, st.b_xq.size),
-                        (st.b_xd.buffer, 0, st.b_xd.size),
-                    ],
-                    qx_groups(c.n_embd),
-                    PushSpec::Static(qx_push(c.n_embd)),
-                )?);
-            }
-            if hib {
-                // Portão do qwen35: a saída da atenção passa por sigmoid(gate), com o
-                // gate vindo da segunda metade da própria projeção de Q.
-                let mut pg = Vec::with_capacity(12);
-                pg.extend_from_slice(&u32::try_from(attn_dim).unwrap_or(0).to_le_bytes());
-                pg.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
-                pg.extend_from_slice(&0u32.to_le_bytes());
-                plan.push(mk(
-                    PipeId::GateMul,
-                    &[
-                        (st.b_attn.buffer, 0, nb(attn_dim)),
                         (st.b_q.buffer, 0, nb(q_out)),
+                        (st.freq_buf.buffer, 0, st.freq_buf.size),
                     ],
-                    Self::groups_for(attn_dim),
-                    PushSpec::Static(pg),
+                    Self::groups_for(c.n_head * (c.rope_dim / 2)),
+                    PushSpec::Rope {
+                        n_head: c.n_head as u32,
+                        stride: if hib {
+                            (c.head_dim * 2) as u32
+                        } else {
+                            c.head_dim as u32
+                        },
+                    },
                 )?);
                 plan.push(mk(
-                    PipeId::QuantizeX,
+                    PipeId::Rope,
                     &[
-                        (st.b_attn.buffer, 0, nb(attn_dim)),
-                        (st.b_xq.buffer, 0, st.b_xq.size),
-                        (st.b_xd.buffer, 0, st.b_xd.size),
+                        (st.b_k.buffer, 0, nb(c.kv_dim)),
+                        (st.freq_buf.buffer, 0, st.freq_buf.size),
                     ],
-                    qx_groups(attn_dim),
-                    PushSpec::Static(qx_push(attn_dim)),
+                    Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
+                    PushSpec::Rope {
+                        n_head: c.n_head_kv as u32,
+                        stride: c.head_dim as u32,
+                    },
                 )?);
-            }
-            plan.push(mv(w_o, &st.b_proj, attn_dim, c.n_embd)?);
+                plan.push(PlannedOp::KvAppend { layer: l });
+                let layer_off = (l * c.ctx * c.kv_dim) as u32;
+                plan.push(mk(
+                    PipeId::Attention,
+                    &[
+                        (st.b_q.buffer, 0, nb(q_out)),
+                        (st.kcache.buffer, 0, st.kcache.size),
+                        (st.vcache.buffer, 0, st.vcache.size),
+                        (st.b_attn.buffer, 0, nb(attn_dim)),
+                    ],
+                    c.n_head as u32,
+                    PushSpec::Attention {
+                        kv_layer_off: layer_off,
+                    },
+                )?);
+                if !hib {
+                    plan.push(mk(
+                        PipeId::QuantizeX,
+                        &[
+                            (st.b_attn.buffer, 0, nb(c.n_embd)),
+                            (st.b_xq.buffer, 0, st.b_xq.size),
+                            (st.b_xd.buffer, 0, st.b_xd.size),
+                        ],
+                        qx_groups(c.n_embd),
+                        PushSpec::Static(qx_push(c.n_embd)),
+                    )?);
+                }
+                if hib {
+                    // Portão do qwen35: a saída da atenção passa por sigmoid(gate), com o
+                    // gate vindo da segunda metade da própria projeção de Q.
+                    let mut pg = Vec::with_capacity(12);
+                    pg.extend_from_slice(&u32::try_from(attn_dim).unwrap_or(0).to_le_bytes());
+                    pg.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
+                    pg.extend_from_slice(&0u32.to_le_bytes());
+                    plan.push(mk(
+                        PipeId::GateMul,
+                        &[
+                            (st.b_attn.buffer, 0, nb(attn_dim)),
+                            (st.b_q.buffer, 0, nb(q_out)),
+                        ],
+                        Self::groups_for(attn_dim),
+                        PushSpec::Static(pg),
+                    )?);
+                    plan.push(mk(
+                        PipeId::QuantizeX,
+                        &[
+                            (st.b_attn.buffer, 0, nb(attn_dim)),
+                            (st.b_xq.buffer, 0, st.b_xq.size),
+                            (st.b_xd.buffer, 0, st.b_xd.size),
+                        ],
+                        qx_groups(attn_dim),
+                        PushSpec::Static(qx_push(attn_dim)),
+                    )?);
+                }
+                plan.push(mv(w_o, &st.b_proj, attn_dim, c.n_embd)?);
             }
             plan.push(mk(
                 PipeId::Add,
@@ -2669,13 +2780,7 @@ impl Drop for ResidentForward<'_> {
                 }
                 if let Some(dn) = &la.delta {
                     for b in [
-                        &dn.conv1d,
-                        &dn.adt,
-                        &dn.alpha,
-                        &dn.beta,
-                        &dn.norm,
-                        &dn.estado,
-                        &dn.janela,
+                        &dn.conv1d, &dn.adt, &dn.alpha, &dn.beta, &dn.norm, &dn.estado, &dn.janela,
                     ] {
                         b.destroy(d);
                     }
