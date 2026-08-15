@@ -107,3 +107,44 @@ fn pesos_das_duas_variantes_de_camada() {
         llama_model::MixerRaw::Delta { .. } => panic!("camada 3 devia ser de atenção"),
     }
 }
+
+#[test]
+fn pesos_auxiliares_das_camadas_lineares() {
+    let Some(bytes) = mapear() else {
+        eprintln!("Qwen3.8-27B ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
+    let dn = cfg.delta_net.clone().unwrap();
+
+    let aux = llama_model::GpuAuxWeights::from_gguf(&f, &bytes, &cfg).expect("pesos auxiliares");
+    assert_eq!(aux.layers.len(), 64);
+    assert_eq!(aux.token_embd.len(), cfg.vocab * cfg.n_embd);
+    assert_eq!(aux.freq_table.len(), cfg.rope_dim / 2);
+
+    // Camada 0 (linear): tem os tensores SSM e não tem QK-norm.
+    let l0 = &aux.layers[0];
+    assert!(l0.q_norm.is_none() && l0.k_norm.is_none());
+    let d = l0.delta.as_ref().expect("camada 0 é linear");
+    let conv_dim = dn.d_state * dn.n_k_heads * 2 + dn.head_v_dim() * dn.n_v_heads;
+    assert_eq!(conv_dim, 10240);
+    assert_eq!(d.conv1d.len(), dn.d_conv * conv_dim);
+    assert_eq!(d.a.len(), dn.n_v_heads);
+    assert_eq!(d.dt_bias.len(), dn.n_v_heads);
+    assert_eq!(d.alpha.len(), cfg.n_embd * dn.n_v_heads);
+    assert_eq!(d.beta.len(), cfg.n_embd * dn.n_v_heads);
+    assert_eq!(d.norm.len(), dn.head_v_dim());
+    // `ssm_a` guarda -exp(A_log): todo negativo, senão o estado cresceria sem limite.
+    assert!(
+        d.a.iter().all(|&v| v < 0.0),
+        "ssm_a devia ser negativo: {:?}",
+        &d.a[..4]
+    );
+
+    // Camada 3 (atenção): tem QK-norm e não tem tensores SSM.
+    let l3 = &aux.layers[3];
+    assert!(l3.delta.is_none());
+    assert_eq!(l3.q_norm.as_ref().unwrap().len(), cfg.head_dim);
+    assert_eq!(l3.k_norm.as_ref().unwrap().len(), cfg.head_dim);
+}

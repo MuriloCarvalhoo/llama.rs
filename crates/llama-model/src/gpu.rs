@@ -161,9 +161,12 @@ impl<'a> GpuRawWeights<'a> {
 }
 
 /// Pesos auxiliares f32 que o decode GPU-resident precisa (norm/bias/freq/embd).
-/// `token_embd` é emprestado do Model (grande); o resto é copiado (pequeno).
+///
+/// `token_embd` é emprestado quando vem do `Model` (são gigabytes: 5.1 GB no vocabulário
+/// de 248320 do Qwen3.8) e possuído quando lido direto do GGUF; o resto é sempre copiado,
+/// porque é pequeno.
 pub struct GpuAuxWeights<'a> {
-    pub token_embd: &'a [f32], // [vocab * n_embd]
+    pub token_embd: std::borrow::Cow<'a, [f32]>, // [vocab * n_embd]
     pub layers: Vec<AuxLayer>,
     pub output_norm: Vec<f32>, // [n_embd]
     pub freq_table: Vec<f32>,  // [rope_dim/2]
@@ -176,6 +179,31 @@ pub struct AuxLayer {
     pub q_bias: Option<Vec<f32>>, // [n_embd]
     pub k_bias: Option<Vec<f32>>, // [kv_dim]
     pub v_bias: Option<Vec<f32>>, // [kv_dim]
+    /// QK-norm por cabeça — `Some` nas camadas de atenção do `qwen35`. [head_dim]
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
+    /// `Some` nas camadas de atenção linear do `qwen35`.
+    pub delta: Option<DeltaAux>,
+}
+
+/// Pesos f32 de uma camada de atenção linear (gated delta net).
+///
+/// `alpha` e `beta` são matrizes de projeção que o GGUF guarda em f32 — cada uma tem
+/// `n_embd × n_v_heads` (≈1 MB por camada no Qwen3.8-27B), pequenas o bastante para não
+/// valer quantizar, mas grandes o bastante para precisarem de um matvec f32 na GPU.
+pub struct DeltaAux {
+    /// Kernel da convolução causal, `[conv_dim][d_conv]` (layout do GGUF).
+    pub conv1d: Vec<f32>,
+    /// `-exp(A_log)`, já aplicado no GGUF. [n_v_heads]
+    pub a: Vec<f32>,
+    /// Bias somado a `alpha` antes do softplus. [n_v_heads]
+    pub dt_bias: Vec<f32>,
+    /// Projeção do log-decaimento. [n_embd * n_v_heads]
+    pub alpha: Vec<f32>,
+    /// Projeção da força do delta rule. [n_embd * n_v_heads]
+    pub beta: Vec<f32>,
+    /// Norma aplicada à saída de cada cabeça. [head_v_dim]
+    pub norm: Vec<f32>,
 }
 
 /// Decode 100% na GPU: a stack inteira do token roda na GPU, KV-cache residente.
@@ -185,6 +213,96 @@ pub trait GpuResidentDecode {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, ModelError>;
     /// Zera o comprimento do KV-cache interno (início de nova sequência).
     fn reset(&self);
+}
+
+impl<'a> GpuAuxWeights<'a> {
+    /// Lê os pesos auxiliares direto do GGUF, sem passar pelo `Model`.
+    ///
+    /// O caminho por `Model::gpu_aux_weights` exige a estrutura densa (`attn_q` em toda
+    /// camada), que o `qwen35` não tem. Aqui cada camada é lida conforme a sua variante.
+    pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+        let f32s = |name: &str, esperado: usize| -> Result<Vec<f32>, ModelError> {
+            let info = f
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| ModelError::Gpu(format!("tensor {name} ausente")))?;
+            let raw = f
+                .tensor_data(bytes, info)
+                .map_err(|e| ModelError::Gpu(e.to_string()))?;
+            let v = ggml_cpu::dequant_to_f32(raw, info.ggml_type)
+                .map_err(|e| ModelError::Gpu(format!("{name}: {e}")))?;
+            if v.len() != esperado {
+                return Err(ModelError::Gpu(format!(
+                    "tensor {name}: {} floats, esperado {esperado}",
+                    v.len()
+                )));
+            }
+            Ok(v)
+        };
+
+        let mut layers = Vec::with_capacity(cfg.n_layer);
+        for l in 0..cfg.n_layer {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            let dn = cfg.delta_net.as_ref();
+            let linear = dn.is_some_and(|d| d.eh_linear(l));
+            // No qwen35 a segunda norma se chama `post_attention_norm`; nas arquiteturas
+            // densas, `ffn_norm`. As duas ficam no mesmo lugar do esqueleto da camada.
+            let segunda_norma = if dn.is_some() {
+                p("post_attention_norm.weight")
+            } else {
+                p("ffn_norm.weight")
+            };
+            let (q_norm, k_norm) = if dn.is_some() && !linear {
+                (
+                    Some(f32s(&p("attn_q_norm.weight"), cfg.head_dim)?),
+                    Some(f32s(&p("attn_k_norm.weight"), cfg.head_dim)?),
+                )
+            } else {
+                (None, None)
+            };
+            let delta = match (linear, dn) {
+                (true, Some(d)) => {
+                    let conv_dim = d.d_state * d.n_k_heads * 2 + d.head_v_dim() * d.n_v_heads;
+                    Some(DeltaAux {
+                        conv1d: f32s(&p("ssm_conv1d.weight"), d.d_conv * conv_dim)?,
+                        a: f32s(&p("ssm_a"), d.n_v_heads)?,
+                        dt_bias: f32s(&p("ssm_dt.bias"), d.n_v_heads)?,
+                        alpha: f32s(&p("ssm_alpha.weight"), cfg.n_embd * d.n_v_heads)?,
+                        beta: f32s(&p("ssm_beta.weight"), cfg.n_embd * d.n_v_heads)?,
+                        norm: f32s(&p("ssm_norm.weight"), d.head_v_dim())?,
+                    })
+                }
+                _ => None,
+            };
+            layers.push(AuxLayer {
+                attn_norm: f32s(&p("attn_norm.weight"), cfg.n_embd)?,
+                ffn_norm: f32s(&segunda_norma, cfg.n_embd)?,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                q_norm,
+                k_norm,
+                delta,
+            });
+        }
+
+        let meia = cfg.rope_dim / 2;
+        let freq_table: Vec<f32> = (0..meia)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let expo = (2 * i) as f32 / cfg.rope_dim as f32;
+                1.0 / cfg.freq_base.powf(expo)
+            })
+            .collect();
+
+        Ok(Self {
+            token_embd: std::borrow::Cow::Owned(f32s("token_embd.weight", cfg.vocab * cfg.n_embd)?),
+            layers,
+            output_norm: f32s("output_norm.weight", cfg.n_embd)?,
+            freq_table,
+        })
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -281,10 +399,13 @@ impl Model<'_> {
                 q_bias: bias(&lw.attn_q_bias)?,
                 k_bias: bias(&lw.attn_k_bias)?,
                 v_bias: bias(&lw.attn_v_bias)?,
+                q_norm: None,
+                k_norm: None,
+                delta: None,
             });
         }
         Ok(GpuAuxWeights {
-            token_embd,
+            token_embd: std::borrow::Cow::Borrowed(token_embd),
             layers,
             output_norm,
             freq_table,
