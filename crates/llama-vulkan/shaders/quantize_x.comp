@@ -8,6 +8,13 @@
 // mais instrucoes que o proprio produto interno.
 //
 // Saida: xq[8 ints por bloco] (4 i8 empacotados por int) e xd[1 float por bloco].
+//
+// A soma dos int8 do bloco — que os K-quants usam para tirar o termo constante do laco —
+// NAO entra aqui, embora nao dependa dos pesos e seja recalculada por cada uma das n_out
+// linhas. Ja foi medida das duas formas: num buffer proprio custou +6%, e empacotada num
+// `vec2` junto da escala (sem load adicional, so 8 B em vez de 4) custou +3%. Os dois
+// resultados dizem a mesma coisa: depois do dot empacotado o matvec e limitado por
+// memoria, e trocar ~8 instrucoes VALU por mais bytes lidos e mau negocio.
 
 layout(local_size_x = 64) in;
 

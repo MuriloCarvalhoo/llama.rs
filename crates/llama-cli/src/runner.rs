@@ -168,7 +168,8 @@ pub fn run_generate(
     // Só no caminho CPU: MPOL_BIND restringe as alocações à RAM de um único nó, e
     // nos backends GPU (onde os pesos vão para a VRAM) isso apenas corta pela metade
     // a memória disponível — um modelo de 15 GB é morto por OOM com RAM livre no nó 1.
-    if !(args.gpu || args.gpu_single || args.gpu_resident) {
+    let usa_gpu = args.gpu || args.gpu_single || args.gpu_resident || args.gpu_layer_split;
+    if !usa_gpu {
         init_numa_before_load();
     }
 
@@ -184,12 +185,18 @@ pub fn run_generate(
     };
     // Criar pool rayon DEPOIS do load: workers herdam afinidade e política de memória.
     init_rayon_after_model_load();
-    // Acordar todos os workers rayon com um broadcast noop — evita latência de
-    // wakeup no primeiro matmul paralelo (workers ficam em spin-wait ~1ms após wakeup).
-    rayon::broadcast(|_| {});
-    // Inicializar spin pool com N-1 workers (N = rayon thread count).
-    // Pinar workers ao node 0 (mesma afinidade dos rayon workers) para acesso local à RAM.
-    {
+    // O spin pool serve só ao matmul Q8_0 de CPU. Nos backends GPU ele nunca é
+    // despachado, mas os N-1 workers ficam em busy-wait permanente queimando todos os
+    // núcleos: o `perf` de um decode do 32B em layer-split mostrou 97.6% dos ciclos em
+    // `llama-spin`. A thread que grava o command buffer, copia os logits e faz o argmax
+    // disputa CPU com eles, e o tempo por token oscilava 13.4–15.1 tok/s sem que o
+    // tempo de GPU mudasse.
+    if !usa_gpu {
+        // Acordar todos os workers rayon com um broadcast noop — evita latência de
+        // wakeup no primeiro matmul paralelo (workers ficam em spin-wait ~1ms após wakeup).
+        rayon::broadcast(|_| {});
+        // Inicializar spin pool com N-1 workers (N = rayon thread count).
+        // Pinar workers ao node 0 (mesma afinidade dos rayon workers) para acesso local à RAM.
         #[cfg(target_os = "linux")]
         let numa0_cpus = read_numa_node_cpus(0);
         #[cfg(not(target_os = "linux"))]

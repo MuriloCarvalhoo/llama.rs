@@ -5,14 +5,28 @@
 
 // Matvec Q5_K: y[n_out] = W[n_out x n_in] * x[n_in], com W em superblocos Q5_K.
 //
-// Superbloco = 256 elementos em 176 bytes = 44 uints:
-//   uint 0      : d (f16 baixo) | dmin (f16 alto)
-//   uint 1..3   : scales[12] — 8 pares (escala, minimo) de 6 bits
-//   uint 4..11  : qh[32]     — o 5o bit de cada elemento
-//   uint 12..43 : qs[128]    — 4 bits baixos, dois elementos por byte
+// Superbloco = 256 elementos em 176 bytes = 44 uints = **11 uvec4**:
+//   uvec4 0     : .x = d|dmin (f16 par), .yzw = scales[12] — 8 pares (escala, minimo) de 6 bits
+//   uvec4 1..2  : qh[32]  — o 5o bit de cada elemento
+//   uvec4 3..10 : qs[128] — 4 bits baixos, dois elementos por byte
+//
+// Todo o superbloco cai em fronteira de 16 bytes (176 = 11*16), e as linhas tambem
+// (n_sb*176), entao o buffer inteiro e indexavel como uvec4 sem nenhum repack.
 //
 // Paralelizacao: o superbloco tem 8 sub-blocos de 32 elementos, cada um com escala e
 // minimo proprios — entao 8 lanes cobrem um superbloco e as 64 lanes do wave cobrem 8.
+//
+// **Ler em uvec4 e o que fecha a banda.** Com loads escalares cada lane emitia 17 requests
+// de 4 B por superbloco (1 de d/dmin, 3 de scales, 8 de qh, 8 de qs = 68 B); em uvec4 sao
+// **5 requests de 16 B** — os mesmos 80 B, com 3.4x menos requests ao L1. O kernel nao
+// estava limitado por bytes de HBM (o L2 ja deduplicava a redundancia entre lanes), estava
+// limitado pela taxa de requests: medimos 465 GB/s efetivos de 717 GB/s de pico.
+//
+// Ja medimos a alternativa de reduzir a *redundancia* em vez dos requests (uma lane
+// cuidando do par de sub-blocos que compartilha os mesmos bytes de qs, 4 lanes por
+// superbloco): ficou **4% mais lento**. Com 20 superblocos por linha — o n_embd/256 do
+// 32B — 4 lanes por superbloco deixam 16 das 64 lanes ociosas na ultima rodada, e a
+// ociosidade custa mais do que a leitura duplicada, que o cache absorve.
 //
 // A ativacao chega ja quantizada em int8 por `quantize_x.comp`, em blocos de 32 elementos.
 // Isso casa exatamente com o sub-bloco do Q5_K, o que permite usar o mesmo dot empacotado
@@ -26,20 +40,21 @@
 // e soma(x) vem de um segundo dot contra 0x01010101 sobre o mesmo `xq` ja em registrador.
 //
 // Ja tentamos pre-calcular soma(x) no `quantize_x.comp` (ela nao depende dos pesos, entao
-// e recalculada por todas as n_out linhas): ficou 6% MAIS LENTO. Trocar ~8 instrucoes VALU
-// por 2 loads de memoria e mau negocio aqui — depois do dot empacotado este kernel passou
-// a ser limitado por memoria, nao por ALU.
+// e recalculada por todas as n_out linhas) de duas formas: em buffer proprio, +6%; e
+// empacotada num `vec2` junto da escala que este laco ja lia — sem load adicional, so 8 B
+// em vez de 4 — ainda +3%. Trocar ~8 instrucoes VALU por bytes lidos e mau negocio aqui:
+// depois do dot empacotado o kernel e limitado por memoria, nao por ALU.
 
 // 4 waves por workgroup, uma linha de saida cada. O trabalho por wave e o mesmo de um
 // workgroup de 64, mas o numero de workgroups cai 4x: com 1 wave por workgroup a GPU
 // esbarra no limite de workgroups residentes por CU antes de encher os slots de wave, e
-// a latencia dos loads deixa de ser escondida (medimos ~420 GB/s de 717 GB/s de pico).
+// a latencia dos loads deixa de ser escondida.
 layout(local_size_x = 256) in;
 const uint ROWS_PER_WG = 4u;
 
-layout(set = 0, binding = 0) readonly buffer WeightBuf { uint w[]; } weight_buf;
-// Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
-layout(set = 0, binding = 1) readonly buffer XqBuf { int xq[]; } xq_buf;
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
+// Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada) = 2 ivec4.
+layout(set = 0, binding = 1) readonly buffer XqBuf { ivec4 xq4[]; } xq_buf;
 // Escala (d_x) por bloco de 32 da ativacao.
 layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
 layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
@@ -50,26 +65,33 @@ layout(push_constant) uniform PC {
     uint row_offset; // vestigial (saida indexada por row absoluta)
 } pc;
 
-const uint UINTS_PER_SB = 44u;   // 176 bytes
+const uint UVEC4_PER_SB = 11u;   // 176 bytes
 
-// Byte `i` do superbloco. Usado so pelas escalas (3 leituras por superbloco).
-uint sb_byte(uint base_u, uint i) {
-    return (weight_buf.w[base_u + (i >> 2u)] >> (8u * (i & 3u))) & 0xFFu;
+// Byte `i` (0..11) de scales[], que ocupa os bytes 4..15 do superbloco — os componentes
+// .yzw do primeiro uvec4, aqui ja em registrador.
+uint scale_byte(uvec4 hdr, uint i) {
+    uint word = i < 4u ? hdr.y : (i < 8u ? hdr.z : hdr.w);
+    return (word >> (8u * (i & 3u))) & 0xFFu;
 }
 
 // Escala e minimo de 6 bits do sub-bloco `j` (0..7), do mesmo esquema do Q4_K.
-void scale_min(uint base_u, uint j, out uint sc, out uint m) {
-    // scales[] ocupa os bytes 4..15 do superbloco.
+void scale_min(uvec4 hdr, uint j, out uint sc, out uint m) {
     if (j < 4u) {
-        sc = sb_byte(base_u, 4u + j) & 63u;
-        m  = sb_byte(base_u, 4u + j + 4u) & 63u;
+        sc = scale_byte(hdr, j) & 63u;
+        m  = scale_byte(hdr, j + 4u) & 63u;
     } else {
-        uint a = sb_byte(base_u, 4u + j + 4u);
-        uint b = sb_byte(base_u, 4u + j - 4u);
-        uint c = sb_byte(base_u, 4u + j);
+        uint a = scale_byte(hdr, j + 4u);
+        uint b = scale_byte(hdr, j - 4u);
+        uint c = scale_byte(hdr, j);
         sc = (a & 0xFu) | ((b >> 6u) << 4u);
         m  = (a >> 4u)  | ((c >> 6u) << 4u);
     }
+}
+
+// Monta os 4 pesos de 5 bits empacotados em bytes, prontos para o dot: nibble de `qsw`
+// (baixo ou alto) mais o 5o bit vindo do bit `j` de cada byte de `qhw`.
+uint wpack(uint qsw, uint qhw, bool hi, uint j) {
+    return ((hi ? (qsw >> 4u) : qsw) & 0x0F0F0F0Fu) | (((qhw >> j) & 0x01010101u) << 4u);
 }
 
 void main() {
@@ -78,15 +100,15 @@ void main() {
     // `row` nao depende de `lane`, entao o return e uniforme no subgroup.
     if (row >= pc.n_out) { return; }
 
-    uint n_sb = pc.n_in / 256u;              // superblocos por linha
-    uint row_u = row * n_sb * UINTS_PER_SB;  // inicio da linha, em uints
+    uint n_sb = pc.n_in / 256u;               // superblocos por linha
+    uint row4 = row * n_sb * UVEC4_PER_SB;    // inicio da linha, em uvec4
 
     uint j = lane & 7u;           // qual sub-bloco de 32
     uint sb_in_grp = lane >> 3u;  // qual superbloco do grupo de 8
 
     // Nos bytes de qs os sub-blocos pares usam o nibble baixo e os impares o alto do mesmo
     // byte, dentro de grupos de 64 elementos. Invariante no laco.
-    uint qs_u0 = 12u + (j >> 1u) * 8u;   // qs[] comeca no byte 48 = uint 12
+    uint qs_v0 = 3u + (j >> 1u) * 2u;   // qs[] comeca no uvec4 3
     bool hi_nibble = (j & 1u) != 0u;
 
     float acc = 0.0;
@@ -94,25 +116,40 @@ void main() {
         uint sb = sb0 + sb_in_grp;
         if (sb >= n_sb) { continue; }
 
-        uint base_u = row_u + sb * UINTS_PER_SB;
-        vec2 dm = unpackHalf2x16(weight_buf.w[base_u]);   // .x = d, .y = dmin
+        uint base4 = row4 + sb * UVEC4_PER_SB;
+        uvec4 hdr = weight_buf.w4[base4];
+        vec2 dm = unpackHalf2x16(hdr.x);   // .x = d, .y = dmin
         uint sc, m;
-        scale_min(base_u, j, sc, m);
+        scale_min(hdr, j, sc, m);
+
+        uvec4 qh0 = weight_buf.w4[base4 + 1u];
+        uvec4 qh1 = weight_buf.w4[base4 + 2u];
+        uvec4 qs0 = weight_buf.w4[base4 + qs_v0];
+        uvec4 qs1 = weight_buf.w4[base4 + qs_v0 + 1u];
 
         uint blk = sb * 8u + j;   // bloco de 32 da ativacao == este sub-bloco
-        uint xq0 = blk * 8u;
-
+        ivec4 xa = xq_buf.xq4[blk * 2u];
+        ivec4 xb = xq_buf.xq4[blk * 2u + 1u];
+        // Componentes constantes: indexar uvec4 por variavel forcaria spill para scratch.
         int isum = 0;  // soma q*xq
         int isx = 0;   // soma xq
-        for (uint t = 0u; t < 8u; t++) {
-            uint qsw = weight_buf.w[base_u + qs_u0 + t];  // 4 elementos (1 nibble cada)
-            uint qhw = weight_buf.w[base_u + 4u + t];     // os 5os bits dos mesmos 4
-            uint wp = ((hi_nibble ? (qsw >> 4u) : qsw) & 0x0F0F0F0Fu)
-                    | (((qhw >> j) & 0x01010101u) << 4u);
-            int xw = xq_buf.xq[xq0 + t];
-            isum = dotPacked4x8AccSatEXT(int(wp), xw, isum);
-            isx = dotPacked4x8AccSatEXT(0x01010101, xw, isx);
-        }
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs0.x, qh0.x, hi_nibble, j)), xa.x, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs0.y, qh0.y, hi_nibble, j)), xa.y, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs0.z, qh0.z, hi_nibble, j)), xa.z, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs0.w, qh0.w, hi_nibble, j)), xa.w, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs1.x, qh1.x, hi_nibble, j)), xb.x, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs1.y, qh1.y, hi_nibble, j)), xb.y, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs1.z, qh1.z, hi_nibble, j)), xb.z, isum);
+        isum = dotPacked4x8AccSatEXT(int(wpack(qs1.w, qh1.w, hi_nibble, j)), xb.w, isum);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xa.x, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xa.y, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xa.z, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xa.w, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xb.x, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xb.y, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xb.z, isx);
+        isx = dotPacked4x8AccSatEXT(0x01010101, xb.w, isx);
+
         acc += xd_buf.xd[blk] * (dm.x * float(sc) * float(isum) - dm.y * float(m) * float(isx));
     }
 

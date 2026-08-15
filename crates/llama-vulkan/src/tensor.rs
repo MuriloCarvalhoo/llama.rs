@@ -231,6 +231,42 @@ pub(crate) fn alloc_and_bind(
     buf: vk::Buffer,
     host_visible: bool,
 ) -> Result<vk::DeviceMemory, vk::Result> {
+    let required_flags = if host_visible {
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+    } else {
+        vk::MemoryPropertyFlags::DEVICE_LOCAL
+    };
+    alloc_with_flags(ctx, phys, dev, buf, required_flags)
+}
+
+/// Como `alloc_and_bind(.., true)`, mas exigindo **HOST_CACHED**.
+///
+/// Sem esse bit o driver entrega o primeiro tipo host-visible, que na MI50 é
+/// write-combining: ótimo para a CPU escrever, péssimo para ela ler. Copiar os 608 KB de
+/// logits do 32B custava **4.2 ms/token (145 MB/s)**; com memória cacheada a mesma cópia
+/// some do perfil. Cai no tipo não-cacheado se o device não oferecer nenhum.
+pub(crate) fn alloc_and_bind_cached(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &ash::Device,
+    buf: vk::Buffer,
+) -> Result<vk::DeviceMemory, vk::Result> {
+    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    match alloc_with_flags(ctx, phys, dev, buf, cached) {
+        Ok(mem) => Ok(mem),
+        Err(_) => alloc_and_bind(ctx, phys, dev, buf, true),
+    }
+}
+
+fn alloc_with_flags(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &ash::Device,
+    buf: vk::Buffer,
+    required_flags: vk::MemoryPropertyFlags,
+) -> Result<vk::DeviceMemory, vk::Result> {
     // SAFETY: ctx.instance e phys.handle sao validos.
     let mem_props = unsafe {
         ctx.instance
@@ -239,12 +275,6 @@ pub(crate) fn alloc_and_bind(
 
     // SAFETY: dev e valido; buf foi criado com sucesso pelo caller.
     let mem_reqs = unsafe { dev.get_buffer_memory_requirements(buf) };
-
-    let required_flags = if host_visible {
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-    } else {
-        vk::MemoryPropertyFlags::DEVICE_LOCAL
-    };
 
     let mem_type_idx = (0..mem_props.memory_type_count)
         .find(|&i| {

@@ -1,6 +1,7 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
-layout(local_size_x = 64) in;
+#extension GL_KHR_shader_subgroup_basic : enable
+layout(local_size_x = 512) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;   // [n_head*head_dim]
 layout(set = 0, binding = 1) readonly buffer KBuf { float k[]; } kb;   // KV-cache K (camada via kv_layer_off)
@@ -12,16 +13,31 @@ layout(push_constant) uniform PC {
     uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos f32
 } pc;
 
-const uint WG = 64u;      // local_size_x (wave64 no MI50)
+const uint WG = 64u;      // lanes por wave (wave64 no MI50)
+const uint NWAVE = 8u;    // waves por head — local_size_x / WG
 const uint MAX_DPL = 4u;  // dimensoes por lane -> suporta head_dim ate 256
 
-// 1 workgroup por head. Cada lane cuida das dimensoes lane, lane+WG, lane+2*WG...
-// Com head_dim <= WG e uma dimensao por lane e o kernel e bit-identico a versao
-// anterior (dpl=1, subgroupAdd de um unico produto por lane).
+// 1 workgroup por head, **NWAVE waves por workgroup**, cada wave varrendo as posicoes
+// j = w, w+NWAVE, w+2*NWAVE... Cada lane cuida das dimensoes lane, lane+WG, ...
+//
+// Por que dividir as posicoes entre waves: o laco sobre `total_len` e uma cadeia serial
+// (o softmax online carrega m/l/acc de uma iteracao para a seguinte) e cada passo tem um
+// `subgroupAdd`, cuja latencia nao tem como ser escondida — com 1 wave por head o
+// Qwen2.5-32B poe **40 waves** numa GPU de 240 SIMDs e deixa 83% dela parada. Medimos o
+// kernel lendo o KV-cache a 3.7 GB/s contra 717 GB/s de pico: o gargalo nunca foi banda,
+// foi a serializacao. Com NWAVE waves a cadeia encurta NWAVE vezes e a ocupancia sobe na
+// mesma proporcao; os NWAVE parciais se combinam no fim pela mesma algebra do softmax
+// online, que e associativa em (m, l, acc).
+shared float s_m[NWAVE];
+shared float s_l[NWAVE];
+shared float s_acc[NWAVE * 256u];
+
 void main() {
     uint h = gl_WorkGroupID.x;
-    uint lane = gl_LocalInvocationID.x;
-    if (h >= pc.n_head) return;
+    // Uniforme no workgroup — nenhum `barrier()` abaixo fica em fluxo divergente.
+    if (h >= pc.n_head) { return; }
+    uint w = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
     uint n_rep = pc.n_head / pc.n_head_kv;
     uint kv_h = h / n_rep;
     float scale = inversesqrt(float(pc.head_dim));
@@ -35,9 +51,9 @@ void main() {
         qd[i] = (d < pc.head_dim) ? qb.q[h * pc.head_dim + d] : 0.0;
     }
 
-    float m = -1.0e30;   // max corrente
-    float l = 0.0;       // soma corrente de exp
-    for (uint j = 0u; j < pc.total_len; j++) {
+    float m = -1.0e30;   // max corrente desta wave
+    float l = 0.0;       // soma corrente de exp desta wave
+    for (uint j = w; j < pc.total_len; j += NWAVE) {
         uint kvbase = pc.kv_layer_off + j * pc.kv_dim + kv_h * pc.head_dim;
         // Produto interno q.k do head: soma parcial por lane sobre suas dimensoes,
         // depois reducao no subgroup -> score uniforme em todas as lanes.
@@ -58,10 +74,34 @@ void main() {
         }
         m = m_new;
     }
+
+    // Publica o parcial da wave. Uma wave sem nenhuma posicao (total_len < NWAVE) sai com
+    // l = 0 e peso exp(-1e30 - m_all) = 0, entao nao contamina a combinacao.
+    if (lane == 0u) { s_m[w] = m; s_l[w] = l; }
     for (uint i = 0u; i < dpl; i++) {
         uint d = lane + i * WG;
-        if (d < pc.head_dim) {
-            ob.o[h * pc.head_dim + d] = acc[i] / l;
+        if (d < pc.head_dim) { s_acc[w * pc.head_dim + d] = acc[i]; }
+    }
+    barrier();
+
+    if (w == 0u) {
+        float m_all = -1.0e30;
+        for (uint kk = 0u; kk < NWAVE; kk++) { m_all = max(m_all, s_m[kk]); }
+        float peso[NWAVE];
+        float l_all = 0.0;
+        for (uint kk = 0u; kk < NWAVE; kk++) {
+            peso[kk] = exp(s_m[kk] - m_all);
+            l_all += s_l[kk] * peso[kk];
+        }
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            if (d < pc.head_dim) {
+                float o = 0.0;
+                for (uint kk = 0u; kk < NWAVE; kk++) {
+                    o += peso[kk] * s_acc[kk * pc.head_dim + d];
+                }
+                ob.o[h * pc.head_dim + d] = o / l_all;
+            }
         }
     }
 }

@@ -61,6 +61,25 @@ impl Buf {
         })
     }
 
+    /// Buffer host-visible que a **CPU vai ler** (readback). A diferença para `host` é o
+    /// bit HOST_CACHED — ver `tensor::alloc_and_bind_cached`.
+    fn host_read(
+        ctx: &VulkanContext,
+        phys: &VulkanPhysicalDevice,
+        d: &ash::Device,
+        bytes: vk::DeviceSize,
+    ) -> Result<Self, MatmulError> {
+        use crate::tensor::{alloc_and_bind_cached, create_buf};
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let buffer = create_buf(d, bytes, usage)?;
+        let mem = alloc_and_bind_cached(ctx, phys, d, buffer)?;
+        Ok(Self {
+            buffer,
+            mem,
+            size: bytes,
+        })
+    }
+
     fn destroy(&self, d: &ash::Device) {
         // SAFETY: handles criados por nós; chamado no Drop, sem uso concorrente.
         unsafe {
@@ -426,7 +445,7 @@ impl<'ctx> ResidentForward<'ctx> {
         use crate::tensor::one_shot_copy;
         let d = &self.dev.device;
         let bytes = (len * std::mem::size_of::<f32>()) as vk::DeviceSize;
-        let host = Buf::host(self.ctx, self.phys(), d, bytes)?;
+        let host = Buf::host_read(self.ctx, self.phys(), d, bytes)?;
         one_shot_copy(
             d,
             self.dev.queue,
@@ -711,7 +730,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
                 // Saída deste shard: logits no último, stream residual nos demais.
-                logits_host: Buf::host(
+                logits_host: Buf::host_read(
                     ctx,
                     phys,
                     d,
@@ -781,7 +800,8 @@ impl<'ctx> ResidentForward<'ctx> {
         head_dim: usize,
         total_len: usize,
     ) -> Result<Vec<f32>, MatmulError> {
-        if head_dim > 64 {
+        // O shader distribui até MAX_DPL=4 dimensões por lane sobre 64 lanes.
+        if head_dim > 256 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
         #[repr(C)]
