@@ -1,18 +1,21 @@
 # Progresso — llama-rs
 
-**Última atualização:** 2026-08-14 (K-quants no decode residente + 32B em layer-split)
+**Última atualização:** 2026-08-15 (32B em layer-split passa o llama.cpp)
 
-## Estado em números (2026-08-14)
+## Estado em números (2026-08-15)
 
 | Config | llama-rs | llama.cpp | razão |
 |---|---|---|---|
-| Qwen2.5-32B Q5_K_M, 2× MI50 (layer-split) | **13.5 tok/s** | 16.36 tok/s (ROCm) | **0.82×** |
+| Qwen2.5-32B Q5_K_M, 2× MI50 (layer-split) | **19.3 tok/s** | 18.02 ± 0.08 (ROCm) | **1.07×** |
 | Qwen2.5-14B Q8_0, 1× MI50 | **28.4 tok/s** | 40.59 tok/s (Vulkan) | 0.70× |
 | Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 tok/s (Vulkan) | 0.37× |
 
 O 32B é o primeiro caso que **justifica** o layer-split: 22.2 GB não cabem nos 16.3 GiB
 de uma MI50. Dividido, ocupa 10.4 GB na GPU0 e 12.2 GB na GPU1, com uma única
-sincronização por token (a stream residual de `n_embd` floats).
+sincronização por token (a stream residual de `n_embd` floats). É também o primeiro
+caso em que o llama-rs **passa o llama.cpp**: 19.17–19.40 tok/s em 5 medições contra
+18.02 ± 0.08 do `llama-bench -n 128` no mesmo arquivo (protocolo idêntico: 128 tokens,
+greedy, contexto pequeno).
 
 O 14B saiu de **4.77 → 28.0 tok/s (5.9×)** nesta sessão. Perfil atual do 14B
 (`LLAMA_RS_PROFILE=1`): GPU 27.8 ms/token, host 3.0 ms/token.
@@ -35,7 +38,7 @@ bloco Q8_0 (contra 34 B do formato) custa 5.9%, e Q4_K quase metade. Ver
 
 ## Resumo em uma frase
 
-CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente correto e a **0.70–0.82× do llama.cpp**, com Q8_0, Q5_K e Q6_K; **layer-split entre as 2 GPUs funcionando** e validado no caso que o justifica (Qwen2.5-32B, 22.2 GB, que não cabe em uma placa). Tensor-parallel row-split foi **descartado por medição** — sem P2P de VRAM neste hardware, o custo de sincronização supera o ganho.
+CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente correto, com Q8_0, Q5_K e Q6_K, e **1.07× o llama.cpp no Qwen2.5-32B em layer-split** — o caso que justifica dividir, porque 22.2 GB não cabem numa placa. Tensor-parallel row-split foi **descartado por medição** — sem P2P de VRAM neste hardware, o custo de sincronização supera o ganho.
 
 ---
 
@@ -250,19 +253,100 @@ a mesma ativação int8): < 1e-5 nos dois shaders.
 
 ---
 
+## Sessão 2026-08-15 — o 32B passa o llama.cpp (14.7 → 19.3 tok/s)
+
+Alvo: bater o llama.cpp no Qwen2.5-32B Q5_K_M em layer-split. Baseline remedido no
+mesmo arquivo e protocolo (`llama-bench -n 128`, ROCm): **18.02 ± 0.08 tok/s** — o
+16.36 registrado antes estava desatualizado. Resultado: **19.17–19.40 tok/s**, estável.
+
+Perfil de GPU por token, antes → depois (soma dos dois shards):
+
+| op | antes | depois |
+|---|---|---|
+| matvec_q5k | 37.8 ms | 33.9 ms |
+| matvec_q6k | 7.9 ms | 7.6 ms |
+| rmsnorm | 3.3 ms | 1.3 ms |
+| attention | 10.0 ms | 1.7 ms |
+| **total GPU** | **59.8 ms** | **49.7 ms** |
+
+### O que rendeu, em ordem de ganho
+
+1. **Espera do fence por sondagem, não bloqueante** (+8%, e acaba com a oscilação).
+   O tempo por token era bimodal — 53 ou 57 ms com o tempo de GPU idêntico até o
+   décimo de µs. Dormir 25 ms num `wait_for_fences` faz o schedutil derrubar a
+   frequência e a CPU entrar em C-state profundo; o wakeup pela IRQ da GPU passa a
+   custar milissegundos. Qualquer busy-loop rodando em paralelo "consertava" o número,
+   o que fecha o diagnóstico. Dormir 90% e sondar o resto **não** resolve: a latência
+   já é paga ao acordar do sono longo. Custo: um núcleo ocupado enquanto a GPU
+   trabalha (3.5% desta máquina).
+2. **`attention` com 8 waves por head** (6× no kernel). O laço sobre as posições é uma
+   cadeia serial (softmax online) com um `subgroupAdd` por passo, e 1 wave por head
+   punha **40 waves numa GPU de 240 SIMDs**. O KV-cache era lido a 3.7 GB/s contra
+   717 GB/s de pico — era serialização, não banda. Com 16 waves o kernel cai mais mas
+   o total piora: workgroups de 1024 competem por recursos.
+3. **spin pool fora do caminho GPU** (+3.6%). O pool de matmul de CPU era inicializado
+   em todos os backends e seus workers ficavam em busy-wait permanente: **97.6% dos
+   ciclos** do processo, disputando CPU com a thread que grava o command buffer.
+4. **Readback dos logits em memória HOST_CACHED** (+5.5%). O primeiro tipo
+   host-visible da MI50 é write-combining — ótimo para escrever, péssimo para ler. Os
+   608 KB de logits custavam 4.2 ms/token (145 MB/s); agora custam 0.21 ms.
+5. **Duas linhas de saída por wave nos dois matvecs K-quant** (−8% no q5k, −5% no q6k):
+   a ativação e a soma dos int8 do bloco valem para as duas linhas, então os requests
+   por linha caem de 8 para 6.5. Com **quatro** linhas piora: os acumuladores extras
+   derrubam a ocupância.
+6. **`q5_k_matvec` lendo em uvec4** (+7% no kernel): 176 B por superbloco são 11 uvec4
+   alinhados, então 17 requests de 4 B por lane viram 5 de 16 B.
+7. **`rmsnorm` em vec4** (2.5×): a redução roda num único workgroup — 1 CU dos 60 —
+   então o que limita é a taxa de requests dessa CU, não a banda.
+
+### O que foi testado e descartado por medição
+
+- **Reduzir a redundância de leitura entre lanes do Q5_K** (par de sub-blocos por lane,
+  4 lanes por superbloco em vez de 8): **4% mais lento**. A amplificação de 2.9× que o
+  documento anterior apontava como "suspeita principal" é absorvida pelo cache; o que
+  custa é deixar 16 das 64 lanes ociosas na última rodada de 20 superblocos.
+- **Pré-calcular `soma(x)` no `quantize_x`**, empacotada em `vec2` junto da escala que o
+  matvec já lia — sem load adicional, só 8 B em vez de 4: **3% mais lento**. Some-se à
+  medição anterior (buffer próprio, +6%): o matvec é limitado por memória, não por ALU,
+  e trocar ~8 instruções VALU por bytes lidos é sempre mau negócio aqui.
+- **Pinar a thread principal ao nó NUMA das GPUs**: piora. As duas MI50 estão no nó 0,
+  mas o nó 1 é consistentemente mais rápido. Não é disputa com a IRQ do amdgpu (rodar
+  *na* CPU que a trata é rápido) — some junto com a bimodalidade quando a espera do
+  fence deixa de bloquear.
+
+### Onde ainda há espaço
+
+- `matvec_q5k` é 68% do tempo e lê a ~490 GB/s de um pico de 717. O Q8_0 atinge 717
+  com o mesmo dot empacotado, então a diferença é estrutural: 8 lanes por superbloco
+  releem os mesmos 80 B para consumir 20 B úteis cada.
+- Sobra ~3 ms/token de host fora do perfil. A gravação dos dois command buffers custa
+  1.5 ms e é serial com a execução; dá para gravar o do shard seguinte enquanto o
+  anterior roda, ou pré-gravar o plano inteiro passando `pos` por buffer em vez de
+  push constant.
+- As ~390 ops pequenas por token (add, quantize_x, rope, swiglu, kv_append) estão todas
+  no piso de latência de lançamento (~4 µs). Fundir os 3 bias nos matvecs e o
+  `quantize_x` no `rmsnorm` tiraria ~150 dispatches.
+
+---
+
 ## Próximos passos (ordem recomendada)
 
-1. **Fechar os ~18% restantes contra o llama.cpp no 32B.** O `matvec_q5k` roda a ~420 GB/s
-   de um pico de 717 GB/s e ainda é 68% do tempo. A amplificação de leitura é a suspeita
-   principal: cada lane lê 32 B de `qs` e 32 B de `qh` para consumir 22 B úteis (2.9×).
-   Fazer cada lane cobrir dois sub-blocos (nibble baixo e alto do mesmo byte) derrubaria
-   isso para ~1.45×. Medir com `MESA_VK_TRACE=rgp` antes de reescrever.
-2. **Investigar o bug de `decode_one_gpu_owned`** (token divergente "89012") — regressão de
-   correção conhecida e sem dono.
-3. **Q4_K.** O `Q4_K_M` é o formato dos modelos que interessam (o Qwen3.6-27B local está em
-   Q4_K_M) e ainda não tem shader. O layout de escalas é o mesmo do Q5_K (`get_scale_min_k4`),
-   então o kernel sai quase de graça a partir do `q5_k_matvec.comp` — sem `qh`, o que reduz
-   a amplificação de leitura pela metade.
+1. **Q4_K.** É o formato dos modelos que interessam (o Qwen3.6-27B local está em Q4_K_M) e
+   ainda não tem shader. O layout de escalas é o mesmo do Q5_K (`get_scale_min_k4`), então
+   o kernel sai quase de graça a partir do `q5_k_matvec.comp` — sem `qh`, com metade dos
+   requests de peso por lane.
+2. **Tirar a gravação do command buffer do caminho crítico** (~1.5 ms/token de 52). Duas
+   saídas: gravar o cmdbuf do shard seguinte enquanto o anterior executa, ou pré-gravar o
+   plano inteiro passando `pos` por buffer em vez de push constant. A segunda também
+   elimina o custo por token de vez.
+3. **Fundir as ops pequenas.** ~390 dispatches/token estão no piso de latência de
+   lançamento (~4 µs): os 3 bias cabem no matvec que os precede e o `quantize_x` cabe no
+   `rmsnorm`/`swiglu` que o alimenta.
+4. **`matvec_q5k` a ~490 GB/s de 717.** O Q8_0 atinge 717 com o mesmo dot empacotado, então
+   a diferença é estrutural: 8 lanes por superbloco releem os mesmos 80 B para consumir
+   20 B úteis cada. Reduzir a redundância por si só já foi medido e piora (ver a sessão de
+   2026-08-15); o caminho seria um repack de `qh` no upload, transpondo o bit-plane para um
+   uint por sub-bloco. Medir com `MESA_VK_TRACE=rgp` antes de reescrever.
 4. **Tensor-parallel está descartado por medição, não por falta de tempo.** Sem P2P de VRAM
    neste hardware (`OPAQUE_FD` falha, `DMA_BUF` importa como host-visible a 10.2 GB/s contra
    717 GB/s local), os 96 all-reduces por token do layout Megatron custariam ~5.7 ms/token —

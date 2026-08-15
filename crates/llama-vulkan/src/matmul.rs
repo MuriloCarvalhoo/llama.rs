@@ -313,6 +313,7 @@ pub fn dispatch_q5_k_matvec(
         x_f32,
         n_in,
         n_out,
+        8, // 4 waves x 2 linhas por wave
     )
 }
 
@@ -342,11 +343,13 @@ pub fn dispatch_q6_k_matvec(
         x_f32,
         n_in,
         n_out,
+        8, // 4 waves x 2 linhas por wave
     )
 }
 
-/// Caminho comum dos matvecs K-quant: sobe pesos e ativação f32, despacha 1 workgroup por
-/// linha e lê o resultado. `w_bytes` já vem no layout que o shader espera.
+/// Caminho comum dos matvecs K-quant: sobe pesos e ativação, despacha
+/// `n_out / rows_por_wg` workgroups e lê o resultado. `w_bytes` já vem no layout que o
+/// shader espera.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_k_matvec(
     ctx: &VulkanContext,
@@ -357,6 +360,7 @@ fn dispatch_k_matvec(
     x_f32: &[f32],
     n_in: usize,
     n_out: usize,
+    rows_por_wg: u32,
 ) -> Result<Vec<f32>, MatmulError> {
     use crate::pipeline::{ComputePipeline, PushConstants};
     use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
@@ -510,8 +514,7 @@ fn dispatch_k_matvec(
                 size_of::<PushConstants>(),
             ),
         );
-        // 4 linhas de saída por workgroup (uma por wave).
-        d.cmd_dispatch(cmd, push.n_out.div_ceil(4), 1, 1);
+        d.cmd_dispatch(cmd, push.n_out.div_ceil(rows_por_wg), 1, 1);
         d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,

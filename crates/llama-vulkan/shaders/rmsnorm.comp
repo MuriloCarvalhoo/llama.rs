@@ -8,9 +8,12 @@
 // token. Com 256 lanes a soma parcial e feita por subgrupo e combinada via LDS.
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } xb;
-layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; } wb;
-layout(set = 0, binding = 2) writeonly buffer OBuf { float o[]; } ob;
+// Lidos em vec4: a reducao inteira roda num unico workgroup — 1 CU dos 60 — entao o que
+// limita e a taxa de requests dessa CU, nao a banda. `dim` e sempre multiplo de 4 (é o
+// n_embd, que a quantizacao ja obriga a ser multiplo de 32).
+layout(set = 0, binding = 0) readonly buffer XBuf { vec4 x[]; } xb;
+layout(set = 0, binding = 1) readonly buffer WBuf { vec4 w[]; } wb;
+layout(set = 0, binding = 2) writeonly buffer OBuf { vec4 o[]; } ob;
 
 layout(push_constant) uniform PC { uint dim; float eps; } pc;
 
@@ -21,10 +24,11 @@ shared float partial[8];
 void main() {
     uint tid = gl_LocalInvocationID.x;
 
+    uint n4 = pc.dim / 4u;
     float ss = 0.0;
-    for (uint i = tid; i < pc.dim; i += WG) {
-        float v = xb.x[i];
-        ss += v * v;
+    for (uint i = tid; i < n4; i += WG) {
+        vec4 v = xb.x[i];
+        ss += dot(v, v);
     }
     ss = subgroupAdd(ss);
     if (gl_SubgroupInvocationID == 0u) {
@@ -40,7 +44,7 @@ void main() {
     }
     float scale = inversesqrt(total / float(pc.dim) + pc.eps);
 
-    for (uint i = tid; i < pc.dim; i += WG) {
+    for (uint i = tid; i < n4; i += WG) {
         ob.o[i] = xb.x[i] * scale * wb.w[i];
     }
 }

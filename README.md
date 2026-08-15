@@ -4,7 +4,7 @@ Reescrita do zero em Rust do runtime de inferência LLM, com foco no backend **V
 
 O projeto constrói a pipeline completa em Rust (tokenizer → forward pass → sampling) com um backend Vulkan próprio, para ter controle total sobre os shaders SPIR-V e o agendamento de memória neste hardware.
 
-> **Estado do backend Vulkan:** decode residente em 1 GPU funcionando e validado — **28 tok/s no Qwen2.5-14B Q8_0** contra 40.59 do llama.cpp Vulkan. Multi-GPU ainda não existe. Ver [`PROGRESS.md`](PROGRESS.md).
+> **Estado do backend Vulkan:** decode residente com Q8_0, Q5_K e Q6_K, e **layer-split entre as 2 MI50** funcionando. No Qwen2.5-32B Q5_K_M — o caso que justifica dividir, porque 22.2 GB não cabem numa placa — são **19.3 tok/s contra 18.02 do llama.cpp (ROCm)**. Em modelos que cabem numa GPU só, ainda perdemos: 28 tok/s no 14B Q8_0 contra 40.59. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ---
 
@@ -15,7 +15,7 @@ A premissa original era corrigir quatro fraquezas do llama.cpp em gfx906 (dequan
 **Duas dessas premissas não sobreviveram à medição** e ficam registradas para não serem refeitas:
 
 - **"Multi-GPU sem row-split" não é uma falha do llama.cpp — é limite deste hardware.** Não há P2P de VRAM entre estas MI50 (medido em `crates/llama-vulkan/src/spike.rs`), e o `-sm row` falha igualmente no ROCm (`NO_PEER_COPY=1`). O que funciona multi-GPU aqui é **layer-split**.
-- **Decode batch-1 nem sempre é memory-bound aqui.** Vale para Q8_0 (nosso matvec lê a 717 GB/s, perto do teto); **não vale para K-quants**, onde o gfx906 vira compute-bound por não ter matrix cores.
+- **Decode batch-1 é memory-bound aqui, inclusive nos K-quants.** Vale para Q8_0 (nosso matvec lê a 717 GB/s, perto do teto) e também para Q5_K/Q6_K, onde duas tentativas independentes de trocar bytes lidos por instruções VALU deixaram o kernel mais lento. A leitura anterior de "compute-bound em K-quants" não sobreviveu à medição.
 
 Ver [`docs/estrategia-inferencia-mi50.md`](docs/estrategia-inferencia-mi50.md) para as evidências.
 
@@ -39,12 +39,13 @@ O backend **Vulkan** em 1 GPU está correto e razoavelmente rápido; o multi-GPU
 - [x] Seleção automática da GPU com mais VRAM livre (evita spill para GTT, que custava 7× de banda)
 - [x] Perfil por operação (`LLAMA_RS_PROFILE=1`): ms/token por op + custo de host por fase
 
-| Modelo | llama-rs | llama.cpp Vulkan | razão |
+| Modelo | llama-rs | llama.cpp | razão |
 |---|---|---|---|
-| Qwen2.5-14B Q8_0, 1× MI50 | **28.0 tok/s** | 40.59 | 0.69× |
-| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 | 0.37× |
+| Qwen2.5-32B Q5_K_M, 2× MI50 (layer-split) | **19.3 tok/s** | 18.02 (ROCm) | **1.07×** |
+| Qwen2.5-14B Q8_0, 1× MI50 | **28.0 tok/s** | 40.59 (Vulkan) | 0.69× |
+| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 (Vulkan) | 0.37× |
 
-- [ ] Layer-split entre as 2 MI50, para rodar modelos acima de 16 GiB (`--gpu` hoje é um row-split ingênuo e não-residente, ~18× mais lento que 1 GPU residente)
+- [x] Layer-split entre as 2 MI50 (`--gpu-layer-split`), para rodar modelos acima de 16 GiB. O `--gpu` continua sendo um row-split ingênuo e não-residente, mantido só como protótipo
 
 Detalhes, benchmarks e próximos passos em [`PROGRESS.md`](PROGRESS.md).
 
@@ -56,7 +57,7 @@ Detalhes, benchmarks e próximos passos em [`PROGRESS.md`](PROGRESS.md).
 |---|---|---|---|
 | AMD MI50 (× 2) | GCN 5.1 / gfx906 | 16 GB HBM2 cada | Vulkan 1.2 |
 
-Em token generation (batch-1) com **Q8_0** o limite é a banda de memória — nosso matvec lê a 717 GB/s, perto do teto da placa. Com **K-quants** o gfx906 vira **compute-bound** (sem matrix cores), o que muda quais otimizações valem a pena. Os 16 GiB por GPU são o outro limite duro: modelos de 20–28 GiB só rodam com layer-split entre as duas.
+Em token generation (batch-1) com **Q8_0** o limite é a banda de memória — nosso matvec lê a 717 GB/s, perto do teto da placa. Nos **K-quants** o kernel também é limitado por memória, mas por outra razão: o superbloco é relido por várias lanes, e o `matvec_q5k` fica em ~490 GB/s (duas tentativas de trocar bytes lidos por instruções VALU pioraram — ver `PROGRESS.md`). Os 16 GiB por GPU são o outro limite duro: modelos de 20–28 GiB só rodam com layer-split entre as duas.
 
 > **NVIDIA Tesla K80 — fora de escopo (decisão deliberada).** O backend enumera só devices AMD (`crates/llama-vulkan/src/device.rs`). A K80 (Kepler, wave32) é incompatível com os shaders wave64 escritos para o gfx906 e é mais lenta que uma única MI50; suportá-la exigiria uma segunda família de kernels sem ganho líquido. Ela também não poderia dividir tensores com as MI50 (sem P2P entre vendors diferentes) — no máximo serviria como worker isolado de layer-split, fora do design atual.
 

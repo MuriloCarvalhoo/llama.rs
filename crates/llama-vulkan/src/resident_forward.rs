@@ -262,6 +262,9 @@ pub(crate) struct ResidentState {
     /// command buffer do token: alocar 608 KB (`vkAllocateMemory`) e submeter um
     /// segundo command buffer a cada token custava mais que o readback em si.
     pub logits_host: Buf,
+    /// Mapa persistente de `logits_host`. Mapear/desmapear por token custa dois ioctls no
+    /// caminho crítico. Válido enquanto o `State` viver (unmap no Drop).
+    pub logits_ptr: *mut std::ffi::c_void,
     pub len: RefCell<usize>,
     pub plan: Vec<PlannedOp>,
     pub token_cmd: vk::CommandBuffer,
@@ -699,6 +702,24 @@ impl<'ctx> ResidentForward<'ctx> {
                     .create_fence(&vk::FenceCreateInfo::default(), None)?
             };
 
+            // Saída deste shard: logits no último, stream residual nos demais. Mapeada uma
+            // única vez — ver `logits_ptr`.
+            let saida_floats = if shard.is_last() {
+                config.vocab
+            } else {
+                config.n_embd
+            };
+            let logits_host = Buf::host_read(ctx, phys, d, (saida_floats * 4) as vk::DeviceSize)?;
+            // SAFETY: memória host-visible recém-criada com esse tamanho, ainda não mapeada.
+            let logits_ptr = unsafe {
+                d.map_memory(
+                    logits_host.mem,
+                    0,
+                    logits_host.size,
+                    vk::MemoryMapFlags::empty(),
+                )?
+            };
+
             ResidentState {
                 cfg,
                 qw,
@@ -730,16 +751,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
                 // Saída deste shard: logits no último, stream residual nos demais.
-                logits_host: Buf::host_read(
-                    ctx,
-                    phys,
-                    d,
-                    (if shard.is_last() {
-                        config.vocab
-                    } else {
-                        config.n_embd
-                    } * 4) as vk::DeviceSize,
-                )?,
+                logits_host,
+                logits_ptr,
                 len: RefCell::new(0),
                 plan: Vec::new(),
                 token_cmd,
@@ -1389,17 +1402,21 @@ impl<'ctx> ResidentForward<'ctx> {
                         mv_groups(n_out),
                         PushSpec::Static(mv_push(n_in, n_out)),
                     ),
-                    ty => mk(
-                        if ty == gguf::GgmlType::Q5_K {
-                            PipeId::MatvecQ5K
+                    ty => {
+                        // Os dois shaders K-quant fazem 4 waves x 2 linhas por wave: a
+                        // ativação é lida uma vez para as duas linhas.
+                        let (pipe, rows_por_wg) = if ty == gguf::GgmlType::Q5_K {
+                            (PipeId::MatvecQ5K, 8)
                         } else {
-                            PipeId::MatvecQ6K
-                        },
-                        &[comum[0], comum[1], comum[2], saida],
-                        // Os shaders K-quant fazem 4 linhas por workgroup (uma por wave).
-                        u32::try_from(n_out.div_ceil(4)).unwrap_or(u32::MAX),
-                        PushSpec::Static(mv_push(n_in, n_out)),
-                    ),
+                            (PipeId::MatvecQ6K, 8)
+                        };
+                        mk(
+                            pipe,
+                            &[comum[0], comum[1], comum[2], saida],
+                            u32::try_from(n_out.div_ceil(rows_por_wg)).unwrap_or(u32::MAX),
+                            PushSpec::Static(mv_push(n_in, n_out)),
+                        )
+                    }
                 }
             };
 
@@ -1750,6 +1767,33 @@ impl<'ctx> ResidentForward<'ctx> {
         }
     }
 
+    /// Espera o fence do token **sondando**, sem dormir.
+    ///
+    /// Um `wait_for_fences` bloqueante entrega a thread ao escalonador pelos ~25 ms do
+    /// shard. Nesse tempo o governor (schedutil) vê utilização baixa e derruba a
+    /// frequência, e a CPU entra em C-state profundo — o wakeup pela IRQ da GPU passa a
+    /// custar milissegundos. O sintoma era o tempo por token **bimodal**, 53 ou 57 ms com
+    /// o tempo de GPU idêntico até o décimo de µs; qualquer busy-loop rodando em paralelo
+    /// "consertava" o número, o que fecha o diagnóstico.
+    ///
+    /// Medido no Qwen2.5-32B em layer-split: 17.5-18.9 tok/s oscilando com o wait
+    /// bloqueante contra **19.4 estável** sondando. Dormir 90% do tempo previsto e sondar
+    /// o resto NÃO resolve — a latência já é paga ao acordar do sono longo, mesmo por
+    /// timeout.
+    ///
+    /// O preço é um núcleo ocupado enquanto a GPU trabalha (~3.5% desta máquina de 28).
+    /// É o mesmo compromisso que o llama.cpp faz no seu laço de espera.
+    fn espera_fence(&self, st: &ResidentState) -> Result<(), MatmulError> {
+        let d = &self.dev.device;
+        loop {
+            // SAFETY: fence válido e submetido.
+            if unsafe { d.get_fence_status(st.token_fence)? } {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     /// Regrava o command buffer do token, submete uma vez, espera o fence, lê os logits.
     #[cfg_attr(
         feature = "profiling",
@@ -1796,8 +1840,8 @@ impl<'ctx> ResidentForward<'ctx> {
         unsafe {
             d.reset_fences(&[st.token_fence])?;
             d.queue_submit(dev.queue, &[submit], st.token_fence)?;
-            d.wait_for_fences(&[st.token_fence], true, u64::MAX)?;
         }
+        self.espera_fence(st)?;
         let t_sub = t1.elapsed();
         let t2 = std::time::Instant::now();
         self.collect_prof(st)?;
@@ -1807,14 +1851,18 @@ impl<'ctx> ResidentForward<'ctx> {
         } else {
             st.cfg.n_embd
         };
-        let bytes = (len * 4) as vk::DeviceSize;
-        // SAFETY: logits_host é host-coherent com `bytes` e a copia ja terminou (fence
-        // aguardado acima); ptr válido até unmap.
+        // O mapa é persistente (feito uma vez na construção): `vkMapMemory`/`vkUnmapMemory`
+        // a cada token são dois ioctls no caminho crítico, e o vocabulário do 32B faz esse
+        // caminho rodar com 608 KB.
+        //
+        // `Vec::with_capacity` + `set_len` em vez de `vec![0.0; len]`: o segundo zera os
+        // 608 KB (calloc) só para a cópia logo abaixo sobrescrever tudo.
         let out = unsafe {
-            let ptr = d.map_memory(st.logits_host.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
-            let mut v = vec![0f32; len];
-            std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), len);
-            d.unmap_memory(st.logits_host.mem);
+            let mut v = Vec::<f32>::with_capacity(len);
+            // SAFETY: logits_host é host-coherent e a cópia já terminou (fence aguardado
+            // acima); `v` tem capacidade para `len` f32, escritos antes do set_len.
+            std::ptr::copy_nonoverlapping(st.logits_ptr.cast::<f32>(), v.as_mut_ptr(), len);
+            v.set_len(len);
             v
         };
         if let Some(pf) = &st.prof {
@@ -1853,6 +1901,8 @@ impl Drop for ResidentForward<'_> {
         }
 
         if let Some(st) = self.state.take() {
+            // SAFETY: mapeada uma vez na construção e nunca desmapeada até aqui.
+            unsafe { d.unmap_memory(st.logits_host.mem) };
             if let Some(pf) = &st.prof {
                 // SAFETY: pool criado por nós; GPU ociosa (device_wait_idle acima).
                 unsafe { d.destroy_query_pool(pf.pool, None) };
