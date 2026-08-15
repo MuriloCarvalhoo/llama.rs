@@ -13,6 +13,9 @@ rand.workspace = true
 rayon.workspace = true
 half.workspace = true
 
+[dev-dependencies]
+memmap2 = "0.9"
+
 [features]
 gpu = []
 

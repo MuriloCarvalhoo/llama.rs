@@ -358,6 +358,7 @@ dependencies = [
  "half",
  "llama-sampling",
  "llama-tokenizer",
+ "memmap2",
  "rand",
  "rayon",
  "thiserror",

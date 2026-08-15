@@ -621,11 +621,14 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let mut qw = Vec::with_capacity(cfg.n_layer);
             for lw in &raw.layers[shard.first_layer..shard.end_layer] {
+                // Só o caminho denso por enquanto: as camadas de atenção linear do
+                // qwen35 ainda não têm plano de decode (ver docs/qwen35-arquitetura.md).
+                let (w_q, w_k, w_v, w_o) = lw.attn();
                 qw.push(LayerQ {
-                    attn_q: up_q(&lw.attn_q, cfg.n_embd, cfg.n_embd)?,
-                    attn_k: up_q(&lw.attn_k, cfg.n_embd, kv_dim)?,
-                    attn_v: up_q(&lw.attn_v, cfg.n_embd, kv_dim)?,
-                    attn_output: up_q(&lw.attn_output, cfg.n_embd, cfg.n_embd)?,
+                    attn_q: up_q(w_q, cfg.n_embd, cfg.n_embd)?,
+                    attn_k: up_q(w_k, cfg.n_embd, kv_dim)?,
+                    attn_v: up_q(w_v, cfg.n_embd, kv_dim)?,
+                    attn_output: up_q(w_o, cfg.n_embd, cfg.n_embd)?,
                     ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
                     ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
                     ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,

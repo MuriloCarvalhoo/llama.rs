@@ -4,6 +4,49 @@ use gguf::{GgufFile, MetadataValue};
 
 use crate::error::ModelError;
 
+/// Parâmetros das camadas de atenção linear (gated delta net) das arquiteturas híbridas
+/// tipo `qwen35`. Ver `docs/qwen35-arquitetura.md`.
+///
+/// Nessas camadas não há KV-cache: o histórico vive num estado `d_state × d_state` por
+/// cabeça, de tamanho fixo. As camadas de atenção completa continuam usando o KV-cache
+/// normal, uma a cada `full_attn_interval`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeltaNetConfig {
+    /// Tamanho do kernel da convolução causal aplicada a q|k|v (`ssm.conv_kernel`).
+    pub d_conv: usize,
+    /// Largura interna: `d_inner / n_v_heads` é a dimensão de cada cabeça de valor.
+    pub d_inner: usize,
+    /// Dimensão de cada cabeça de chave **e** de valor (`ssm.state_size`).
+    pub d_state: usize,
+    /// Cabeças de valor (`ssm.time_step_rank`).
+    pub n_v_heads: usize,
+    /// Cabeças de chave (`ssm.group_count`); divide `n_v_heads`, como em GQA.
+    pub n_k_heads: usize,
+    /// Uma camada em cada `full_attn_interval` é de atenção completa; as demais são
+    /// lineares. Camada `il` é linear quando `(il + 1) % full_attn_interval != 0`.
+    pub full_attn_interval: usize,
+}
+
+impl DeltaNetConfig {
+    /// `true` se a camada `il` é de atenção linear (recorrente).
+    #[must_use]
+    pub fn eh_linear(&self, il: usize) -> bool {
+        (il + 1) % self.full_attn_interval != 0
+    }
+
+    /// Dimensão de cada cabeça de valor.
+    #[must_use]
+    pub fn head_v_dim(&self) -> usize {
+        self.d_inner / self.n_v_heads
+    }
+
+    /// Floats do estado recorrente de uma camada.
+    #[must_use]
+    pub fn state_len(&self) -> usize {
+        self.d_state * self.d_state * self.n_v_heads
+    }
+}
+
 /// Hiperparâmetros do modelo Llama necessários ao forward f32.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlamaConfig {
@@ -20,6 +63,12 @@ pub struct LlamaConfig {
     pub ctx: usize,
     pub bos_id: u32,
     pub eos_id: u32,
+    /// `Some` nas arquiteturas híbridas (`qwen35`); `None` no transformer denso.
+    pub delta_net: Option<DeltaNetConfig>,
+    /// Blocos MTP/NextN empilhados depois das `n_layer` camadas. Carregados pelo
+    /// llama.cpp para speculative decoding e **ignorados** aqui: não participam do
+    /// forward normal.
+    pub n_layer_nextn: usize,
 }
 
 impl LlamaConfig {
@@ -38,12 +87,24 @@ impl LlamaConfig {
         };
         let n_embd = u(&p("embedding_length"))?;
         let n_head = u(&p("attention.head_count"))?;
-        if n_head == 0 || n_embd % n_head != 0 {
-            return Err(ModelError::Config(
-                "n_head inválido ou não divide n_embd".into(),
-            ));
+        if n_head == 0 {
+            return Err(ModelError::Config("n_head é zero".into()));
         }
-        let head_dim = n_embd / n_head;
+        // `attention.key_length` manda quando existe: no Qwen3.8-27B a cabeça tem 256
+        // dimensões com n_embd=5120 e n_head=24, e `n_embd / n_head` nem sequer é inteiro.
+        let head_dim = match f.metadata.get(&p("attention.key_length")) {
+            Some(v) => {
+                usize::try_from(v.as_u32("key_length")?).map_err(|_| ModelError::Overflow)?
+            }
+            None => {
+                if n_embd % n_head != 0 {
+                    return Err(ModelError::Config(
+                        "n_head não divide n_embd e falta attention.key_length".into(),
+                    ));
+                }
+                n_embd / n_head
+            }
+        };
         let vocab = f
             .get("tokenizer.ggml.tokens")?
             .array_len()
@@ -58,9 +119,43 @@ impl LlamaConfig {
             Some(v) => usize::try_from(v.as_u32("rope_dim")?).map_err(|_| ModelError::Overflow)?,
             None => head_dim,
         };
+        // Arquitetura híbrida: as chaves `ssm.*` só existem onde há atenção linear.
+        let delta_net = if f.metadata.contains_key(&p("ssm.conv_kernel")) {
+            let interval = match f.metadata.get(&p("full_attention_interval")) {
+                Some(v) => usize::try_from(v.as_u32("full_attention_interval")?)
+                    .map_err(|_| ModelError::Overflow)?,
+                None => 4,
+            };
+            if interval == 0 {
+                return Err(ModelError::Config("full_attention_interval é zero".into()));
+            }
+            Some(DeltaNetConfig {
+                d_conv: u(&p("ssm.conv_kernel"))?,
+                d_inner: u(&p("ssm.inner_size"))?,
+                d_state: u(&p("ssm.state_size"))?,
+                n_v_heads: u(&p("ssm.time_step_rank"))?,
+                n_k_heads: u(&p("ssm.group_count"))?,
+                full_attn_interval: interval,
+            })
+        } else {
+            None
+        };
+        let n_layer_nextn = match f.metadata.get(&p("nextn_predict_layers")) {
+            Some(v) => usize::try_from(v.as_u32("nextn_predict_layers")?)
+                .map_err(|_| ModelError::Overflow)?,
+            None => 0,
+        };
+
+        // `block_count` conta os blocos MTP/NextN empilhados no fim, que existem para
+        // speculative decoding e não participam do forward normal — o llama.cpp faz a
+        // mesma distinção entre `n_layer_all` e `n_layer()`.
+        let n_layer = u(&p("block_count"))?
+            .checked_sub(n_layer_nextn)
+            .ok_or_else(|| ModelError::Config("nextn_predict_layers >= block_count".into()))?;
+
         Ok(Self {
             n_embd,
-            n_layer: u(&p("block_count"))?,
+            n_layer,
             n_head,
             n_head_kv: u(&p("attention.head_count_kv"))?,
             head_dim,
@@ -74,6 +169,8 @@ impl LlamaConfig {
             ctx: u(&p("context_length"))?,
             bos_id: f.get("tokenizer.ggml.bos_token_id")?.as_u32("bos")?,
             eos_id: f.get("tokenizer.ggml.eos_token_id")?.as_u32("eos")?,
+            delta_net,
+            n_layer_nextn,
         })
     }
 }

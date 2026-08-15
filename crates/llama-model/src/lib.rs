@@ -3,6 +3,7 @@
 
 mod attention;
 mod config;
+pub mod delta_net;
 mod error;
 mod generate;
 #[cfg(feature = "gpu")]
@@ -12,11 +13,12 @@ mod ops;
 pub(crate) mod spin_pool;
 mod weights;
 
-pub use config::LlamaConfig;
+pub use config::{DeltaNetConfig, LlamaConfig};
 pub use error::ModelError;
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode, QTensor,
+    AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode, MixerRaw,
+    QTensor,
 };
 pub use model::Model;
 

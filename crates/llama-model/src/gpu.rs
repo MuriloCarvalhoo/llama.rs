@@ -16,15 +16,53 @@ pub struct QTensor<'a> {
     pub bytes: &'a [u8],
 }
 
+/// O que fica entre as duas normas de uma camada.
+///
+/// Nas arquiteturas densas é sempre `Attn`. No `qwen35` três em cada quatro camadas são
+/// `Delta` — atenção linear, sem KV-cache. Ver `docs/qwen35-arquitetura.md`.
+pub enum MixerRaw<'a> {
+    Attn {
+        /// No `qwen35` esta projeção sai com `2 * head_dim` por cabeça: query e gate.
+        attn_q: QTensor<'a>,
+        attn_k: QTensor<'a>,
+        attn_v: QTensor<'a>,
+        attn_output: QTensor<'a>,
+    },
+    Delta {
+        /// `key_dim * 2 + value_dim`, fatiado em q|k|v depois da convolução.
+        attn_qkv: QTensor<'a>,
+        /// `value_dim` — o `z` que fecha a norma gated na saída.
+        attn_gate: QTensor<'a>,
+        /// `value_dim -> n_embd`.
+        ssm_out: QTensor<'a>,
+    },
+}
+
 /// Pesos quantizados de uma camada, emprestados do buffer do GGUF (sem cópia).
 pub struct GpuLayerRaw<'a> {
-    pub attn_q: QTensor<'a>,
-    pub attn_k: QTensor<'a>,
-    pub attn_v: QTensor<'a>,
-    pub attn_output: QTensor<'a>,
+    pub mixer: MixerRaw<'a>,
     pub ffn_gate: QTensor<'a>,
     pub ffn_up: QTensor<'a>,
     pub ffn_down: QTensor<'a>,
+}
+
+impl<'a> GpuLayerRaw<'a> {
+    /// Atalho para as camadas densas, onde o mixer é sempre atenção.
+    ///
+    /// # Panics
+    /// Se chamada numa camada de atenção linear.
+    #[must_use]
+    pub fn attn(&self) -> (&QTensor<'a>, &QTensor<'a>, &QTensor<'a>, &QTensor<'a>) {
+        match &self.mixer {
+            MixerRaw::Attn {
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+            } => (attn_q, attn_k, attn_v, attn_output),
+            MixerRaw::Delta { .. } => panic!("camada de atenção linear não tem q/k/v"),
+        }
+    }
 }
 
 /// Todos os pesos Q8_0 que o decode envia à GPU.
@@ -85,11 +123,33 @@ impl<'a> GpuRawWeights<'a> {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for l in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
+            let linear = cfg.delta_net.as_ref().is_some_and(|d| d.eh_linear(l));
+            let mixer = if let (true, Some(dn)) = (linear, cfg.delta_net.as_ref()) {
+                let key_dim = dn.d_state * dn.n_k_heads;
+                let value_dim = dn.head_v_dim() * dn.n_v_heads;
+                MixerRaw::Delta {
+                    attn_qkv: read(&p("attn_qkv.weight"), cfg.n_embd, key_dim * 2 + value_dim)?,
+                    attn_gate: read(&p("attn_gate.weight"), cfg.n_embd, value_dim)?,
+                    ssm_out: read(&p("ssm_out.weight"), value_dim, cfg.n_embd)?,
+                }
+            } else {
+                // No qwen35 a projeção de Q sai com query e gate juntos, e a saída da
+                // atenção entra com `head_dim * n_head`, que não é `n_embd`.
+                let q_out = if cfg.delta_net.is_some() {
+                    cfg.head_dim * cfg.n_head * 2
+                } else {
+                    cfg.n_embd
+                };
+                let o_in = cfg.head_dim * cfg.n_head;
+                MixerRaw::Attn {
+                    attn_q: read(&p("attn_q.weight"), cfg.n_embd, q_out)?,
+                    attn_k: read(&p("attn_k.weight"), cfg.n_embd, kv_dim)?,
+                    attn_v: read(&p("attn_v.weight"), cfg.n_embd, kv_dim)?,
+                    attn_output: read(&p("attn_output.weight"), o_in, cfg.n_embd)?,
+                }
+            };
             layers.push(GpuLayerRaw {
-                attn_q: read(&p("attn_q.weight"), cfg.n_embd, cfg.n_embd)?,
-                attn_k: read(&p("attn_k.weight"), cfg.n_embd, kv_dim)?,
-                attn_v: read(&p("attn_v.weight"), cfg.n_embd, kv_dim)?,
-                attn_output: read(&p("attn_output.weight"), cfg.n_embd, cfg.n_embd)?,
+                mixer,
                 ffn_gate: read(&p("ffn_gate.weight"), cfg.n_embd, cfg.n_ff)?,
                 ffn_up: read(&p("ffn_up.weight"), cfg.n_embd, cfg.n_ff)?,
                 ffn_down: read(&p("ffn_down.weight"), cfg.n_ff, cfg.n_embd)?,
@@ -337,9 +397,11 @@ impl Model<'_> {
             let (attn_norm, ffn_norm) = self.layer_norms_f32(l)?;
             let attn_in = rmsnorm_and_scale(&x, attn_norm, c.n_embd, c.rms_eps);
 
-            let mut q = gpu.matvec_q8_0(gw.attn_q.bytes, &attn_in, c.n_embd, c.n_embd)?;
-            let mut k = gpu.matvec_q8_0(gw.attn_k.bytes, &attn_in, c.n_embd, kv_dim)?;
-            let mut v = gpu.matvec_q8_0(gw.attn_v.bytes, &attn_in, c.n_embd, kv_dim)?;
+            // Caminho denso (Q8_0): o mixer é sempre atenção.
+            let (w_q, w_k, w_v, w_o) = gw.attn();
+            let mut q = gpu.matvec_q8_0(w_q.bytes, &attn_in, c.n_embd, c.n_embd)?;
+            let mut k = gpu.matvec_q8_0(w_k.bytes, &attn_in, c.n_embd, kv_dim)?;
+            let mut v = gpu.matvec_q8_0(w_v.bytes, &attn_in, c.n_embd, kv_dim)?;
 
             self.add_layer_biases(l, &mut q, &mut k, &mut v, kv_dim, n_tok)?;
 
@@ -374,7 +436,7 @@ impl Model<'_> {
                 c.n_head_kv,
                 c.head_dim,
             );
-            let attn_out = gpu.matvec_q8_0(gw.attn_output.bytes, &attn, c.n_embd, c.n_embd)?;
+            let attn_out = gpu.matvec_q8_0(w_o.bytes, &attn, c.n_embd, c.n_embd)?;
             for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) {
                 *xi += ai;
             }
@@ -533,8 +595,9 @@ mod tests {
         assert_eq!(w.layers.len(), cfg.n_layer);
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
         let row_bytes_q = (cfg.n_embd / 32) * 34;
-        assert_eq!(w.layers[0].attn_q.bytes.len(), cfg.n_embd * row_bytes_q);
-        assert_eq!(w.layers[0].attn_k.bytes.len(), kv_dim * row_bytes_q);
+        let (w_q, w_k, _, _) = w.layers[0].attn();
+        assert_eq!(w_q.bytes.len(), cfg.n_embd * row_bytes_q);
+        assert_eq!(w_k.bytes.len(), kv_dim * row_bytes_q);
         assert_eq!(w.output.bytes.len(), cfg.vocab * row_bytes_q);
         eprintln!("GpuRawWeights OK — {} camadas", w.layers.len());
     }
