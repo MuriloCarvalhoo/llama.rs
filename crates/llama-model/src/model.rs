@@ -444,8 +444,8 @@ mod tests {
         let logits_b = m.forward(&tokens_b, &mut cb).unwrap();
 
         // Forward batch
-        let mut ca2 = m.new_cache();
-        let mut cb2 = m.new_cache();
+        let ca2 = m.new_cache();
+        let cb2 = m.new_cache();
         let batch: &[&[u32]] = &[&tokens_a, &tokens_b];
         let results = m.forward_batch(batch, &mut [ca2, cb2]).unwrap();
 

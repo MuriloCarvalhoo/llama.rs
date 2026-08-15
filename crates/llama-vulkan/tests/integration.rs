@@ -328,6 +328,23 @@ fn forward_gpu_real_matches_f32_cpu_reference() {
 /// produto interno é feito em inteiros. Difere de `cpu_ref_q8_0_f32act` (ativação f32)
 /// por ~0.14% — diferença suficiente para virar o argmax em logits quase degenerados,
 /// por isso os testes de igualdade de token usam esta referência, não a f32.
+/// Reconstrói `x` como o shader o enxerga: quantizado em int8 por blocos de 32 e
+/// multiplicado de volta pela escala. Os matvecs K-quant consomem a mesma ativação int8 do
+/// caminho Q8_0, então a referência de CPU precisa partir dela — comparar contra o `x` em
+/// f32 original mediria o erro da *quantização*, não o do shader.
+fn quant_dequant_x(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    for b in 0..x.len() / 32 {
+        let blk = &x[b * 32..b * 32 + 32];
+        let d_x = blk.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+        let inv = if d_x > 0.0 { 1.0 / d_x } else { 0.0 };
+        for i in 0..32 {
+            out[b * 32 + i] = (blk[i] * inv).round().clamp(-127.0, 127.0) * d_x;
+        }
+    }
+    out
+}
+
 fn cpu_ref_q8_0_int8act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
     let n_blocks = n_in / 32;
     let row_bytes = n_blocks * 34;
@@ -411,9 +428,9 @@ fn gpu_matvec_large_n_out_matches_cpu_ref() {
         .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
         .collect();
     let gpu1 = backend
-        .matvec_q8_0(&w.output, &x1, cfg.n_embd, cfg.vocab)
+        .matvec_q8_0(w.output.bytes, &x1, cfg.n_embd, cfg.vocab)
         .unwrap();
-    let cpu1 = cpu_ref_q8_0_f32act(&w.output, &x1, cfg.n_embd, cfg.vocab);
+    let cpu1 = cpu_ref_q8_0_f32act(w.output.bytes, &x1, cfg.n_embd, cfg.vocab);
     let mut maxdiff1 = 0f32;
     let mut argi1 = 0usize;
     for (i, (a, b)) in gpu1.iter().zip(cpu1.iter()).enumerate() {
@@ -445,9 +462,9 @@ fn gpu_matvec_large_n_out_matches_cpu_ref() {
         .map(|i| ((i % 5) as f32) * 0.05 - 0.1)
         .collect();
     let gpu2 = backend
-        .matvec_q8_0(&w.layers[0].ffn_down, &x2, cfg.n_ff, cfg.n_embd)
+        .matvec_q8_0(w.layers[0].ffn_down.bytes, &x2, cfg.n_ff, cfg.n_embd)
         .unwrap();
-    let cpu2 = cpu_ref_q8_0_f32act(&w.layers[0].ffn_down, &x2, cfg.n_ff, cfg.n_embd);
+    let cpu2 = cpu_ref_q8_0_f32act(w.layers[0].ffn_down.bytes, &x2, cfg.n_ff, cfg.n_embd);
     let mut maxdiff2 = 0f32;
     for (a, b) in gpu2.iter().zip(cpu2.iter()) {
         maxdiff2 = maxdiff2.max((a - b).abs());
@@ -1036,12 +1053,13 @@ fn q6_k_matvec_gpu_bate_com_a_referencia_de_cpu() {
         .expect("dispatch Q6_K");
 
     let row_bytes = sb_per_row * 210;
+    let x_int8 = quant_dequant_x(&x);
     let mut cpu = vec![0f32; n_out];
     for (r, out) in cpu.iter_mut().enumerate() {
         let deq =
             ggml_cpu::dequant_to_f32(&w[r * row_bytes..(r + 1) * row_bytes], gguf::GgmlType::Q6_K)
                 .expect("dequant");
-        *out = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+        *out = deq.iter().zip(&x_int8).map(|(a, b)| a * b).sum();
     }
 
     let max_abs = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
@@ -1098,12 +1116,13 @@ fn q5_k_matvec_gpu_bate_com_a_referencia_de_cpu() {
 
     // Referência: desquantiza cada linha e faz o produto interno em f32.
     let row_bytes = sb_per_row * 176;
+    let x_int8 = quant_dequant_x(&x);
     let mut cpu = vec![0f32; n_out];
     for (r, out) in cpu.iter_mut().enumerate() {
         let deq =
             ggml_cpu::dequant_to_f32(&w[r * row_bytes..(r + 1) * row_bytes], gguf::GgmlType::Q5_K)
                 .expect("dequant");
-        *out = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+        *out = deq.iter().zip(&x_int8).map(|(a, b)| a * b).sum();
     }
 
     let max_abs = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);

@@ -236,6 +236,8 @@ pub fn run_generate(
                         n_tokens += 1;
                     },
                 )?;
+                // No-op sem LLAMA_RS_PROFILE=1.
+                backend.print_profile();
                 #[cfg(feature = "profiling")]
                 if let Some(g) = trace_guard.as_ref() {
                     for (track, spans) in backend.gpu_spans_by_track() {

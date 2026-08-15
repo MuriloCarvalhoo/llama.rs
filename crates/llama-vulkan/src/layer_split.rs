@@ -98,6 +98,18 @@ impl<'ctx> LayerSplitForward<'ctx> {
             .collect()
     }
 
+    /// Perfil agregado de cada shard (no-op sem `LLAMA_RS_PROFILE=1`).
+    pub fn print_profile(&self) {
+        for s in &self.shards {
+            let sh = s.shard();
+            eprintln!(
+                "[prof] GPU{} camadas {}..{}",
+                sh.device, sh.first_layer, sh.end_layer
+            );
+            s.print_profile();
+        }
+    }
+
     /// Distribuição efetiva, para log: `(device, primeira, última+1)`.
     pub fn layout(&self) -> Vec<(usize, usize, usize)> {
         self.shards

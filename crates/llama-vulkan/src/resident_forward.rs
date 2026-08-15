@@ -130,13 +130,19 @@ pub(crate) struct Cfg {
 
 /// Pesos Q8_0 residentes de uma camada.
 pub(crate) struct LayerQ {
-    pub attn_q: GpuTensor,
-    pub attn_k: GpuTensor,
-    pub attn_v: GpuTensor,
-    pub attn_output: GpuTensor,
-    pub ffn_gate: GpuTensor,
-    pub ffn_up: GpuTensor,
-    pub ffn_down: GpuTensor,
+    pub attn_q: QWeight,
+    pub attn_k: QWeight,
+    pub attn_v: QWeight,
+    pub attn_output: QWeight,
+    pub ffn_gate: QWeight,
+    pub ffn_up: QWeight,
+    pub ffn_down: QWeight,
+}
+
+/// Peso residente em VRAM junto com o tipo, que decide qual shader de matvec usar.
+pub(crate) struct QWeight {
+    pub ty: gguf::GgmlType,
+    pub gpu: GpuTensor,
 }
 
 /// Buffers f32 auxiliares residentes de uma camada.
@@ -152,6 +158,8 @@ pub(crate) struct LayerAux {
 #[derive(Clone, Copy)]
 pub(crate) enum PipeId {
     Matvec,
+    MatvecQ5K,
+    MatvecQ6K,
     QuantizeX,
     Rmsnorm,
     Rope,
@@ -164,6 +172,8 @@ impl PipeId {
     pub(crate) fn label(self) -> &'static str {
         match self {
             PipeId::Matvec => "matvec",
+            PipeId::MatvecQ5K => "matvec_q5k",
+            PipeId::MatvecQ6K => "matvec_q6k",
             PipeId::QuantizeX => "quantize_x",
             PipeId::Rmsnorm => "rmsnorm",
             PipeId::Rope => "rope",
@@ -203,7 +213,7 @@ pub(crate) enum PlannedOp {
 pub(crate) struct ResidentState {
     pub cfg: Cfg,
     pub qw: Vec<LayerQ>,
-    pub output_w: GpuTensor,
+    pub output_w: QWeight,
     pub aux: Vec<LayerAux>,
     pub output_norm_buf: Buf,
     pub freq_buf: Buf,
@@ -274,6 +284,8 @@ pub struct ResidentForward<'ctx> {
     // pipelines (preenchidos na Task 9; campos públicos ao crate para as tasks de teste)
     pub(crate) matvec: ComputePipeline,
     pub(crate) quantize_x: ComputePipeline,
+    pub(crate) matvec_q5k: ComputePipeline,
+    pub(crate) matvec_q6k: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) rope: ComputePipeline,
     pub(crate) attention: ComputePipeline,
@@ -474,6 +486,10 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec = ComputePipeline::new(d)?;
         // 3 bindings (x, xq, xd) + push de 12 bytes (n_in + 2 pads de alinhamento).
         let quantize_x = ComputePipeline::with(d, crate::QUANTIZE_X_SPV, 3, 12, &[])?;
+        // Matvecs K-quant: os mesmos 4 bindings do Q8_0 (pesos, xq, xd, saída) e o mesmo push.
+        let push_mv = std::mem::size_of::<crate::pipeline::PushConstants>() as u32;
+        let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 4, push_mv, &[])?;
+        let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 4, push_mv, &[])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24, &[])?;
@@ -502,6 +518,8 @@ impl<'ctx> ResidentForward<'ctx> {
             dev,
             matvec,
             quantize_x,
+            matvec_q5k,
+            matvec_q6k,
             rmsnorm,
             rope,
             attention,
@@ -571,11 +589,14 @@ impl<'ctx> ResidentForward<'ctx> {
                 shard,
             };
 
-            let up_q =
-                |bytes: &[u8], n_in: usize, n_out: usize| -> Result<GpuTensor, MatmulError> {
-                    GpuTensor::upload_q8_0(ctx, phys, dev_ref, bytes, n_in, n_out)
-                        .map_err(MatmulError::from)
-                };
+            let up_q = |t: &llama_model::QTensor<'_>,
+                        n_in: usize,
+                        n_out: usize|
+             -> Result<QWeight, MatmulError> {
+                let gpu = GpuTensor::upload_quant(ctx, phys, dev_ref, t.ty, t.bytes, n_in, n_out)
+                    .map_err(MatmulError::from)?;
+                Ok(QWeight { ty: t.ty, gpu })
+            };
             let mut qw = Vec::with_capacity(cfg.n_layer);
             for lw in &raw.layers[shard.first_layer..shard.end_layer] {
                 qw.push(LayerQ {
@@ -1226,6 +1247,8 @@ impl<'ctx> ResidentForward<'ctx> {
     pub(crate) fn pipe_of(&self, id: PipeId) -> &ComputePipeline {
         match id {
             PipeId::Matvec => &self.matvec,
+            PipeId::MatvecQ5K => &self.matvec_q5k,
+            PipeId::MatvecQ6K => &self.matvec_q6k,
             PipeId::QuantizeX => &self.quantize_x,
             PipeId::Rmsnorm => &self.rmsnorm,
             PipeId::Rope => &self.rope,
@@ -1327,6 +1350,39 @@ impl<'ctx> ResidentForward<'ctx> {
 
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
 
+        // Emite o matvec com o shader do tipo do peso. Os três tipos consomem a mesma
+        // ativação int8 (`b_xq`/`b_xd`, produzida pelo dispatch QuantizeX): os sub-blocos
+        // dos K-quants têm 32 elementos, exatamente o bloco de quantização do Q8_0, então
+        // as escalas casam sem nenhuma conversão.
+        let mv =
+            |w: &QWeight, dst: &Buf, n_in: usize, n_out: usize| -> Result<PlannedOp, MatmulError> {
+                let comum = [
+                    (w.gpu.buffer, 0, w.gpu.size_bytes),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ];
+                let saida = (dst.buffer, 0, nb(n_out));
+                match w.ty {
+                    gguf::GgmlType::Q8_0 => mk(
+                        PipeId::Matvec,
+                        &[comum[0], comum[1], comum[2], saida],
+                        mv_groups(n_out),
+                        PushSpec::Static(mv_push(n_in, n_out)),
+                    ),
+                    ty => mk(
+                        if ty == gguf::GgmlType::Q5_K {
+                            PipeId::MatvecQ5K
+                        } else {
+                            PipeId::MatvecQ6K
+                        },
+                        &[comum[0], comum[1], comum[2], saida],
+                        // Os shaders K-quant fazem 4 linhas por workgroup (uma por wave).
+                        u32::try_from(n_out.div_ceil(4)).unwrap_or(u32::MAX),
+                        PushSpec::Static(mv_push(n_in, n_out)),
+                    ),
+                }
+            };
+
         // Presente em todos os shards: no primeiro copia a linha do token da tabela de
         // embedding; nos demais copia a stream residual vinda da GPU anterior. Nos dois
         // casos o host escreve em `embd_stage` e a cópia entra no command buffer do token.
@@ -1356,39 +1412,9 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.attn_q.buffer, 0, lq.attn_q.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_q.buffer, 0, nb(c.n_embd)),
-                ],
-                mv_groups(c.n_embd),
-                PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
-            )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.attn_k.buffer, 0, lq.attn_k.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_k.buffer, 0, nb(c.kv_dim)),
-                ],
-                mv_groups(c.kv_dim),
-                PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
-            )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.attn_v.buffer, 0, lq.attn_v.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_v.buffer, 0, nb(c.kv_dim)),
-                ],
-                mv_groups(c.kv_dim),
-                PushSpec::Static(mv_push(c.n_embd, c.kv_dim)),
-            )?);
+            plan.push(mv(&lq.attn_q, &st.b_q, c.n_embd, c.n_embd)?);
+            plan.push(mv(&lq.attn_k, &st.b_k, c.n_embd, c.kv_dim)?);
+            plan.push(mv(&lq.attn_v, &st.b_v, c.n_embd, c.kv_dim)?);
             if let Some(b) = &la.q_bias {
                 plan.push(mk(
                     PipeId::Add,
@@ -1460,17 +1486,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.attn_output.buffer, 0, lq.attn_output.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_proj.buffer, 0, nb(c.n_embd)),
-                ],
-                mv_groups(c.n_embd),
-                PushSpec::Static(mv_push(c.n_embd, c.n_embd)),
-            )?);
+            plan.push(mv(&lq.attn_output, &st.b_proj, c.n_embd, c.n_embd)?);
             plan.push(mk(
                 PipeId::Add,
                 &[
@@ -1500,28 +1516,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.ffn_gate.buffer, 0, lq.ffn_gate.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_gate.buffer, 0, nb(c.n_ff)),
-                ],
-                mv_groups(c.n_ff),
-                PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
-            )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.ffn_up.buffer, 0, lq.ffn_up.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_up.buffer, 0, nb(c.n_ff)),
-                ],
-                mv_groups(c.n_ff),
-                PushSpec::Static(mv_push(c.n_embd, c.n_ff)),
-            )?);
+            plan.push(mv(&lq.ffn_gate, &st.b_gate, c.n_embd, c.n_ff)?);
+            plan.push(mv(&lq.ffn_up, &st.b_up, c.n_embd, c.n_ff)?);
             plan.push(mk(
                 PipeId::Swiglu,
                 &[
@@ -1542,17 +1538,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_ff),
                 PushSpec::Static(qx_push(c.n_ff)),
             )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (lq.ffn_down.buffer, 0, lq.ffn_down.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_proj.buffer, 0, nb(c.n_embd)),
-                ],
-                mv_groups(c.n_embd),
-                PushSpec::Static(mv_push(c.n_ff, c.n_embd)),
-            )?);
+            plan.push(mv(&lq.ffn_down, &st.b_proj, c.n_ff, c.n_embd)?);
             plan.push(mk(
                 PipeId::Add,
                 &[
@@ -1585,17 +1571,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mk(
-                PipeId::Matvec,
-                &[
-                    (st.output_w.buffer, 0, st.output_w.size_bytes),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                    (st.b_logits.buffer, 0, nb(c.vocab)),
-                ],
-                mv_groups(c.vocab),
-                PushSpec::Static(mv_push(c.n_embd, c.vocab)),
-            )?);
+            plan.push(mv(&st.output_w, &st.b_logits, c.n_embd, c.vocab)?);
         }
 
         Ok(plan)
@@ -1862,15 +1838,15 @@ impl Drop for ResidentForward<'_> {
                 unsafe { d.destroy_query_pool(pf.pool, None) };
             }
             for lq in st.qw {
-                lq.attn_q.destroy(d);
-                lq.attn_k.destroy(d);
-                lq.attn_v.destroy(d);
-                lq.attn_output.destroy(d);
-                lq.ffn_gate.destroy(d);
-                lq.ffn_up.destroy(d);
-                lq.ffn_down.destroy(d);
+                lq.attn_q.gpu.destroy(d);
+                lq.attn_k.gpu.destroy(d);
+                lq.attn_v.gpu.destroy(d);
+                lq.attn_output.gpu.destroy(d);
+                lq.ffn_gate.gpu.destroy(d);
+                lq.ffn_up.gpu.destroy(d);
+                lq.ffn_down.gpu.destroy(d);
             }
-            st.output_w.destroy(d);
+            st.output_w.gpu.destroy(d);
             for la in st.aux {
                 la.attn_norm.destroy(d);
                 la.ffn_norm.destroy(d);
@@ -1891,15 +1867,12 @@ impl Drop for ResidentForward<'_> {
                 &st.kcache,
                 &st.vcache,
                 &st.b_x,
-                &st.b_normed,
                 &st.b_q,
                 &st.b_k,
                 &st.b_v,
-                &st.b_attn,
                 &st.b_proj,
                 &st.b_gate,
                 &st.b_up,
-                &st.b_act,
                 &st.b_logits,
                 &st.b_xq,
                 &st.b_xd,

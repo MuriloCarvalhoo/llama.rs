@@ -23,6 +23,76 @@ pub struct GpuTensor {
 }
 
 impl GpuTensor {
+    /// Upload de um tensor quantizado para VRAM, no layout que o shader do tipo espera.
+    ///
+    /// - **Q8_0**: repack de blocos de 34 B para 36 B (ver `upload_q8_0`).
+    /// - **Q5_K**: cru — o superbloco já tem 176 B = 44 uints alinhados.
+    /// - **Q6_K**: superbloco de 210 B alinhado em 212, para as leituras de 32 bits do
+    ///   shader ficarem alinhadas (mesmo motivo do repack do Q8_0).
+    pub fn upload_quant(
+        ctx: &VulkanContext,
+        phys: &VulkanPhysicalDevice,
+        dev: &VulkanDevice,
+        ty: gguf::GgmlType,
+        bytes: &[u8],
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<Self, TensorError> {
+        match ty {
+            gguf::GgmlType::Q8_0 => Self::upload_q8_0(ctx, phys, dev, bytes, n_in, n_out),
+            gguf::GgmlType::Q5_K => Self::upload_raw(ctx, phys, dev, bytes, n_in, n_out),
+            gguf::GgmlType::Q6_K => {
+                let n_sb = bytes.len() / 210;
+                let mut padded = vec![0u8; n_sb * 212];
+                for i in 0..n_sb {
+                    padded[i * 212..i * 212 + 210].copy_from_slice(&bytes[i * 210..(i + 1) * 210]);
+                }
+                Self::upload_raw(ctx, phys, dev, &padded, n_in, n_out)
+            }
+            _ => Err(TensorError::Vulkan(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)),
+        }
+    }
+
+    /// Upload sem transformação de layout.
+    fn upload_raw(
+        ctx: &VulkanContext,
+        phys: &VulkanPhysicalDevice,
+        dev: &VulkanDevice,
+        bytes: &[u8],
+        n_in: usize,
+        n_out: usize,
+    ) -> Result<Self, TensorError> {
+        let d = &dev.device;
+        let size = bytes.len() as vk::DeviceSize;
+        let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
+        // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
+        unsafe {
+            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            d.unmap_memory(staging_mem);
+        }
+        let buffer = create_buf(
+            d,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let memory = alloc_and_bind(ctx, phys, d, buffer, false)?;
+        one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buffer, size)?;
+        // SAFETY: staging já copiado; ambos criados por nós.
+        unsafe {
+            d.destroy_buffer(staging, None);
+            d.free_memory(staging_mem, None);
+        }
+        Ok(Self {
+            buffer,
+            memory,
+            size_bytes: size,
+            n_in,
+            n_out,
+        })
+    }
+
     /// Upload de bytes Q8_0 para VRAM via staging buffer.
     ///
     /// Fluxo:

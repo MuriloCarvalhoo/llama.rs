@@ -1,13 +1,18 @@
 # Progresso — llama-rs
 
-**Última atualização:** 2026-08-13 (sessão Fase 0 + desbloqueios do 14B)
+**Última atualização:** 2026-08-14 (K-quants no decode residente + 32B em layer-split)
 
-## Estado em números (2026-08-13, fim da sessão de otimização)
+## Estado em números (2026-08-14)
 
-| Config | llama-rs | llama.cpp Vulkan | razão |
+| Config | llama-rs | llama.cpp | razão |
 |---|---|---|---|
-| Qwen2.5-14B Q8_0, 1× MI50 | **28.0 tok/s** | 40.59 tok/s | **0.69×** |
-| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 tok/s | 0.37× |
+| Qwen2.5-32B Q5_K_M, 2× MI50 (layer-split) | **13.5 tok/s** | 16.36 tok/s (ROCm) | **0.82×** |
+| Qwen2.5-14B Q8_0, 1× MI50 | **28.4 tok/s** | 40.59 tok/s (Vulkan) | 0.70× |
+| Qwen2.5-0.5B Q8_0, 1× MI50 | 123 tok/s | 334 tok/s (Vulkan) | 0.37× |
+
+O 32B é o primeiro caso que **justifica** o layer-split: 22.2 GB não cabem nos 16.3 GiB
+de uma MI50. Dividido, ocupa 10.4 GB na GPU0 e 12.2 GB na GPU1, com uma única
+sincronização por token (a stream residual de `n_embd` floats).
 
 O 14B saiu de **4.77 → 28.0 tok/s (5.9×)** nesta sessão. Perfil atual do 14B
 (`LLAMA_RS_PROFILE=1`): GPU 27.8 ms/token, host 3.0 ms/token.
@@ -30,7 +35,7 @@ bloco Q8_0 (contra 34 B do formato) custa 5.9%, e Q4_K quase metade. Ver
 
 ## Resumo em uma frase
 
-CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente em **1 GPU** é numericamente correto mas ~4× mais lento que o llama.cpp; a **Fase 0 foi concluída** (baseline do 14B + spike de all-reduce, risco nº1 resolvido) e vários bloqueios do 14B foram removidos, mas o **row-split real entre as 2 GPUs** — o objetivo central — ainda não foi implementado, e o 14B ainda não carrega por consumo de RAM no lado CPU.
+CPU: pipeline completa e bit-exact contra o llama.cpp. GPU (Vulkan, 2× AMD MI50): decode residente correto e a **0.70–0.82× do llama.cpp**, com Q8_0, Q5_K e Q6_K; **layer-split entre as 2 GPUs funcionando** e validado no caso que o justifica (Qwen2.5-32B, 22.2 GB, que não cabe em uma placa). Tensor-parallel row-split foi **descartado por medição** — sem P2P de VRAM neste hardware, o custo de sincronização supera o ganho.
 
 ---
 
@@ -206,7 +211,7 @@ Alavancas testadas, eliminadas como causa uma a uma:
 |---|---|
 | Specialization constants + NUM_ROWS=2 | ganho marginal (~5%) |
 | Cache de `x[]` em shared memory (LDS) | **revertido**: -38%, derruba ocupação |
-| Ativação int8 + `dotPacked4x8` (packed dot) | gate técnico OK, mas **0% de ganho** → não é ALU-bound |
+| Ativação int8 + `dotPacked4x8` (packed dot) | **no Q8_0**: 0% de ganho → esse kernel não é ALU-bound. (Nos K-quants, em 2026-08-14, o mesmo dot deu **2×** — ali o desempacotamento byte a byte dominava.) |
 | Pesos Q8_0 em blocos alinhados de 32 bits | ~5% → não é padrão de load isolado |
 
 Conclusões cruzadas: não é ALU-bound, não é byte-load, não é banda saturada (~91 tok/s já está a ~5% do teto de ~1 TB/s para este modelo), não é overhead de submit (resolvido na Fase 1D). **Suspeito remanescente: baixa ocupação/paralelização estrutural do matvec** — 1 workgroup de 64 lanes cobrindo poucas linhas de saída, sem coalescência real entre lanes adjacentes.
@@ -215,13 +220,54 @@ Próximo passo recomendado no próprio documento (nunca executado): **profiling 
 
 ---
 
+## Sessão 2026-08-14 — K-quants no decode residente
+
+O 32B Q5_K_M saiu de **2.81 → ~13.5 tok/s (4.8×)**. Progressão medida, cada passo isolado:
+
+| passo | tok/s | matvec_q5k (ms/token, GPU0) |
+|---|---|---|
+| Q5_K/Q6_K desempacotando byte a byte | 2.81 | 120.0 |
+| loads de 32 bits (4 elementos por load) | 5.47 | 62.2 |
+| ativação lida em `vec4` | 6.15 | 56.1 |
+| **ativação int8 + `dotPacked4x8`** | **12.75** | **17.5** |
+| 4 waves por workgroup | ~13.5 | — |
+| `soma(x)` pré-calculada no `quantize_x` | 12.24 | **revertido** |
+
+O salto está no dot empacotado, e o que o torna barato nos K-quants é que **num uint de
+`qs`/`ql` os 4 nibbles já estão em bytes separados**: `qsw & 0x0F0F0F0F` produz o operando
+do `V_DOT4_I32_I8` em uma instrução. O sub-bloco de 32 elementos do Q5_K coincide com o
+bloco de quantização da ativação, então as escalas casam sem conversão.
+
+Duas medições que contrariam a intuição e valem como referência:
+
+- **Pré-calcular `soma(x)`** (o termo constante do K-quant, que não depende dos pesos e era
+  refeito para cada uma das n_out linhas) ficou **6% mais lento**: trocar ~8 instruções VALU
+  por 2 loads é mau negócio. Depois do dot empacotado o kernel é limitado por memória.
+- **4 waves por workgroup** rendeu só ~2% — a ocupância não era o gargalo que parecia.
+
+Erro numérico validado contra a referência de CPU (`dequant_to_f32` + produto interno sobre
+a mesma ativação int8): < 1e-5 nos dois shaders.
+
+---
+
 ## Próximos passos (ordem recomendada)
 
-1. **Rodar a Fase 0 do row-split** — spike de latência de all-reduce MI50↔MI50 (host-bounce e device-local) + baseline do llama.cpp no 14B (layer-split e row-split, tomar o melhor). Decide o mecanismo (host-staged vs peer-to-peer) e se o teto de latência inviabiliza o design Megatron antes de escrever código de produção. Nenhum trabalho de Fase 2 deveria começar sem isso — é o pré-requisito mais barato e mais crítico que falta.
-2. **Investigar o bug de `decode_one_gpu_owned`** (token divergente "89012") antes de construir mais em cima desse caminho — é uma regressão de correção conhecida e sem dono.
-3. **Implementar a Fase 2 — tensor-parallel row-split real** (layout Megatron: §5 da spec ativa), substituindo o `DualGpuMatmul` ingênuo por um caminho residente com all-reduce, usando o mecanismo decidido no passo 1.
-4. **Fase 3 — redesenho do kernel matvec** (multi-subgroup/workgroup, tiling), só depois de ter row-split funcionando — a otimização isolada de kernel (Fase 8.3) já mostrou retorno marginal sem mudar a arquitetura de paralelização.
-5. **Manter README e este documento sincronizados a cada mudança de escopo** — a divergência entre o README e as specs mais recentes (K80 anunciada como alvo quando já estava excluída há duas fases) foi a causa da rodada de revisão que gerou este documento.
+1. **Fechar os ~18% restantes contra o llama.cpp no 32B.** O `matvec_q5k` roda a ~420 GB/s
+   de um pico de 717 GB/s e ainda é 68% do tempo. A amplificação de leitura é a suspeita
+   principal: cada lane lê 32 B de `qs` e 32 B de `qh` para consumir 22 B úteis (2.9×).
+   Fazer cada lane cobrir dois sub-blocos (nibble baixo e alto do mesmo byte) derrubaria
+   isso para ~1.45×. Medir com `MESA_VK_TRACE=rgp` antes de reescrever.
+2. **Investigar o bug de `decode_one_gpu_owned`** (token divergente "89012") — regressão de
+   correção conhecida e sem dono.
+3. **Q4_K.** O `Q4_K_M` é o formato dos modelos que interessam (o Qwen3.6-27B local está em
+   Q4_K_M) e ainda não tem shader. O layout de escalas é o mesmo do Q5_K (`get_scale_min_k4`),
+   então o kernel sai quase de graça a partir do `q5_k_matvec.comp` — sem `qh`, o que reduz
+   a amplificação de leitura pela metade.
+4. **Tensor-parallel está descartado por medição, não por falta de tempo.** Sem P2P de VRAM
+   neste hardware (`OPAQUE_FD` falha, `DMA_BUF` importa como host-visible a 10.2 GB/s contra
+   717 GB/s local), os 96 all-reduces por token do layout Megatron custariam ~5.7 ms/token —
+   mais do que economizariam. Layer-split é a resposta certa aqui, e é o que o llama.cpp faz.
+5. **Manter README e este documento sincronizados a cada mudança de escopo.**
 
 ---
 

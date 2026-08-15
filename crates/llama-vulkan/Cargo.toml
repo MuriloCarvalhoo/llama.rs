@@ -10,6 +10,7 @@ thiserror = { workspace = true }
 rayon = { workspace = true }
 llama-model = { workspace = true, features = ["gpu"] }
 tracing = { version = "0.1.44", optional = true }
+gguf = { version = "0.1.0", path = "../gguf" }
 
 [dev-dependencies]
 gguf = { workspace = true }

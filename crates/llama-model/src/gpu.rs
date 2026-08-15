@@ -5,15 +5,26 @@ use crate::config::LlamaConfig;
 use crate::error::ModelError;
 use gguf::{GgmlType, GgufFile};
 
-/// Pesos Q8_0 por camada, emprestados do buffer do GGUF (sem cópia).
+/// Um tensor de peso quantizado, emprestado do buffer do GGUF (sem cópia).
+///
+/// O tipo viaja junto porque modelos `*_K_M` são **mistos**: no Qwen2.5-32B-Q5_K_M,
+/// `attn_v` e `ffn_down` são Q6_K em algumas camadas e Q5_K em outras, então o backend
+/// escolhe o shader por tensor, não por modelo.
+#[derive(Clone, Copy)]
+pub struct QTensor<'a> {
+    pub ty: GgmlType,
+    pub bytes: &'a [u8],
+}
+
+/// Pesos quantizados de uma camada, emprestados do buffer do GGUF (sem cópia).
 pub struct GpuLayerRaw<'a> {
-    pub attn_q: &'a [u8],
-    pub attn_k: &'a [u8],
-    pub attn_v: &'a [u8],
-    pub attn_output: &'a [u8],
-    pub ffn_gate: &'a [u8],
-    pub ffn_up: &'a [u8],
-    pub ffn_down: &'a [u8],
+    pub attn_q: QTensor<'a>,
+    pub attn_k: QTensor<'a>,
+    pub attn_v: QTensor<'a>,
+    pub attn_output: QTensor<'a>,
+    pub ffn_gate: QTensor<'a>,
+    pub ffn_up: QTensor<'a>,
+    pub ffn_down: QTensor<'a>,
 }
 
 /// Todos os pesos Q8_0 que o decode envia à GPU.
@@ -23,43 +34,52 @@ pub struct GpuLayerRaw<'a> {
 /// o suficiente para o processo ser morto por OOM antes de chegar à VRAM.
 pub struct GpuRawWeights<'a> {
     pub layers: Vec<GpuLayerRaw<'a>>,
-    pub output: &'a [u8],
+    pub output: QTensor<'a>,
 }
 
 impl<'a> GpuRawWeights<'a> {
-    /// Lê e valida os pesos Q8_0 do GGUF. Erro se algum tensor não for Q8_0
-    /// ou tiver `n_in % 32 != 0` (incompatível com o shader matvec wave64).
+    /// Lê e valida os pesos quantizados do GGUF. Aceita Q8_0, Q5_K e Q6_K — os tipos
+    /// para os quais existe shader de matvec. Valida a granularidade que cada um exige:
+    /// 32 elementos por bloco no Q8_0, 256 por superbloco nos K-quants.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
 
-        let read = |name: &str, n_in: usize, n_out: usize| -> Result<&'a [u8], ModelError> {
+        let read = |name: &str, n_in: usize, n_out: usize| -> Result<QTensor<'a>, ModelError> {
             let info = f
                 .tensors
                 .iter()
                 .find(|t| t.name == name)
                 .ok_or_else(|| ModelError::Gpu(format!("tensor {name} ausente")))?;
-            if info.ggml_type != GgmlType::Q8_0 {
+            let (elems_per_block, block_bytes) = match info.ggml_type {
+                GgmlType::Q8_0 => (32usize, 34usize),
+                GgmlType::Q5_K => (256, 176),
+                GgmlType::Q6_K => (256, 210),
+                other => {
+                    return Err(ModelError::Gpu(format!(
+                        "tensor {name} é {other:?} — a GPU só tem shader para Q8_0, Q5_K e Q6_K"
+                    )));
+                }
+            };
+            if n_in % elems_per_block != 0 {
                 return Err(ModelError::Gpu(format!(
-                    "tensor {name} não é Q8_0 (é {:?}) — GPU exige Q8_0",
+                    "tensor {name}: n_in={n_in} não é múltiplo de {elems_per_block} ({:?})",
                     info.ggml_type
-                )));
-            }
-            if n_in % 32 != 0 {
-                return Err(ModelError::Gpu(format!(
-                    "tensor {name}: n_in={n_in} não é múltiplo de 32"
                 )));
             }
             let raw = f
                 .tensor_data(bytes, info)
                 .map_err(|e| ModelError::Gpu(e.to_string()))?;
-            let expected = n_out * (n_in / 32) * 34;
+            let expected = n_out * (n_in / elems_per_block) * block_bytes;
             if raw.len() != expected {
                 return Err(ModelError::Gpu(format!(
                     "tensor {name}: {} bytes, esperado {expected}",
                     raw.len()
                 )));
             }
-            Ok(raw)
+            Ok(QTensor {
+                ty: info.ggml_type,
+                bytes: raw,
+            })
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
@@ -317,9 +337,9 @@ impl Model<'_> {
             let (attn_norm, ffn_norm) = self.layer_norms_f32(l)?;
             let attn_in = rmsnorm_and_scale(&x, attn_norm, c.n_embd, c.rms_eps);
 
-            let mut q = gpu.matvec_q8_0(&gw.attn_q, &attn_in, c.n_embd, c.n_embd)?;
-            let mut k = gpu.matvec_q8_0(&gw.attn_k, &attn_in, c.n_embd, kv_dim)?;
-            let mut v = gpu.matvec_q8_0(&gw.attn_v, &attn_in, c.n_embd, kv_dim)?;
+            let mut q = gpu.matvec_q8_0(gw.attn_q.bytes, &attn_in, c.n_embd, c.n_embd)?;
+            let mut k = gpu.matvec_q8_0(gw.attn_k.bytes, &attn_in, c.n_embd, kv_dim)?;
+            let mut v = gpu.matvec_q8_0(gw.attn_v.bytes, &attn_in, c.n_embd, kv_dim)?;
 
             self.add_layer_biases(l, &mut q, &mut k, &mut v, kv_dim, n_tok)?;
 
@@ -354,16 +374,16 @@ impl Model<'_> {
                 c.n_head_kv,
                 c.head_dim,
             );
-            let attn_out = gpu.matvec_q8_0(&gw.attn_output, &attn, c.n_embd, c.n_embd)?;
+            let attn_out = gpu.matvec_q8_0(gw.attn_output.bytes, &attn, c.n_embd, c.n_embd)?;
             for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) {
                 *xi += ai;
             }
 
             let ffn_in = rmsnorm_and_scale(&x, ffn_norm, c.n_embd, c.rms_eps);
-            let gate = gpu.matvec_q8_0(&gw.ffn_gate, &ffn_in, c.n_embd, c.n_ff)?;
-            let up = gpu.matvec_q8_0(&gw.ffn_up, &ffn_in, c.n_embd, c.n_ff)?;
+            let gate = gpu.matvec_q8_0(gw.ffn_gate.bytes, &ffn_in, c.n_embd, c.n_ff)?;
+            let up = gpu.matvec_q8_0(gw.ffn_up.bytes, &ffn_in, c.n_embd, c.n_ff)?;
             let act = swiglu(&gate, &up);
-            let ffn_out = gpu.matvec_q8_0(&gw.ffn_down, &act, c.n_ff, c.n_embd)?;
+            let ffn_out = gpu.matvec_q8_0(gw.ffn_down.bytes, &act, c.n_ff, c.n_embd)?;
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) {
                 *xi += fi;
             }
@@ -374,7 +394,7 @@ impl Model<'_> {
         let output_norm = self.output_norm_f32()?;
         let final_x = rmsnorm_and_scale(&x, output_norm, c.n_embd, c.rms_eps);
         let last = &final_x[..c.n_embd];
-        let logits = gpu.matvec_q8_0(&w.output, last, c.n_embd, c.vocab)?;
+        let logits = gpu.matvec_q8_0(w.output.bytes, last, c.n_embd, c.vocab)?;
         Ok(logits)
     }
 }
@@ -513,9 +533,9 @@ mod tests {
         assert_eq!(w.layers.len(), cfg.n_layer);
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
         let row_bytes_q = (cfg.n_embd / 32) * 34;
-        assert_eq!(w.layers[0].attn_q.len(), cfg.n_embd * row_bytes_q);
-        assert_eq!(w.layers[0].attn_k.len(), kv_dim * row_bytes_q);
-        assert_eq!(w.output.len(), cfg.vocab * row_bytes_q);
+        assert_eq!(w.layers[0].attn_q.bytes.len(), cfg.n_embd * row_bytes_q);
+        assert_eq!(w.layers[0].attn_k.bytes.len(), kv_dim * row_bytes_q);
+        assert_eq!(w.output.bytes.len(), cfg.vocab * row_bytes_q);
         eprintln!("GpuRawWeights OK — {} camadas", w.layers.len());
     }
 }

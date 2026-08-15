@@ -393,10 +393,14 @@ fn dispatch_k_matvec(
     };
 
     let (w_buf, w_mem) = upload(w_bytes)?;
-    // SAFETY: Vec<f32> é POD contíguo; reinterpretar como bytes é válido.
-    let x_bytes =
-        unsafe { std::slice::from_raw_parts(x_f32.as_ptr().cast::<u8>(), size_of_val(x_f32)) };
-    let (x_buf, x_mem) = upload(x_bytes)?;
+    // Os shaders K-quant consomem a ativação em int8, como o caminho Q8_0: o sub-bloco de
+    // 32 elementos do K-quant coincide com o bloco de quantização.
+    let (xq, xd) = crate::tensor::quantize_x_host(x_f32);
+    // SAFETY: Vec<u32>/Vec<f32> são POD contíguos; reinterpretar como bytes é válido.
+    let xq_bytes = unsafe { std::slice::from_raw_parts(xq.as_ptr().cast::<u8>(), xq.len() * 4) };
+    let xd_bytes = unsafe { std::slice::from_raw_parts(xd.as_ptr().cast::<u8>(), xd.len() * 4) };
+    let (xq_buf, xq_mem) = upload(xq_bytes)?;
+    let (xd_buf, xd_mem) = upload(xd_bytes)?;
 
     let y_size = (n_out * size_of::<f32>()) as vk::DeviceSize;
     let y_buf = create_buf(
@@ -406,16 +410,16 @@ fn dispatch_k_matvec(
     )?;
     let y_mem = alloc_and_bind(ctx, phys, d, y_buf, false)?;
 
-    let pipe = ComputePipeline::with(d, spv, 3, size_of::<PushConstants>() as u32, &[])?;
+    let pipe = ComputePipeline::with(d, spv, 4, size_of::<PushConstants>() as u32, &[])?;
     let push = PushConstants {
         n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         row_offset: 0,
     };
-    // Descriptor pool + set com os 3 bindings (pesos, ativação, saída).
+    // Descriptor pool + set com os 4 bindings (pesos, xq, xd, saída).
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 3,
+        descriptor_count: 4,
     }];
     let pool_info = vk::DescriptorPoolCreateInfo {
         max_sets: 1,
@@ -441,9 +445,14 @@ fn dispatch_k_matvec(
             range: w_bytes.len() as vk::DeviceSize,
         },
         vk::DescriptorBufferInfo {
-            buffer: x_buf,
+            buffer: xq_buf,
             offset: 0,
-            range: x_bytes.len() as vk::DeviceSize,
+            range: xq_bytes.len() as vk::DeviceSize,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: xd_buf,
+            offset: 0,
+            range: xd_bytes.len() as vk::DeviceSize,
         },
         vk::DescriptorBufferInfo {
             buffer: y_buf,
@@ -501,8 +510,8 @@ fn dispatch_k_matvec(
                 size_of::<PushConstants>(),
             ),
         );
-        // 1 workgroup por linha de saída.
-        d.cmd_dispatch(cmd, push.n_out, 1, 1);
+        // 4 linhas de saída por workgroup (uma por wave).
+        d.cmd_dispatch(cmd, push.n_out.div_ceil(4), 1, 1);
         d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
@@ -532,8 +541,10 @@ fn dispatch_k_matvec(
         pipe.destroy(d);
         d.destroy_buffer(w_buf, None);
         d.free_memory(w_mem, None);
-        d.destroy_buffer(x_buf, None);
-        d.free_memory(x_mem, None);
+        d.destroy_buffer(xq_buf, None);
+        d.free_memory(xq_mem, None);
+        d.destroy_buffer(xd_buf, None);
+        d.free_memory(xd_mem, None);
         d.destroy_buffer(y_buf, None);
         d.free_memory(y_mem, None);
     }
