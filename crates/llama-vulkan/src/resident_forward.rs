@@ -149,13 +149,26 @@ pub(crate) struct Cfg {
 
 /// Pesos Q8_0 residentes de uma camada.
 pub(crate) struct LayerQ {
-    pub attn_q: QWeight,
-    pub attn_k: QWeight,
-    pub attn_v: QWeight,
-    pub attn_output: QWeight,
+    pub mixer: MixerQ,
     pub ffn_gate: QWeight,
     pub ffn_up: QWeight,
     pub ffn_down: QWeight,
+}
+
+/// Pesos quantizados do que fica entre as duas normas da camada, já na VRAM.
+pub(crate) enum MixerQ {
+    Attn {
+        attn_q: QWeight,
+        attn_k: QWeight,
+        attn_v: QWeight,
+        attn_output: QWeight,
+    },
+    /// Atenção linear do qwen35 — ver `docs/qwen35-arquitetura.md`.
+    Delta {
+        attn_qkv: QWeight,
+        attn_gate: QWeight,
+        ssm_out: QWeight,
+    },
 }
 
 /// Peso residente em VRAM junto com o tipo, que decide qual shader de matvec usar.
@@ -171,6 +184,28 @@ pub(crate) struct LayerAux {
     pub q_bias: Option<Buf>,
     pub k_bias: Option<Buf>,
     pub v_bias: Option<Buf>,
+    /// QK-norm por cabeça (qwen35): [head_dim].
+    pub q_norm: Option<Buf>,
+    pub k_norm: Option<Buf>,
+    /// Pesos e estado residente da atenção linear.
+    pub delta: Option<DeltaBufs>,
+}
+
+/// Pesos f32 e **estado recorrente** de uma camada de atenção linear.
+///
+/// `estado` e `janela` são o que substitui o KV-cache: tamanho fixo, lidos e reescritos a
+/// cada token. Ficam na mesma VRAM do shard, então acompanham o layer-split de graça.
+pub(crate) struct DeltaBufs {
+    pub conv1d: Buf,
+    /// (ssm_a, dt_bias) por cabeça, empacotados como o `dn_gates` os consome.
+    pub adt: Buf,
+    pub alpha: Buf,
+    pub beta: Buf,
+    pub norm: Buf,
+    /// [n_v_heads * d_state * d_state] — o histórico inteiro da sequência.
+    pub estado: Buf,
+    /// [conv_dim * (d_conv - 1)] — os tokens anteriores que a convolução ainda enxerga.
+    pub janela: Buf,
 }
 
 /// Identifica qual pipeline um dispatch usa (resolvido em `pipe_of`).
@@ -185,6 +220,10 @@ pub(crate) enum PipeId {
     Attention,
     Swiglu,
     Add,
+    DeltaNet,
+    DnConv,
+    DnGates,
+    DnNorm,
 }
 
 impl PipeId {
@@ -199,6 +238,10 @@ impl PipeId {
             PipeId::Attention => "attention",
             PipeId::Swiglu => "swiglu",
             PipeId::Add => "add",
+            PipeId::DeltaNet => "delta_net",
+            PipeId::DnConv => "dn_conv",
+            PipeId::DnGates => "dn_gates",
+            PipeId::DnNorm => "dn_norm",
         }
     }
 }
@@ -649,10 +692,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 // qwen35 ainda não têm plano de decode (ver docs/qwen35-arquitetura.md).
                 let (w_q, w_k, w_v, w_o) = lw.attn();
                 qw.push(LayerQ {
-                    attn_q: up_q(w_q, cfg.n_embd, cfg.n_embd)?,
-                    attn_k: up_q(w_k, cfg.n_embd, kv_dim)?,
-                    attn_v: up_q(w_v, cfg.n_embd, kv_dim)?,
-                    attn_output: up_q(w_o, cfg.n_embd, cfg.n_embd)?,
+                    mixer: MixerQ::Attn {
+                        attn_q: up_q(w_q, cfg.n_embd, cfg.n_embd)?,
+                        attn_k: up_q(w_k, cfg.n_embd, kv_dim)?,
+                        attn_v: up_q(w_v, cfg.n_embd, kv_dim)?,
+                        attn_output: up_q(w_o, cfg.n_embd, cfg.n_embd)?,
+                    },
                     ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
                     ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
                     ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
@@ -701,6 +746,11 @@ impl<'ctx> ResidentForward<'ctx> {
                     q_bias: mk_opt(&al.q_bias)?,
                     k_bias: mk_opt(&al.k_bias)?,
                     v_bias: mk_opt(&al.v_bias)?,
+                    q_norm: mk_opt(&al.q_norm)?,
+                    k_norm: mk_opt(&al.k_norm)?,
+                    // Ainda sem plano de decode para as camadas lineares — os pesos e o
+                    // estado recorrente entram junto com ele.
+                    delta: None,
                 });
             }
             let output_norm_buf = mk(&aux.output_norm)?;
@@ -1354,6 +1404,10 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::Matvec => &self.matvec,
             PipeId::MatvecQ5K => &self.matvec_q5k,
             PipeId::MatvecQ6K => &self.matvec_q6k,
+            PipeId::DeltaNet => &self.delta_net,
+            PipeId::DnConv => &self.dn_conv,
+            PipeId::DnGates => &self.dn_gates,
+            PipeId::DnNorm => &self.dn_norm,
             PipeId::QuantizeX => &self.quantize_x,
             PipeId::Rmsnorm => &self.rmsnorm,
             PipeId::Rope => &self.rope,
@@ -1521,9 +1575,20 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mv(&lq.attn_q, &st.b_q, c.n_embd, c.n_embd)?);
-            plan.push(mv(&lq.attn_k, &st.b_k, c.n_embd, c.kv_dim)?);
-            plan.push(mv(&lq.attn_v, &st.b_v, c.n_embd, c.kv_dim)?);
+            let (w_q, w_k, w_v, w_o) = match &lq.mixer {
+                MixerQ::Attn {
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                } => (attn_q, attn_k, attn_v, attn_output),
+                MixerQ::Delta { .. } => {
+                    return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+                }
+            };
+            plan.push(mv(w_q, &st.b_q, c.n_embd, c.n_embd)?);
+            plan.push(mv(w_k, &st.b_k, c.n_embd, c.kv_dim)?);
+            plan.push(mv(w_v, &st.b_v, c.n_embd, c.kv_dim)?);
             if let Some(b) = &la.q_bias {
                 plan.push(mk(
                     PipeId::Add,
@@ -1595,7 +1660,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
-            plan.push(mv(&lq.attn_output, &st.b_proj, c.n_embd, c.n_embd)?);
+            plan.push(mv(w_o, &st.b_proj, c.n_embd, c.n_embd)?);
             plan.push(mk(
                 PipeId::Add,
                 &[
@@ -1980,10 +2045,28 @@ impl Drop for ResidentForward<'_> {
                 unsafe { d.destroy_query_pool(pf.pool, None) };
             }
             for lq in st.qw {
-                lq.attn_q.gpu.destroy(d);
-                lq.attn_k.gpu.destroy(d);
-                lq.attn_v.gpu.destroy(d);
-                lq.attn_output.gpu.destroy(d);
+                match lq.mixer {
+                    MixerQ::Attn {
+                        attn_q,
+                        attn_k,
+                        attn_v,
+                        attn_output,
+                    } => {
+                        attn_q.gpu.destroy(d);
+                        attn_k.gpu.destroy(d);
+                        attn_v.gpu.destroy(d);
+                        attn_output.gpu.destroy(d);
+                    }
+                    MixerQ::Delta {
+                        attn_qkv,
+                        attn_gate,
+                        ssm_out,
+                    } => {
+                        attn_qkv.gpu.destroy(d);
+                        attn_gate.gpu.destroy(d);
+                        ssm_out.gpu.destroy(d);
+                    }
+                }
                 lq.ffn_gate.gpu.destroy(d);
                 lq.ffn_up.gpu.destroy(d);
                 lq.ffn_down.gpu.destroy(d);
@@ -1992,6 +2075,22 @@ impl Drop for ResidentForward<'_> {
             for la in st.aux {
                 la.attn_norm.destroy(d);
                 la.ffn_norm.destroy(d);
+                for b in [&la.q_norm, &la.k_norm].into_iter().flatten() {
+                    b.destroy(d);
+                }
+                if let Some(dn) = &la.delta {
+                    for b in [
+                        &dn.conv1d,
+                        &dn.adt,
+                        &dn.alpha,
+                        &dn.beta,
+                        &dn.norm,
+                        &dn.estado,
+                        &dn.janela,
+                    ] {
+                        b.destroy(d);
+                    }
+                }
                 if let Some(b) = la.q_bias {
                     b.destroy(d);
                 }

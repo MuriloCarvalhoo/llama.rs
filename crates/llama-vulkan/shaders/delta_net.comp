@@ -1,82 +1,99 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 // Um passo da recorrência do gated delta net (arquiteturas híbridas tipo qwen35).
 //
-// Substitui a atenção em 3 de cada 4 camadas do Qwen3.8: em vez de um KV-cache que
-// cresce, cada cabeça carrega um estado `d × d` de tamanho fixo, que este shader lê,
+// Substitui a atencao em 3 de cada 4 camadas do Qwen3.8: em vez de um KV-cache que
+// cresce, cada cabeca carrega um estado `d x d` de tamanho fixo, que este shader le,
 // atualiza e reescreve a cada token.
 //
-// Por cabeça h e linha j do estado (guardado transposto, `M[j][i] = S[i][j]`):
+// Por cabeca h e coluna `col` do estado (guardado transposto, `M[col][i] = S[i][col]`):
 //
-//   M[j]   *= exp(g[h])                        // decaimento
-//   delta_j = (v[h][j] - dot(M[j], k[h])) * beta[h]
-//   M[j]   += delta_j * k[h]                   // atualizacao de posto 1
-//   out[j]  = dot(M[j], q[h]) / sqrt(d)
+//   kv     = sum_i M[col][i] * k[i]
+//   delta  = (v[col] - exp(g) * kv) * beta
+//   M[col] = exp(g) * M[col] + k * delta        // decaimento e posto 1, fundidos
+//   out    = sum_i M[col][i] * q[i] / sqrt(d)
 //
-// **As linhas nao se falam.** Cada uma le e escreve so a sua fatia de `d` floats do
-// estado, e os dois produtos internos sao locais — nao ha reducao entre lanes, o que
-// torna este kernel trivialmente paralelo em `n_heads * d` threads.
+// **Uma wave por coluna, com o estado em registrador.** Cada lane guarda `d / 64`
+// elementos da coluna, entao as 64 lanes cobrem a coluna inteira e os dois produtos
+// internos viram `subgroupAdd`. Assim o estado e lido **uma vez** e escrito **uma vez**,
+// e lanes vizinhas leem posicoes vizinhas da coluna — acesso coalescido.
 //
-// q e k sao os mesmos para todas as `d` linhas de uma cabeca, entao vao para LDS: sao
-// 2*d floats lidos uma vez por workgroup em vez de d vezes.
+// A versao anterior deste shader punha uma thread por *linha*, cada uma percorrendo os
+// seus `d` floats: sem reducao nenhuma, o que parecia melhor, mas com dois problemas que
+// custam mais que a reducao — o estado era lido e escrito **duas vezes** por token (uma
+// para o decaimento e o produto com k, outra para a atualizacao e o produto com q), e as
+// 64 lanes de uma wave liam endereços separados por `d * 4` bytes, ou seja, uma linha de
+// cache inteira por lane. O desenho atual segue o kernel CUDA do llama.cpp.
 
-layout(local_size_x = 128) in;  // uma thread por linha do estado; d = 128 no Qwen3.8
+layout(local_size_x = 64, local_size_y = 4) in;  // 4 colunas por workgroup, uma wave cada
 
 layout(set = 0, binding = 0) buffer StateBuf { float s[]; } state_buf;   // inout [n_heads][d][d]
-layout(set = 0, binding = 1) readonly buffer QBuf { float q[]; } q_buf;  // [n_heads][d]
-layout(set = 0, binding = 2) readonly buffer KBuf { float k[]; } k_buf;  // [n_heads][d]
+layout(set = 0, binding = 1) readonly buffer QBuf { float q[]; } q_buf;  // [n_k_heads][d]
+layout(set = 0, binding = 2) readonly buffer KBuf { float k[]; } k_buf;  // [n_k_heads][d]
 layout(set = 0, binding = 3) readonly buffer VBuf { float v[]; } v_buf;  // [n_heads][d]
 // (g, beta) por cabeca, empacotados num vec2: os dois sao lidos juntos e uma vez so.
 layout(set = 0, binding = 4) readonly buffer GBuf { vec2 gb[]; } g_buf;  // [n_heads]
 layout(set = 0, binding = 5) writeonly buffer OutBuf { float o[]; } out_buf; // [n_heads][d]
 
 layout(push_constant) uniform PC {
-    uint d;        // dimensao da cabeca (= d_state)
+    uint d;        // dimensao da cabeca (= d_state); multiplo de 64
     uint n_heads;  // cabecas de valor
-    uint pad;
+    uint rep;      // cabecas de valor por cabeca de chave (GQA): 3 no Qwen3.8
 } pc;
 
-shared float s_q[256];
-shared float s_k[256];
+const uint LANES = 64u;
+const uint MAX_POR_LANE = 4u;   // cobre d ate 256
 
 void main() {
-    uint h = gl_WorkGroupID.x;
-    uint j = gl_LocalInvocationID.x;
-    if (h >= pc.n_heads) { return; }
+    // Workgroups linearizados em x: `d / local_size_y` por cabeca. O dispatch do plano
+    // so varia a dimensao x, entao a divisao acontece aqui.
+    uint wg_por_head = pc.d / gl_WorkGroupSize.y;
+    uint h = gl_WorkGroupID.x / wg_por_head;
+    uint col = (gl_WorkGroupID.x % wg_por_head) * gl_WorkGroupSize.y + gl_LocalInvocationID.y;
+    uint lane = gl_LocalInvocationID.x;
+    if (h >= pc.n_heads || col >= pc.d) { return; }
 
+    uint por_lane = pc.d / LANES;
+    // q e k tem menos cabecas que v (GQA): a cabeca de chave `h / rep` serve `rep`
+    // cabecas de valor. Indexar aqui evita materializar a repeticao num buffer.
+    uint base_qk = (h / pc.rep) * pc.d;
     uint base_h = h * pc.d;
-    // Carrega q e k da cabeca em LDS (uma passada por thread cobre d <= local_size).
-    if (j < pc.d) {
-        s_q[j] = q_buf.q[base_h + j];
-        s_k[j] = k_buf.k[base_h + j];
-    }
-    barrier();
-
-    if (j >= pc.d) { return; }
+    uint base_col = h * pc.d * pc.d + col * pc.d;
 
     vec2 gb = g_buf.gb[h];
     float decay = exp(gb.x);
     float beta = gb.y;
 
-    uint linha = h * pc.d * pc.d + j * pc.d;
+    float s_reg[MAX_POR_LANE];
+    float k_reg[MAX_POR_LANE];
+    float q_reg[MAX_POR_LANE];
 
-    // Passada 1: decaimento e produto interno com k, na mesma leitura do estado.
-    float pred = 0.0;
-    for (uint i = 0u; i < pc.d; i++) {
-        float m = state_buf.s[linha + i] * decay;
-        state_buf.s[linha + i] = m;
-        pred += m * s_k[i];
+    float kv = 0.0;
+    for (uint r = 0u; r < por_lane; r++) {
+        uint i = r * LANES + lane;
+        s_reg[r] = state_buf.s[base_col + i];
+        k_reg[r] = k_buf.k[base_qk + i];
+        q_reg[r] = q_buf.q[base_qk + i];
+        kv += s_reg[r] * k_reg[r];
     }
+    kv = subgroupAdd(kv);
 
-    float delta = (v_buf.v[base_h + j] - pred) * beta;
+    // `kv` sai uniforme na wave; o decaimento entra aqui em vez de numa passada propria
+    // sobre o estado, porque `dot(decay * M[col], k) == decay * dot(M[col], k)`.
+    float delta = (v_buf.v[base_h + col] - decay * kv) * beta;
 
-    // Passada 2: atualizacao de posto 1 e leitura com q.
     float acc = 0.0;
-    for (uint i = 0u; i < pc.d; i++) {
-        float m = state_buf.s[linha + i] + delta * s_k[i];
-        state_buf.s[linha + i] = m;
-        acc += m * s_q[i];
+    for (uint r = 0u; r < por_lane; r++) {
+        uint i = r * LANES + lane;
+        float m = decay * s_reg[r] + k_reg[r] * delta;
+        state_buf.s[base_col + i] = m;
+        acc += m * q_reg[r];
     }
+    acc = subgroupAdd(acc);
 
-    out_buf.o[base_h + j] = acc * inversesqrt(float(pc.d));
+    if (lane == 0u) {
+        out_buf.o[base_h + col] = acc * inversesqrt(float(pc.d));
+    }
 }

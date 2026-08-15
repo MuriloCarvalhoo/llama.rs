@@ -62,12 +62,13 @@ fn delta_net_bate_com_a_referencia_de_cpu() {
     struct P {
         d: u32,
         n_heads: u32,
-        pad: u32,
+        rep: u32,
     }
+    // rep = 1: uma cabeça de chave por cabeça de valor (o caso sem GQA).
     let push = push_bytes(&P {
         d: d as u32,
         n_heads: n_heads as u32,
-        pad: 0,
+        rep: 1,
     });
 
     let saida = fwd
@@ -82,7 +83,8 @@ fn delta_net_bate_com_a_referencia_de_cpu() {
                 vec![0f32; n_heads * d],
             ],
             &push,
-            n_heads as u32,
+            // n_heads * (d / 4): quatro colunas do estado por workgroup.
+            (n_heads * d / 4) as u32,
         )
         .expect("dispatch delta_net");
     let estado_gpu = &saida[0];
