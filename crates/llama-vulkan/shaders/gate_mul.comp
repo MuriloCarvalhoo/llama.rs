@@ -1,0 +1,27 @@
+#version 450
+
+// dst[i] *= sigmoid(gate[i]) — o portao que o qwen35 aplica na saida da atencao antes da
+// projecao. O `gate` vem da segunda metade da propria projecao de Q, entao chega com um
+// deslocamento (`off`) dentro do mesmo buffer, intercalado por cabeca.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer DBuf { float d[]; } db;              // inout [n]
+layout(set = 0, binding = 1) readonly buffer GBuf { float g[]; } gb;     // [n_head][2*head_dim]
+
+layout(push_constant) uniform PC {
+    uint n;         // head_dim * n_head
+    uint head_dim;
+    uint pad;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    // Cabeca h ocupa [h*2*head_dim, (h+1)*2*head_dim): query na primeira metade, gate na
+    // segunda.
+    uint h = i / pc.head_dim;
+    uint d = i % pc.head_dim;
+    float g = gb.g[h * 2u * pc.head_dim + pc.head_dim + d];
+    db.d[i] *= 1.0 / (1.0 + exp(-g));
+}

@@ -151,6 +151,91 @@ fn init_rayon_after_model_load() {
     }
 }
 
+/// Geração para arquiteturas híbridas (`qwen35`): sempre GPU, sempre layer-split se
+/// houver duas placas. O caminho CPU não implementa atenção linear.
+#[cfg(feature = "gpu")]
+fn run_hibrido(
+    args: &Args,
+    f: &GgufFile,
+    bytes: &[u8],
+    cfg: llama_model::LlamaConfig,
+    on_token: &mut impl FnMut(&str),
+) -> Result<Timing, Box<dyn std::error::Error>> {
+    use llama_vulkan::{LayerSplitForward, ResidentForward, VulkanContext};
+
+    let tokenizer = Tokenizer::from_gguf(f)?;
+    let sampler = choose_sampler(args);
+    let mut rng = SmallRng::seed_from_u64(args.seed);
+    let raw = llama_model::GpuRawWeights::from_gguf(f, bytes, &cfg)?;
+    let aux = llama_model::GpuAuxWeights::from_gguf(f, bytes, &cfg)?;
+
+    let ctx = VulkanContext::new()?;
+    let n_gpus = ctx.amd_compute_devices().len();
+    if n_gpus == 0 {
+        return Err("nenhuma GPU AMD — o qwen35 não tem caminho de CPU".into());
+    }
+
+    let mut n_tokens = 0usize;
+    let mut start: Option<Instant> = None;
+    let mut emitir = |piece: &str, on_token: &mut dyn FnMut(&str)| {
+        if start.is_none() {
+            start = Some(Instant::now());
+        }
+        on_token(piece);
+        n_tokens += 1;
+    };
+
+    let usar_split = args.gpu_layer_split && n_gpus >= 2;
+    if usar_split {
+        let backend = LayerSplitForward::new(&ctx, &cfg, &raw, &aux)
+            .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
+        let layout: Vec<String> = backend
+            .layout()
+            .iter()
+            .map(|(d, a, b)| format!("GPU{d}: camadas {a}..{b}"))
+            .collect();
+        eprintln!("[GPU] layer-split — {}", layout.join(" | "));
+        llama_model::gerar_streaming_residente(
+            &cfg,
+            &tokenizer,
+            &args.prompt,
+            args.n_predict,
+            &sampler,
+            &mut rng,
+            &backend,
+            &mut |p| emitir(p, on_token),
+        )?;
+        backend.print_profile();
+    } else {
+        let backend = ResidentForward::new(&ctx, &cfg, &raw, &aux)
+            .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
+        llama_model::gerar_streaming_residente(
+            &cfg,
+            &tokenizer,
+            &args.prompt,
+            args.n_predict,
+            &sampler,
+            &mut rng,
+            &backend,
+            &mut |p| emitir(p, on_token),
+        )?;
+        backend.print_profile();
+    }
+
+    let elapsed_secs = start.map_or(0.0, |s| s.elapsed().as_secs_f64());
+    #[allow(clippy::cast_precision_loss)]
+    let tokens_per_sec = if elapsed_secs > 0.0 {
+        n_tokens as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    Ok(Timing {
+        n_tokens,
+        elapsed_secs,
+        tokens_per_sec,
+    })
+}
+
 /// Metricas coletadas durante a geracao.
 pub struct Timing {
     pub n_tokens: usize,
@@ -178,10 +263,20 @@ pub fn run_generate(
 
     let bytes = map_model(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
+    let cfg = model_config(&f, args)?;
+
+    // Arquiteturas híbridas (`qwen35`) não têm a estrutura densa que o `Model` exige — em
+    // 3 de cada 4 camadas não existe `attn_q` —, então o caminho de GPU delas monta os
+    // pesos direto do GGUF e usa o laço de geração livre.
+    #[cfg(feature = "gpu")]
+    if cfg.delta_net.is_some() {
+        return run_hibrido(args, &f, &bytes, cfg, on_token);
+    }
+
     let model = {
         #[cfg(feature = "profiling")]
         let _s = tracing::info_span!("carregar_modelo").entered();
-        Model::load_with_config(&f, &bytes, model_config(&f, args)?)?
+        Model::load_with_config(&f, &bytes, cfg)?
     };
     // Criar pool rayon DEPOIS do load: workers herdam afinidade e política de memória.
     init_rayon_after_model_load();

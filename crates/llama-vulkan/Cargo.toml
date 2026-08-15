@@ -13,6 +13,7 @@ tracing = { version = "0.1.44", optional = true }
 gguf = { version = "0.1.0", path = "../gguf" }
 
 [dev-dependencies]
+memmap2 = "0.9"
 gguf = { workspace = true }
 llama-tokenizer = { workspace = true }
 llama-sampling = { workspace = true }

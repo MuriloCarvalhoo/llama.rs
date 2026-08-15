@@ -11,6 +11,9 @@ layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; } ob;  // [n_hea
 layout(push_constant) uniform PC {
     uint n_head; uint n_head_kv; uint head_dim;
     uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos f32
+    // Distancia entre cabecas no buffer de Q. Igual a head_dim quando as cabecas sao
+    // contiguas; no qwen35 e 2*head_dim, porque cada cabeca traz query e gate lado a lado.
+    uint q_stride;
 } pc;
 
 const uint WG = 64u;      // lanes por wave (wave64 no MI50)
@@ -48,7 +51,7 @@ void main() {
     for (uint i = 0u; i < MAX_DPL; i++) { qd[i] = 0.0; acc[i] = 0.0; }
     for (uint i = 0u; i < dpl; i++) {
         uint d = lane + i * WG;
-        qd[i] = (d < pc.head_dim) ? qb.q[h * pc.head_dim + d] : 0.0;
+        qd[i] = (d < pc.head_dim) ? qb.q[h * pc.q_stride + d] : 0.0;
     }
 
     float m = -1.0e30;   // max corrente desta wave

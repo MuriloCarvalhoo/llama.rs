@@ -41,4 +41,6 @@ pub(crate) const DN_GATES_SPV: &[u8] = include_bytes!(concat!(env!("DN_GATES_SPV
 #[allow(dead_code)]
 pub(crate) const DN_NORM_SPV: &[u8] = include_bytes!(concat!(env!("DN_NORM_SPV")));
 #[allow(dead_code)]
+pub(crate) const GATE_MUL_SPV: &[u8] = include_bytes!(concat!(env!("GATE_MUL_SPV")));
+#[allow(dead_code)]
 pub(crate) const ADD_SPV: &[u8] = include_bytes!(concat!(env!("ADD_SPV")));

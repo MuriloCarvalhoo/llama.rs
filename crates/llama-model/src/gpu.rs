@@ -305,6 +305,52 @@ impl<'a> GpuAuxWeights<'a> {
     }
 }
 
+/// Geração token a token com o decode inteiro na GPU, **sem depender do `Model`**.
+///
+/// As arquiteturas híbridas (`qwen35`) não têm a estrutura densa que `Model` exige — em 3
+/// de cada 4 camadas não existe `attn_q` — mas o laço de geração só precisa da config, do
+/// tokenizer e do backend.
+#[allow(clippy::too_many_arguments)]
+pub fn gerar_streaming_residente(
+    config: &LlamaConfig,
+    tokenizer: &llama_tokenizer::Tokenizer,
+    prompt: &str,
+    n_tokens: usize,
+    sampler: &llama_sampling::Sampler,
+    rng: &mut impl rand::Rng,
+    gpu: &dyn GpuResidentDecode,
+    on_token: &mut impl FnMut(&str),
+) -> Result<(), ModelError> {
+    let prompt_ids = tokenizer.encode(prompt, config.add_bos);
+    if prompt_ids.is_empty() {
+        return Err(ModelError::Gpu("prompt vazio".into()));
+    }
+    gpu.reset();
+
+    let mut logits = Vec::new();
+    for (pos, &t) in prompt_ids.iter().enumerate() {
+        logits = gpu.decode(t, pos)?;
+    }
+    let first_idx = sampler.sample(&logits, rng);
+    let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
+    let mut pos = prompt_ids.len();
+
+    let mut count = 0usize;
+    while count < n_tokens {
+        if next == config.eos_id {
+            break;
+        }
+        let piece = tokenizer.decode(&[next]);
+        on_token(&piece);
+        count += 1;
+        let logits = gpu.decode(next, pos)?;
+        pos += 1;
+        let idx = sampler.sample(&logits, rng);
+        next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "gpu")]
 use crate::attention::{KvCache, attention};
 #[cfg(feature = "gpu")]
@@ -425,34 +471,16 @@ impl Model<'_> {
         gpu: &dyn GpuResidentDecode,
         on_token: &mut impl FnMut(&str),
     ) -> Result<(), ModelError> {
-        let prompt_ids = tokenizer.encode(prompt, true);
-        if prompt_ids.is_empty() {
-            return Err(ModelError::Gpu("prompt vazio".into()));
-        }
-        gpu.reset();
-
-        let mut logits = Vec::new();
-        for (pos, &t) in prompt_ids.iter().enumerate() {
-            logits = gpu.decode(t, pos)?;
-        }
-        let first_idx = sampler.sample(&logits, rng);
-        let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
-        let mut pos = prompt_ids.len();
-
-        let mut count = 0usize;
-        while count < n_tokens {
-            if next == self.config.eos_id {
-                break;
-            }
-            let piece = tokenizer.decode(&[next]);
-            on_token(&piece);
-            count += 1;
-            let logits = gpu.decode(next, pos)?;
-            pos += 1;
-            let idx = sampler.sample(&logits, rng);
-            next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
-        }
-        Ok(())
+        gerar_streaming_residente(
+            &self.config,
+            tokenizer,
+            prompt,
+            n_tokens,
+            sampler,
+            rng,
+            gpu,
+            on_token,
+        )
     }
 
     /// Prefill + 1 decode 100% na GPU; argmax dos logits. Para teste de paridade vs CPU.

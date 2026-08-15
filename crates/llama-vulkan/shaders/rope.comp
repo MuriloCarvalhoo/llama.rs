@@ -4,6 +4,9 @@ layout(set = 0, binding = 0) buffer XBuf { float x[]; } xb;        // inout
 layout(set = 0, binding = 1) readonly buffer FBuf { float f[]; } fb; // freq_table[rope_dim/2]
 layout(push_constant) uniform PC {
     uint n_head; uint head_dim; uint rope_dim; float pos;
+    // Distancia entre cabecas. Igual a head_dim quando sao contiguas; no Q do qwen35 e
+    // 2*head_dim, porque cada cabeca traz query e gate lado a lado.
+    uint stride;
 } pc;
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -12,7 +15,7 @@ void main() {
     if (idx >= total) return;
     uint h = idx / half_rope;
     uint i = idx % half_rope;
-    uint base = h * pc.head_dim;
+    uint base = h * pc.stride;
     float theta = pc.pos * fb.f[i];
     float s = sin(theta);
     float c = cos(theta);

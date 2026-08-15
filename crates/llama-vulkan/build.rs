@@ -17,6 +17,7 @@ fn main() {
         ("dn_conv.comp", "DN_CONV_SPV"),
         ("dn_gates.comp", "DN_GATES_SPV"),
         ("dn_norm.comp", "DN_NORM_SPV"),
+        ("gate_mul.comp", "GATE_MUL_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

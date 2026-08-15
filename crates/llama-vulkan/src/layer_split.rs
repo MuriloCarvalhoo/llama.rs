@@ -110,6 +110,26 @@ impl<'ctx> LayerSplitForward<'ctx> {
         }
     }
 
+    /// Rótulos das ops do plano do shard `s`.
+    pub fn dbg_plano(&self, s: usize) -> Vec<&'static str> {
+        self.shards.get(s).map(|x| x.dbg_plano()).unwrap_or_default()
+    }
+
+    /// Stream residual do shard `s`, para diagnóstico.
+    pub fn dbg_hidden(&self, s: usize) -> Option<Vec<f32>> {
+        self.shards.get(s)?.dbg_hidden()
+    }
+
+    /// Buffer intermediário do caminho de atenção linear do shard `s`.
+    pub fn dbg_dn_buf(&self, s: usize, nome: &str) -> Option<Vec<f32>> {
+        self.shards.get(s)?.dbg_dn_buf(nome)
+    }
+
+    /// Estado recorrente da camada `l` do shard `s`, para diagnóstico.
+    pub fn dbg_estado_delta(&self, s: usize, l: usize) -> Option<Vec<f32>> {
+        self.shards.get(s)?.dbg_estado_delta(l)
+    }
+
     /// Distribuição efetiva, para log: `(device, primeira, última+1)`.
     pub fn layout(&self) -> Vec<(usize, usize, usize)> {
         self.shards

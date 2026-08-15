@@ -5,6 +5,7 @@
 //
 //   modo 0 (L2):    x / sqrt(sum(x^2) + eps)                  — em q e k, antes do delta net
 //   modo 1 (gated): rmsnorm(x, w) * silu(z)                   — na saida do delta net
+//   modo 2 (QK):    rmsnorm(x, w)                             — em q e k da atencao completa
 //
 // Sao o mesmo esqueleto (uma reducao por cabeca, depois uma escala) e por isso dividem o
 // shader: um workgroup por cabeca, reducao no subgrupo.
@@ -23,8 +24,12 @@ layout(set = 0, binding = 3) writeonly buffer OutBuf { float o[]; } out_buf; // 
 layout(push_constant) uniform PC {
     uint dim;
     uint n_heads;
-    uint modo;     // 0 = L2, 1 = rmsnorm(w) * silu(z)
+    uint modo;     // 0 = L2, 1 = rmsnorm(w) * silu(z), 2 = rmsnorm(w)
     float eps;
+    // Distancia entre cabecas no buffer de entrada/saida. Igual a `dim` quando as cabecas
+    // sao contiguas; no Q da atencao do qwen35 e `2*dim`, porque cada cabeca traz query e
+    // gate lado a lado e a norma so toca a query.
+    uint stride;
 } pc;
 
 void main() {
@@ -32,7 +37,7 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     if (h >= pc.n_heads) { return; }
 
-    uint base = h * pc.dim;
+    uint base = h * pc.stride;
     float ss = 0.0;
     for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
         float v = x_buf.x[base + i];
@@ -50,6 +55,8 @@ void main() {
         if (pc.modo == 1u) {
             float z = z_buf.z[base + i];
             v *= w_buf.w[i] * (z / (1.0 + exp(-z)));  // peso da norma e SiLU do gate
+        } else if (pc.modo == 2u) {
+            v *= w_buf.w[i];
         }
         out_buf.o[base + i] = v;
     }

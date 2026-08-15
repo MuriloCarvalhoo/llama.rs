@@ -145,6 +145,8 @@ pub(crate) struct Cfg {
     pub rms_eps: f32,
     /// Faixa de camadas deste shard. `n_layer` acima é a contagem LOCAL.
     pub shard: Shard,
+    /// `Some` nas arquiteturas híbridas (qwen35).
+    pub delta_net: Option<llama_model::DeltaNetConfig>,
 }
 
 /// Pesos Q8_0 residentes de uma camada.
@@ -191,6 +193,33 @@ pub(crate) struct LayerAux {
     pub delta: Option<DeltaBufs>,
 }
 
+/// Ativações intermediárias do caminho de atenção linear, compartilhadas por todas as
+/// camadas do shard (uma camada por vez usa cada uma).
+pub(crate) struct DnBufs {
+    /// Projeção q|k|v antes e depois da convolução: [conv_dim].
+    pub qkv: Buf,
+    pub conv: Buf,
+    /// `z`, o gate que fecha a norma da saída: [value_dim].
+    pub z: Buf,
+    /// (g, beta) por cabeça de valor: [n_v_heads * 2].
+    pub gb: Buf,
+    /// q e k já normalizados em L2: [key_dim] cada.
+    pub qn: Buf,
+    pub kn: Buf,
+    /// Saída da recorrência e da norma gated: [value_dim].
+    pub out: Buf,
+    pub normed: Buf,
+    /// Ativação quantizada própria do caminho linear. Separada da global para que a
+    /// projeção de saída não dispute o buffer com o FFN da mesma camada.
+    pub xq: Buf,
+    pub xd: Buf,
+}
+
+/// Canais que a convolução causal cobre: q, k (com as cabeças de chave) e v.
+pub(crate) fn conv_dim_de(dn: &llama_model::DeltaNetConfig) -> usize {
+    dn.d_state * dn.n_k_heads * 2 + dn.head_v_dim() * dn.n_v_heads
+}
+
 /// Pesos f32 e **estado recorrente** de uma camada de atenção linear.
 ///
 /// `estado` e `janela` são o que substitui o KV-cache: tamanho fixo, lidos e reescritos a
@@ -224,6 +253,7 @@ pub(crate) enum PipeId {
     DnConv,
     DnGates,
     DnNorm,
+    GateMul,
 }
 
 impl PipeId {
@@ -242,6 +272,7 @@ impl PipeId {
             PipeId::DnConv => "dn_conv",
             PipeId::DnGates => "dn_gates",
             PipeId::DnNorm => "dn_norm",
+            PipeId::GateMul => "gate_mul",
         }
     }
 }
@@ -250,8 +281,8 @@ impl PipeId {
 pub(crate) enum PushSpec {
     /// Push totalmente conhecido na construção do plano.
     Static(Vec<u8>),
-    /// RoPE: precisa de `pos` na gravação. `n_head` fixo.
-    Rope { n_head: u32 },
+    /// RoPE: precisa de `pos` na gravação. `n_head` e o passo entre cabeças são fixos.
+    Rope { n_head: u32, stride: u32 },
     /// Attention: precisa de `total_len`. `kv_layer_off` fixo.
     Attention { kv_layer_off: u32 },
 }
@@ -297,6 +328,11 @@ pub(crate) struct ResidentState {
     pub b_up: Buf,
     pub b_act: Buf,
     pub b_logits: Buf,
+    /// Saída do FFN. Separada de `b_proj` (saída do mixer) porque compartilhar as duas
+    /// esconde de qual das duas veio um valor quando se lê o buffer para diagnóstico.
+    pub b_ffn: Buf,
+    /// Buffers do caminho de atenção linear (qwen35). `None` nas arquiteturas densas.
+    pub dn: Option<DnBufs>,
     /// Ativacao quantizada em int8 (8 uints por bloco de 32) e escala por bloco,
     /// produzidas uma vez por matvec pelo dispatch `QuantizeX`.
     pub b_xq: Buf,
@@ -341,6 +377,8 @@ pub enum DnPipe {
     Conv,
     Gates,
     Norm,
+    /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
+    QuantizeX,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +408,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_conv: ComputePipeline,
     pub(crate) dn_gates: ComputePipeline,
     pub(crate) dn_norm: ComputePipeline,
+    pub(crate) gate_mul: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState>,
 }
@@ -570,8 +609,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 4, push_mv, &[])?;
         let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 4, push_mv, &[])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
-        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 16, &[])?;
-        let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24, &[])?;
+        let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 20, &[])?;
+        let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
         let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
         // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
@@ -579,7 +618,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 12, &[])?;
         let dn_conv = ComputePipeline::with(d, crate::DN_CONV_SPV, 4, 12, &[])?;
         let dn_gates = ComputePipeline::with(d, crate::DN_GATES_SPV, 5, 12, &[])?;
-        let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 16, &[])?;
+        let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 20, &[])?;
+        let gate_mul = ComputePipeline::with(d, crate::GATE_MUL_SPV, 2, 12, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -614,6 +654,7 @@ impl<'ctx> ResidentForward<'ctx> {
             dn_conv,
             dn_gates,
             dn_norm,
+            gate_mul,
             desc_pool,
             state: None,
         })
@@ -676,6 +717,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 ctx: config.ctx,
                 rms_eps: config.rms_eps,
                 shard,
+                delta_net: config.delta_net.clone(),
             };
 
             let up_q = |t: &llama_model::QTensor<'_>,
@@ -690,14 +732,47 @@ impl<'ctx> ResidentForward<'ctx> {
             for lw in &raw.layers[shard.first_layer..shard.end_layer] {
                 // Só o caminho denso por enquanto: as camadas de atenção linear do
                 // qwen35 ainda não têm plano de decode (ver docs/qwen35-arquitetura.md).
-                let (w_q, w_k, w_v, w_o) = lw.attn();
+                let mixer = match &lw.mixer {
+                    llama_model::MixerRaw::Attn {
+                        attn_q,
+                        attn_k,
+                        attn_v,
+                        attn_output,
+                    } => {
+                        // No qwen35 a projeção de Q sai dobrada (query|gate) e a saída da
+                        // atenção entra com head_dim × n_head, que não é n_embd.
+                        let (q_out, o_in) = match config.delta_net.as_ref() {
+                            Some(_) => (
+                                config.head_dim * config.n_head * 2,
+                                config.head_dim * config.n_head,
+                            ),
+                            None => (config.n_embd, config.n_embd),
+                        };
+                        MixerQ::Attn {
+                            attn_q: up_q(attn_q, cfg.n_embd, q_out)?,
+                            attn_k: up_q(attn_k, cfg.n_embd, kv_dim)?,
+                            attn_v: up_q(attn_v, cfg.n_embd, kv_dim)?,
+                            attn_output: up_q(attn_output, o_in, cfg.n_embd)?,
+                        }
+                    }
+                    llama_model::MixerRaw::Delta {
+                        attn_qkv,
+                        attn_gate,
+                        ssm_out,
+                    } => {
+                        let dn = config.delta_net.as_ref().ok_or(MatmulError::Vulkan(
+                            vk::Result::ERROR_FEATURE_NOT_PRESENT,
+                        ))?;
+                        let value_dim = dn.head_v_dim() * dn.n_v_heads;
+                        MixerQ::Delta {
+                            attn_qkv: up_q(attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
+                            attn_gate: up_q(attn_gate, cfg.n_embd, value_dim)?,
+                            ssm_out: up_q(ssm_out, value_dim, cfg.n_embd)?,
+                        }
+                    }
+                };
                 qw.push(LayerQ {
-                    mixer: MixerQ::Attn {
-                        attn_q: up_q(w_q, cfg.n_embd, cfg.n_embd)?,
-                        attn_k: up_q(w_k, cfg.n_embd, kv_dim)?,
-                        attn_v: up_q(w_v, cfg.n_embd, kv_dim)?,
-                        attn_output: up_q(w_o, cfg.n_embd, cfg.n_embd)?,
-                    },
+                    mixer,
                     ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
                     ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
                     ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
@@ -748,9 +823,30 @@ impl<'ctx> ResidentForward<'ctx> {
                     v_bias: mk_opt(&al.v_bias)?,
                     q_norm: mk_opt(&al.q_norm)?,
                     k_norm: mk_opt(&al.k_norm)?,
-                    // Ainda sem plano de decode para as camadas lineares — os pesos e o
-                    // estado recorrente entram junto com ele.
-                    delta: None,
+                    delta: match (&al.delta, config.delta_net.as_ref()) {
+                        (Some(da), Some(dn)) => {
+                            // (ssm_a, dt_bias) intercalados: o `dn_gates` lê os dois de
+                            // uma cabeça num vec2.
+                            let adt: Vec<f32> = (0..dn.n_v_heads)
+                                .flat_map(|h| [da.a[h], da.dt_bias[h]])
+                                .collect();
+                            Some(DeltaBufs {
+                                conv1d: mk(&da.conv1d)?,
+                                adt: mk(&adt)?,
+                                alpha: mk(&da.alpha)?,
+                                beta: mk(&da.beta)?,
+                                norm: mk(&da.norm)?,
+                                // Estado recorrente e janela da convolução começam
+                                // zerados — é o "contexto vazio" desta arquitetura.
+                                estado: mk(&vec![0f32; dn.state_len()])?,
+                                janela: mk(&vec![
+                                    0f32;
+                                    conv_dim_de(dn) * (dn.d_conv - 1)
+                                ])?,
+                            })
+                        }
+                        _ => None,
+                    },
                 });
             }
             let output_norm_buf = mk(&aux.output_norm)?;
@@ -761,6 +857,17 @@ impl<'ctx> ResidentForward<'ctx> {
             let kcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
             let vcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
 
+            let attn_dim = if config.delta_net.is_some() {
+                config.head_dim * config.n_head
+            } else {
+                config.n_embd
+            };
+            // Query e gate juntos quando há QK-norm/gate (qwen35).
+            let q_dim = if config.delta_net.is_some() {
+                attn_dim * 2
+            } else {
+                config.n_embd
+            };
             let nf = |n: usize| -> Result<Buf, MatmulError> {
                 Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)
             };
@@ -816,17 +923,41 @@ impl<'ctx> ResidentForward<'ctx> {
                 vcache,
                 b_x: nf(config.n_embd)?,
                 b_normed: nf(config.n_embd)?,
-                b_q: nf(config.n_embd)?,
+                // No qwen35 a projeção de Q sai com query **e** gate por cabeça, e o
+                // conjunto de cabeças não tem exatamente n_embd (24 × 256 = 6144 contra
+                // 5120), então os buffers da atenção seguem head_dim × n_head.
+                b_q: nf(q_dim)?,
                 b_k: nf(kv_dim)?,
                 b_v: nf(kv_dim)?,
-                b_attn: nf(config.n_embd)?,
+                b_attn: nf(attn_dim)?,
                 b_proj: nf(config.n_embd)?,
                 b_gate: nf(config.n_ff)?,
                 b_up: nf(config.n_ff)?,
                 b_act: nf(config.n_ff)?,
                 b_logits: nf(config.vocab)?,
+                b_ffn: nf(config.n_embd)?,
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
+                dn: match config.delta_net.as_ref() {
+                    Some(dn) => {
+                        let key_dim = dn.d_state * dn.n_k_heads;
+                        let value_dim = dn.head_v_dim() * dn.n_v_heads;
+                        let cd = conv_dim_de(dn);
+                        Some(DnBufs {
+                            qkv: nf(cd)?,
+                            conv: nf(cd)?,
+                            z: nf(value_dim)?,
+                            gb: nf(dn.n_v_heads * 2)?,
+                            qn: nf(key_dim)?,
+                            kn: nf(key_dim)?,
+                            out: nf(value_dim)?,
+                            normed: nf(value_dim)?,
+                            xq: nf(value_dim / 32 * 8)?,
+                            xd: nf(value_dim / 32)?,
+                        })
+                    }
+                    None => None,
+                },
                 // Saída deste shard: logits no último, stream residual nos demais.
                 logits_host,
                 logits_ptr,
@@ -902,6 +1033,7 @@ impl<'ctx> ResidentForward<'ctx> {
             total_len: u32,
             kv_dim: u32,
             kv_layer_off: u32,
+            q_stride: u32,
         }
         let d = &self.dev.device;
         let kv_dim = n_head_kv * head_dim;
@@ -940,8 +1072,10 @@ impl<'ctx> ResidentForward<'ctx> {
             total_len: total_len as u32,
             kv_dim: kv_dim as u32,
             kv_layer_off: 0,
+            // Cabeças contíguas neste helper de teste.
+            q_stride: head_dim as u32,
         };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 24) };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 28) };
         self.dispatch1(
             &self.attention,
             set,
@@ -960,6 +1094,192 @@ impl<'ctx> ResidentForward<'ctx> {
         vb.destroy(d);
         ob.destroy(d);
         Ok(out)
+    }
+
+
+    /// Emite as ops de uma camada de atenção linear (qwen35), deixando o resultado em
+    /// `b_proj` — o mesmo lugar onde a camada de atenção deixa o dela, para que o fecho
+    /// da camada (residual, norma, FFN) seja comum aos dois caminhos.
+    ///
+    /// A sequência segue `docs/qwen35-arquitetura.md`:
+    /// `qkv = W·x`, `z = Wg·x`, gates, convolução causal, L2 em q/k, recorrência, norma
+    /// gated e projeção de saída. A ativação já foi quantizada em int8 pelo `QuantizeX`
+    /// do começo da camada, então os três matvecs a consomem direto.
+    #[allow(clippy::too_many_arguments)]
+    fn plano_delta(
+        plan: &mut Vec<PlannedOp>,
+        st: &ResidentState,
+        la: &LayerAux,
+        c: &Cfg,
+        pesos: (&QWeight, &QWeight, &QWeight),
+        mk: &dyn Fn(
+            PipeId,
+            &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+            u32,
+            PushSpec,
+        ) -> Result<PlannedOp, MatmulError>,
+        mv: &dyn Fn(&QWeight, &Buf, usize, usize) -> Result<PlannedOp, MatmulError>,
+        mv_com: &dyn Fn(
+            &QWeight,
+            &Buf,
+            (&Buf, &Buf),
+            usize,
+            usize,
+        ) -> Result<PlannedOp, MatmulError>,
+    ) -> Result<(), MatmulError> {
+        let (w_qkv, w_gate, w_out) = pesos;
+        let dn_cfg = c
+            .delta_net
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        let b = st
+            .dn
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        let da = la
+            .delta
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+
+        let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
+        let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
+        let conv_dim = conv_dim_de(dn_cfg);
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let push3 = |a: u32, b: u32, c: u32| {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v.extend_from_slice(&c.to_le_bytes());
+            v
+        };
+        let push_norm = |dim: u32, n_heads: u32, modo: u32, eps: f32| {
+            let mut v = Vec::with_capacity(20);
+            v.extend_from_slice(&dim.to_le_bytes());
+            v.extend_from_slice(&n_heads.to_le_bytes());
+            v.extend_from_slice(&modo.to_le_bytes());
+            v.extend_from_slice(&eps.to_le_bytes());
+            v.extend_from_slice(&dim.to_le_bytes()); // stride: cabeças contíguas
+            v
+        };
+
+        // Projeções da entrada já quantizada.
+        plan.push(mv(w_qkv, &b.qkv, c.n_embd, conv_dim)?);
+        plan.push(mv(w_gate, &b.z, c.n_embd, value_dim)?);
+
+        // (g, beta) por cabeça — leem `b_normed` em f32, não a versão int8: são
+        // projeções f32 pequenas e o erro da quantização entraria num expoente.
+        plan.push(mk(
+            PipeId::DnGates,
+            &[
+                (st.b_normed.buffer, 0, nb(c.n_embd)),
+                (da.alpha.buffer, 0, da.alpha.size),
+                (da.beta.buffer, 0, da.beta.size),
+                (da.adt.buffer, 0, da.adt.size),
+                (b.gb.buffer, 0, nb(dn_cfg.n_v_heads * 2)),
+            ],
+            u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
+            PushSpec::Static(push3(
+                u32::try_from(c.n_embd).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
+                0,
+            )),
+        )?);
+
+        // Convolução causal com estado, já saindo com SiLU.
+        plan.push(mk(
+            PipeId::DnConv,
+            &[
+                (da.janela.buffer, 0, da.janela.size),
+                (b.qkv.buffer, 0, nb(conv_dim)),
+                (da.conv1d.buffer, 0, da.conv1d.size),
+                (b.conv.buffer, 0, nb(conv_dim)),
+            ],
+            Self::groups_for(conv_dim),
+            PushSpec::Static(push3(
+                u32::try_from(conv_dim).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.d_conv).unwrap_or(u32::MAX),
+                0,
+            )),
+        )?);
+
+        // L2 por cabeça em q e k, que estão nos dois primeiros terços de `conv`.
+        let eps = c.rms_eps;
+        for (off, dst) in [(0usize, &b.qn), (key_dim, &b.kn)] {
+            plan.push(mk(
+                PipeId::DnNorm,
+                &[
+                    (b.conv.buffer, nb(off), nb(key_dim)),
+                    (da.norm.buffer, 0, da.norm.size), // não usado no modo 0
+                    (b.conv.buffer, nb(off), nb(key_dim)), // idem
+                    (dst.buffer, 0, nb(key_dim)),
+                ],
+                u32::try_from(dn_cfg.n_k_heads).unwrap_or(u32::MAX),
+                PushSpec::Static(push_norm(
+                    u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
+                    u32::try_from(dn_cfg.n_k_heads).unwrap_or(u32::MAX),
+                    0,
+                    eps,
+                )),
+            )?);
+        }
+
+        // Recorrência: lê e reescreve o estado da camada.
+        plan.push(mk(
+            PipeId::DeltaNet,
+            &[
+                (da.estado.buffer, 0, da.estado.size),
+                (b.qn.buffer, 0, nb(key_dim)),
+                (b.kn.buffer, 0, nb(key_dim)),
+                (b.conv.buffer, nb(2 * key_dim), nb(value_dim)), // v
+                (b.gb.buffer, 0, nb(dn_cfg.n_v_heads * 2)),
+                (b.out.buffer, 0, nb(value_dim)),
+            ],
+            u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
+            PushSpec::Static(push3(
+                u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
+            )),
+        )?);
+
+        // Norma gated: rmsnorm por cabeça vezes silu(z).
+        plan.push(mk(
+            PipeId::DnNorm,
+            &[
+                (b.out.buffer, 0, nb(value_dim)),
+                (da.norm.buffer, 0, da.norm.size),
+                (b.z.buffer, 0, nb(value_dim)),
+                (b.normed.buffer, 0, nb(value_dim)),
+            ],
+            u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
+            PushSpec::Static(push_norm(
+                u32::try_from(dn_cfg.head_v_dim()).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
+                1,
+                eps,
+            )),
+        )?);
+
+        // A saída da recorrência precisa ser requantizada antes do matvec final: o
+        // `QuantizeX` do começo da camada quantizou `b_normed`, não isto.
+        plan.push(mk(
+            PipeId::QuantizeX,
+            &[
+                (b.normed.buffer, 0, nb(value_dim)),
+                (b.xq.buffer, 0, b.xq.size),
+                (b.xd.buffer, 0, b.xd.size),
+            ],
+            u32::try_from((value_dim / 32).div_ceil(64)).unwrap_or(u32::MAX),
+            PushSpec::Static(push3(u32::try_from(value_dim).unwrap_or(u32::MAX), 0, 0)),
+        )?);
+        plan.push(mv_com(
+            w_out,
+            &st.b_proj,
+            (&b.xq, &b.xd),
+            value_dim,
+            c.n_embd,
+        )?);
+        Ok(())
     }
 
     /// nº de workgroups para cobrir `n` elementos com local_size_x=64.
@@ -986,6 +1306,7 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::Conv => &self.dn_conv,
             DnPipe::Gates => &self.dn_gates,
             DnPipe::Norm => &self.dn_norm,
+            DnPipe::QuantizeX => &self.quantize_x,
         };
         let mut gpu = Vec::with_capacity(bufs.len());
         for b in bufs {
@@ -1159,6 +1480,7 @@ impl<'ctx> ResidentForward<'ctx> {
             head_dim: u32,
             rope_dim: u32,
             pos: f32,
+            stride: u32,
         }
         let d = &self.dev.device;
         let xb = Buf::device(
@@ -1181,8 +1503,10 @@ impl<'ctx> ResidentForward<'ctx> {
             head_dim: head_dim as u32,
             rope_dim: rope_dim as u32,
             pos: pos as f32,
+            // Cabeças contíguas neste helper de teste.
+            stride: head_dim as u32,
         };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 16) };
+        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 20) };
         let pairs = n_head * (rope_dim / 2);
         self.dispatch1(
             &self.rope,
@@ -1305,21 +1629,23 @@ impl<'ctx> ResidentForward<'ctx> {
                     let p = self.pipe_of(*pipe);
                     let bytes: Vec<u8> = match push {
                         PushSpec::Static(b) => b.clone(),
-                        PushSpec::Rope { n_head } => {
+                        PushSpec::Rope { n_head, stride } => {
                             #[repr(C)]
                             struct P {
                                 n_head: u32,
                                 head_dim: u32,
                                 rope_dim: u32,
                                 pos: f32,
+                                stride: u32,
                             }
                             let pp = P {
                                 n_head: *n_head,
                                 head_dim: c.head_dim as u32,
                                 rope_dim: c.rope_dim as u32,
                                 pos: pos as f32,
+                                stride: *stride,
                             };
-                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 16) }
+                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }
                                 .to_vec()
                         }
                         PushSpec::Attention { kv_layer_off } => {
@@ -1331,6 +1657,7 @@ impl<'ctx> ResidentForward<'ctx> {
                                 total_len: u32,
                                 kv_dim: u32,
                                 kv_layer_off: u32,
+                                q_stride: u32,
                             }
                             let pp = P {
                                 n_head: c.n_head as u32,
@@ -1339,8 +1666,14 @@ impl<'ctx> ResidentForward<'ctx> {
                                 total_len,
                                 kv_dim: c.kv_dim as u32,
                                 kv_layer_off: *kv_layer_off,
+                                // No qwen35 query e gate dividem a cabeça.
+                                q_stride: if c.delta_net.is_some() {
+                                    (c.head_dim * 2) as u32
+                                } else {
+                                    c.head_dim as u32
+                                },
                             };
-                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 24) }
+                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 28) }
                                 .to_vec()
                         }
                     };
@@ -1408,6 +1741,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
             PipeId::DnNorm => &self.dn_norm,
+            PipeId::GateMul => &self.gate_mul,
             PipeId::QuantizeX => &self.quantize_x,
             PipeId::Rmsnorm => &self.rmsnorm,
             PipeId::Rope => &self.rope,
@@ -1546,12 +1880,48 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
             };
 
+        // Como `mv`, mas com a ativação vinda de buffers escolhidos pelo chamador.
+        let mv_com = |w: &QWeight,
+                      dst: &Buf,
+                      ativ: (&Buf, &Buf),
+                      n_in: usize,
+                      n_out: usize|
+         -> Result<PlannedOp, MatmulError> {
+            let (xq, xd) = ativ;
+            let rows_por_wg = 8;
+            let pipe = if w.ty == gguf::GgmlType::Q5_K {
+                PipeId::MatvecQ5K
+            } else {
+                PipeId::MatvecQ6K
+            };
+            mk(
+                pipe,
+                &[
+                    (w.gpu.buffer, 0, w.gpu.size_bytes),
+                    (xq.buffer, 0, xq.size),
+                    (xd.buffer, 0, xd.size),
+                    (dst.buffer, 0, nb(n_out)),
+                ],
+                u32::try_from(n_out.div_ceil(rows_por_wg)).unwrap_or(u32::MAX),
+                PushSpec::Static(mv_push(n_in, n_out)),
+            )
+        };
+
         // Presente em todos os shards: no primeiro copia a linha do token da tabela de
         // embedding; nos demais copia a stream residual vinda da GPU anterior. Nos dois
         // casos o host escreve em `embd_stage` e a cópia entra no command buffer do token.
         plan.push(PlannedOp::Embed);
 
+        // Diagnóstico: `LLAMA_RS_STOP_LAYER=N` executa só as N primeiras camadas do
+        // shard. Com N=0 o token sai do embedding direto para a projeção final, o que dá
+        // uma linha de base para saber se as camadas estão de fato contribuindo.
+        let parar_em: Option<usize> = std::env::var("LLAMA_RS_STOP_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok());
         for l in 0..c.n_layer {
+            if parar_em.is_some_and(|n| l >= n) {
+                break;
+            }
             let lq = &st.qw[l];
             let la = &st.aux[l];
 
@@ -1575,6 +1945,28 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_embd),
                 PushSpec::Static(qx_push(c.n_embd)),
             )?);
+            // Camada de atenção linear (qwen35): caminho próprio, que troca o KV-cache
+            // por estado recorrente. Os dois caminhos deixam o resultado em `b_proj`, e o
+            // fecho da camada (residual + norma + FFN) é comum.
+            let eh_delta = matches!(&lq.mixer, MixerQ::Delta { .. });
+            if let MixerQ::Delta {
+                attn_qkv,
+                attn_gate,
+                ssm_out,
+            } = &lq.mixer
+            {
+                Self::plano_delta(
+                    &mut plan,
+                    st,
+                    la,
+                    c,
+                    (attn_qkv, attn_gate, ssm_out),
+                    &mk,
+                    &mv,
+                    &mv_com,
+                )?;
+            }
+            if !eh_delta {
             let (w_q, w_k, w_v, w_o) = match &lq.mixer {
                 MixerQ::Attn {
                     attn_q,
@@ -1582,13 +1974,57 @@ impl<'ctx> ResidentForward<'ctx> {
                     attn_v,
                     attn_output,
                 } => (attn_q, attn_k, attn_v, attn_output),
-                MixerQ::Delta { .. } => {
-                    return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
-                }
+                MixerQ::Delta { .. } => unreachable!("tratado acima"),
             };
-            plan.push(mv(w_q, &st.b_q, c.n_embd, c.n_embd)?);
+            // No qwen35 a projeção de Q sai com query e gate por cabeça (2 × head_dim),
+            // e o conjunto de cabeças (head_dim × n_head) não é n_embd.
+            let hib = c.delta_net.is_some();
+            let attn_dim = if hib { c.head_dim * c.n_head } else { c.n_embd };
+            let q_out = if hib { attn_dim * 2 } else { c.n_embd };
+            plan.push(mv(w_q, &st.b_q, c.n_embd, q_out)?);
             plan.push(mv(w_k, &st.b_k, c.n_embd, c.kv_dim)?);
             plan.push(mv(w_v, &st.b_v, c.n_embd, c.kv_dim)?);
+            // QK-norm: RMSNorm por cabeça, in-place. No Q as cabeças estão espaçadas de
+            // 2 × head_dim porque o gate mora ao lado da query.
+            if let (Some(qn), Some(kn)) = (&la.q_norm, &la.k_norm) {
+                let push_qk = |n_heads: u32, stride: u32| {
+                    let mut v = Vec::with_capacity(20);
+                    v.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
+                    v.extend_from_slice(&n_heads.to_le_bytes());
+                    v.extend_from_slice(&2u32.to_le_bytes()); // modo QK-norm
+                    v.extend_from_slice(&c.rms_eps.to_le_bytes());
+                    v.extend_from_slice(&stride.to_le_bytes());
+                    v
+                };
+                plan.push(mk(
+                    PipeId::DnNorm,
+                    &[
+                        (st.b_q.buffer, 0, nb(q_out)),
+                        (qn.buffer, 0, qn.size),
+                        (st.b_q.buffer, 0, nb(q_out)),
+                        (st.b_q.buffer, 0, nb(q_out)),
+                    ],
+                    u32::try_from(c.n_head).unwrap_or(u32::MAX),
+                    PushSpec::Static(push_qk(
+                        u32::try_from(c.n_head).unwrap_or(u32::MAX),
+                        u32::try_from(c.head_dim * 2).unwrap_or(u32::MAX),
+                    )),
+                )?);
+                plan.push(mk(
+                    PipeId::DnNorm,
+                    &[
+                        (st.b_k.buffer, 0, nb(c.kv_dim)),
+                        (kn.buffer, 0, kn.size),
+                        (st.b_k.buffer, 0, nb(c.kv_dim)),
+                        (st.b_k.buffer, 0, nb(c.kv_dim)),
+                    ],
+                    u32::try_from(c.n_head_kv).unwrap_or(u32::MAX),
+                    PushSpec::Static(push_qk(
+                        u32::try_from(c.n_head_kv).unwrap_or(u32::MAX),
+                        u32::try_from(c.head_dim).unwrap_or(u32::MAX),
+                    )),
+                )?);
+            }
             if let Some(b) = &la.q_bias {
                 plan.push(mk(
                     PipeId::Add,
@@ -1616,12 +2052,17 @@ impl<'ctx> ResidentForward<'ctx> {
             plan.push(mk(
                 PipeId::Rope,
                 &[
-                    (st.b_q.buffer, 0, nb(c.n_embd)),
+                    (st.b_q.buffer, 0, nb(q_out)),
                     (st.freq_buf.buffer, 0, st.freq_buf.size),
                 ],
                 Self::groups_for(c.n_head * (c.rope_dim / 2)),
                 PushSpec::Rope {
                     n_head: c.n_head as u32,
+                    stride: if hib {
+                        (c.head_dim * 2) as u32
+                    } else {
+                        c.head_dim as u32
+                    },
                 },
             )?);
             plan.push(mk(
@@ -1633,6 +2074,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
                 PushSpec::Rope {
                     n_head: c.n_head_kv as u32,
+                    stride: c.head_dim as u32,
                 },
             )?);
             plan.push(PlannedOp::KvAppend { layer: l });
@@ -1640,27 +2082,57 @@ impl<'ctx> ResidentForward<'ctx> {
             plan.push(mk(
                 PipeId::Attention,
                 &[
-                    (st.b_q.buffer, 0, nb(c.n_embd)),
+                    (st.b_q.buffer, 0, nb(q_out)),
                     (st.kcache.buffer, 0, st.kcache.size),
                     (st.vcache.buffer, 0, st.vcache.size),
-                    (st.b_attn.buffer, 0, nb(c.n_embd)),
+                    (st.b_attn.buffer, 0, nb(attn_dim)),
                 ],
                 c.n_head as u32,
                 PushSpec::Attention {
                     kv_layer_off: layer_off,
                 },
             )?);
-            plan.push(mk(
-                PipeId::QuantizeX,
-                &[
-                    (st.b_attn.buffer, 0, nb(c.n_embd)),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                ],
-                qx_groups(c.n_embd),
-                PushSpec::Static(qx_push(c.n_embd)),
-            )?);
-            plan.push(mv(w_o, &st.b_proj, c.n_embd, c.n_embd)?);
+            if !hib {
+                plan.push(mk(
+                    PipeId::QuantizeX,
+                    &[
+                        (st.b_attn.buffer, 0, nb(c.n_embd)),
+                        (st.b_xq.buffer, 0, st.b_xq.size),
+                        (st.b_xd.buffer, 0, st.b_xd.size),
+                    ],
+                    qx_groups(c.n_embd),
+                    PushSpec::Static(qx_push(c.n_embd)),
+                )?);
+            }
+            if hib {
+                // Portão do qwen35: a saída da atenção passa por sigmoid(gate), com o
+                // gate vindo da segunda metade da própria projeção de Q.
+                let mut pg = Vec::with_capacity(12);
+                pg.extend_from_slice(&u32::try_from(attn_dim).unwrap_or(0).to_le_bytes());
+                pg.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
+                pg.extend_from_slice(&0u32.to_le_bytes());
+                plan.push(mk(
+                    PipeId::GateMul,
+                    &[
+                        (st.b_attn.buffer, 0, nb(attn_dim)),
+                        (st.b_q.buffer, 0, nb(q_out)),
+                    ],
+                    Self::groups_for(attn_dim),
+                    PushSpec::Static(pg),
+                )?);
+                plan.push(mk(
+                    PipeId::QuantizeX,
+                    &[
+                        (st.b_attn.buffer, 0, nb(attn_dim)),
+                        (st.b_xq.buffer, 0, st.b_xq.size),
+                        (st.b_xd.buffer, 0, st.b_xd.size),
+                    ],
+                    qx_groups(attn_dim),
+                    PushSpec::Static(qx_push(attn_dim)),
+                )?);
+            }
+            plan.push(mv(w_o, &st.b_proj, attn_dim, c.n_embd)?);
+            }
             plan.push(mk(
                 PipeId::Add,
                 &[
@@ -1712,12 +2184,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 qx_groups(c.n_ff),
                 PushSpec::Static(qx_push(c.n_ff)),
             )?);
-            plan.push(mv(&lq.ffn_down, &st.b_proj, c.n_ff, c.n_embd)?);
+            plan.push(mv(&lq.ffn_down, &st.b_ffn, c.n_ff, c.n_embd)?);
             plan.push(mk(
                 PipeId::Add,
                 &[
                     (st.b_x.buffer, 0, nb(c.n_embd)),
-                    (st.b_proj.buffer, 0, nb(c.n_embd)),
+                    (st.b_ffn.buffer, 0, nb(c.n_embd)),
                 ],
                 Self::groups_for(c.n_embd),
                 PushSpec::Static(n_push(c.n_embd)),
@@ -1890,6 +2362,72 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
+    /// Rótulos das ops do plano, na ordem de execução — para conferir a montagem.
+    pub fn dbg_plano(&self) -> Vec<&'static str> {
+        self.state
+            .as_ref()
+            .map(|st| {
+                st.plan
+                    .iter()
+                    .map(|op| match op {
+                        PlannedOp::Dispatch { pipe, .. } => pipe.label(),
+                        PlannedOp::Embed => "embed",
+                        PlannedOp::KvAppend { .. } => "kv_append",
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Lê a stream residual (`b_x`) — o estado oculto depois das camadas executadas.
+    ///
+    /// Com `LLAMA_RS_STOP_LAYER=N` isso dá o hidden state após N camadas, que é o que se
+    /// compara com o `l_out-N` do `llama-eval-callback` do llama.cpp.
+    pub fn dbg_hidden(&self) -> Option<Vec<f32>> {
+        let st = self.state.as_ref()?;
+        self.readback(&st.b_x, st.cfg.n_embd).ok()
+    }
+
+    /// Lê um dos buffers intermediários do caminho de atenção linear, por nome.
+    ///
+    /// Existe para bissecar contra o dump do `llama-eval-callback`: `qkv`, `conv`, `qn`,
+    /// `kn`, `gb`, `out` e `normed` correspondem, na ordem, aos tensores
+    /// `linear_attn_qkv_mixed`, `conv_output_silu`, `q_conv_predelta`, `k_conv_predelta`,
+    /// `gate`/`beta_sigmoid`, `attn_output` e `final_output` da referência.
+    pub fn dbg_dn_buf(&self, nome: &str) -> Option<Vec<f32>> {
+        let st = self.state.as_ref()?;
+        let b = st.dn.as_ref()?;
+        let buf = match nome {
+            "qkv" => &b.qkv,
+            "conv" => &b.conv,
+            "z" => &b.z,
+            "gb" => &b.gb,
+            "qn" => &b.qn,
+            "kn" => &b.kn,
+            "out" => &b.out,
+            "normed" => &b.normed,
+            // Saída da camada e stream residual, para fechar a bissecção.
+            "proj" => &st.b_proj,
+            "ffn" => &st.b_ffn,
+            "x" => &st.b_x,
+            "xd" => &st.b_xd,
+            _ => return None,
+        };
+        self.readback(buf, (buf.size / 4) as usize).ok()
+    }
+
+    /// Lê o estado recorrente da camada local `l`, se ela for de atenção linear.
+    ///
+    /// Diagnóstico: o sintoma de um estado que não persiste entre tokens é o modelo
+    /// repetir o último token do prompt — sem memória, a camada linear vira função só do
+    /// token atual.
+    pub fn dbg_estado_delta(&self, l: usize) -> Option<Vec<f32>> {
+        let st = self.state.as_ref()?;
+        let dn = st.aux.get(l)?.delta.as_ref()?;
+        let n = (dn.estado.size / 4) as usize;
+        self.readback(&dn.estado, n).ok()
+    }
+
     /// Faixa de camadas e papel deste backend.
     pub fn shard(&self) -> Shard {
         self.state
@@ -1901,6 +2439,57 @@ impl<'ctx> ResidentForward<'ctx> {
     pub fn reset_len(&self) {
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = 0;
+            // Nas camadas de atenção linear não há comprimento de KV-cache para zerar: o
+            // histórico está no estado recorrente e na janela da convolução, que precisam
+            // voltar a zero — é o que representa "contexto vazio" nesta arquitetura.
+            let d = &self.dev.device;
+            let zerar: Vec<vk::Buffer> = st
+                .aux
+                .iter()
+                .filter_map(|la| la.delta.as_ref())
+                .flat_map(|dn| [dn.estado.buffer, dn.janela.buffer])
+                .collect();
+            if zerar.is_empty() {
+                return;
+            }
+            let tamanhos: Vec<vk::DeviceSize> = st
+                .aux
+                .iter()
+                .filter_map(|la| la.delta.as_ref())
+                .flat_map(|dn| [dn.estado.size, dn.janela.size])
+                .collect();
+            // SAFETY: GPU ociosa entre sequências; buffers criados por nós.
+            unsafe {
+                let _ = d.device_wait_idle();
+                let cb_info = vk::CommandBufferAllocateInfo {
+                    command_pool: self.dev.cmd_pool,
+                    level: vk::CommandBufferLevel::PRIMARY,
+                    command_buffer_count: 1,
+                    ..Default::default()
+                };
+                let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
+                    return;
+                };
+                let cmd = cbs[0];
+                let begin = vk::CommandBufferBeginInfo {
+                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                    ..Default::default()
+                };
+                if d.begin_command_buffer(cmd, &begin).is_ok() {
+                    for (buf, size) in zerar.iter().zip(&tamanhos) {
+                        d.cmd_fill_buffer(cmd, *buf, 0, *size, 0);
+                    }
+                    let _ = d.end_command_buffer(cmd);
+                    let submit = vk::SubmitInfo {
+                        command_buffer_count: 1,
+                        p_command_buffers: &cmd,
+                        ..Default::default()
+                    };
+                    let _ = d.queue_submit(self.dev.queue, &[submit], vk::Fence::null());
+                    let _ = d.queue_wait_idle(self.dev.queue);
+                }
+                d.free_command_buffers(self.dev.cmd_pool, &cbs);
+            }
         }
     }
 
@@ -2115,6 +2704,7 @@ impl Drop for ResidentForward<'_> {
                 &st.b_gate,
                 &st.b_up,
                 &st.b_logits,
+                &st.b_ffn,
                 &st.b_xq,
                 &st.b_xd,
                 &st.logits_host,

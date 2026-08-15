@@ -69,6 +69,10 @@ pub struct LlamaConfig {
     /// llama.cpp para speculative decoding e **ignorados** aqui: não participam do
     /// forward normal.
     pub n_layer_nextn: usize,
+    /// Se o prompt leva BOS. Vem de `tokenizer.ggml.add_bos_token`; quando a chave não
+    /// existe o padrão segue o tipo de vocabulário — SPM adiciona, BPE não. Forçar BOS
+    /// num modelo treinado sem ele degrada a geração.
+    pub add_bos: bool,
 }
 
 impl LlamaConfig {
@@ -140,6 +144,13 @@ impl LlamaConfig {
         } else {
             None
         };
+        let add_bos = match f.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(MetadataValue::Bool(b)) => *b,
+            _ => !matches!(
+                f.metadata.get("tokenizer.ggml.model"),
+                Some(MetadataValue::String(m)) if m == "gpt2"
+            ),
+        };
         let n_layer_nextn = match f.metadata.get(&p("nextn_predict_layers")) {
             Some(v) => usize::try_from(v.as_u32("nextn_predict_layers")?)
                 .map_err(|_| ModelError::Overflow)?,
@@ -171,6 +182,7 @@ impl LlamaConfig {
             eos_id: f.get("tokenizer.ggml.eos_token_id")?.as_u32("eos")?,
             delta_net,
             n_layer_nextn,
+            add_bos,
         })
     }
 }

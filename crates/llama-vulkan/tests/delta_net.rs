@@ -244,6 +244,7 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
         n_heads: u32,
         modo: u32,
         eps: f32,
+        stride: u32,
     }
 
     // Modo 0: L2 por cabeça.
@@ -256,6 +257,7 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
                 n_heads: n_heads as u32,
                 modo: 0,
                 eps,
+                stride: dim as u32,
             }),
             n_heads as u32,
         )
@@ -274,6 +276,7 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
                 n_heads: n_heads as u32,
                 modo: 1,
                 eps,
+                stride: dim as u32,
             }),
             n_heads as u32,
         )
