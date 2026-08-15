@@ -1,0 +1,50 @@
+#version 450
+
+// Convolucao causal de largura `d_conv` sobre um token, com estado — a etapa que vem
+// antes do delta net nas camadas lineares do qwen35.
+//
+// `state` guarda os `d_conv - 1` valores anteriores de cada canal em layout
+// `[canal][passo]`, e e deslizado aqui mesmo: o valor novo entra no fim, o mais antigo
+// sai. Uma thread por canal; os canais nao se falam.
+//
+// A saida ja sai com SiLU aplicada, que e o que a camada faz em seguida — evita um
+// dispatch inteiro de 10240 elementos so para isso.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer StateBuf { float s[]; } state_buf;      // inout [canais][d_conv-1]
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; } x_buf;     // [canais]
+layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; } w_buf;     // [canais][d_conv]
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float o[]; } out_buf; // [canais]
+
+layout(push_constant) uniform PC {
+    uint canais;
+    uint d_conv;
+    uint pad;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.canais) { return; }
+
+    uint passos = pc.d_conv - 1u;
+    uint base_s = c * passos;
+    uint base_w = c * pc.d_conv;
+
+    float acc = 0.0;
+    for (uint t = 0u; t < passos; t++) {
+        acc += state_buf.s[base_s + t] * w_buf.w[base_w + t];
+    }
+    float atual = x_buf.x[c];
+    acc += atual * w_buf.w[base_w + passos];
+
+    // Desliza a janela e guarda o token atual no fim.
+    for (uint t = 0u; t + 1u < passos; t++) {
+        state_buf.s[base_s + t] = state_buf.s[base_s + t + 1u];
+    }
+    if (passos > 0u) {
+        state_buf.s[base_s + passos - 1u] = atual;
+    }
+
+    out_buf.o[c] = acc / (1.0 + exp(-acc)) ; // SiLU
+}

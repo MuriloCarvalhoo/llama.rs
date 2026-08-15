@@ -1,0 +1,56 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Duas normalizacoes por cabeca que o qwen35 usa e o transformer denso nao:
+//
+//   modo 0 (L2):    x / sqrt(sum(x^2) + eps)                  — em q e k, antes do delta net
+//   modo 1 (gated): rmsnorm(x, w) * silu(z)                   — na saida do delta net
+//
+// Sao o mesmo esqueleto (uma reducao por cabeca, depois uma escala) e por isso dividem o
+// shader: um workgroup por cabeca, reducao no subgrupo.
+//
+// A diferenca entre L2 e RMS aqui e so o `1/dim`: a L2 divide pela norma, a RMS pela raiz
+// da media. Trocar uma pela outra em `q`/`k` muda a escala do produto interno do delta
+// rule e o modelo passa a gerar lixo, entao os dois modos existem separados de proposito.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } x_buf;      // [n_heads][dim]
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; } w_buf;      // [dim] (modo 1)
+layout(set = 0, binding = 2) readonly buffer ZBuf { float z[]; } z_buf;      // [n_heads][dim] (modo 1)
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float o[]; } out_buf; // [n_heads][dim]
+
+layout(push_constant) uniform PC {
+    uint dim;
+    uint n_heads;
+    uint modo;     // 0 = L2, 1 = rmsnorm(w) * silu(z)
+    float eps;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (h >= pc.n_heads) { return; }
+
+    uint base = h * pc.dim;
+    float ss = 0.0;
+    for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x_buf.x[base + i];
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+
+    // `ss` sai uniforme no subgrupo, entao cada lane calcula a escala sem barreira.
+    float escala = pc.modo == 0u
+        ? inversesqrt(ss + pc.eps)
+        : inversesqrt(ss / float(pc.dim) + pc.eps);
+
+    for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x_buf.x[base + i] * escala;
+        if (pc.modo == 1u) {
+            float z = z_buf.z[base + i];
+            v *= w_buf.w[i] * (z / (1.0 + exp(-z)));  // peso da norma e SiLU do gate
+        }
+        out_buf.o[base + i] = v;
+    }
+}

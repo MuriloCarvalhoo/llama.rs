@@ -1,0 +1,55 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Os dois escalares por cabeca que controlam a recorrencia do delta net:
+//
+//   g[h]    = ssm_a[h] * softplus(alpha[h] + dt_bias[h])   // log do decaimento (< 0)
+//   beta[h] = sigmoid(beta_proj[h])                        // forca do delta rule
+//
+// `alpha` e `beta_proj` sao projecoes de `x` por matrizes **f32** de n_embd x n_heads
+// (o GGUF nao as quantiza — sao pequenas). Como o resultado tem so `n_heads` elementos,
+// o dispatch inteiro cabe num punhado de waves e o produto interno de cada cabeca e uma
+// reducao de subgrupo sobre n_embd.
+//
+// Saida empacotada em vec2 (g, beta), que e como o `delta_net.comp` os consome: um load
+// de 8 B por cabeca em vez de dois de 4 B.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } x_buf;          // [n_embd]
+layout(set = 0, binding = 1) readonly buffer AlphaBuf { float w[]; } alpha_buf;  // [n_heads][n_embd]
+layout(set = 0, binding = 2) readonly buffer BetaBuf { float w[]; } beta_buf;    // [n_heads][n_embd]
+// (ssm_a, dt_bias) por cabeca.
+layout(set = 0, binding = 3) readonly buffer AdtBuf { vec2 adt[]; } adt_buf;     // [n_heads]
+layout(set = 0, binding = 4) writeonly buffer OutBuf { vec2 gb[]; } out_buf;     // [n_heads]
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint n_heads;
+    uint pad;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (h >= pc.n_heads) { return; }
+
+    uint base = h * pc.n_embd;
+    float pa = 0.0;
+    float pb = 0.0;
+    for (uint i = lane; i < pc.n_embd; i += gl_WorkGroupSize.x) {
+        float xv = x_buf.x[i];
+        pa += alpha_buf.w[base + i] * xv;
+        pb += beta_buf.w[base + i] * xv;
+    }
+    pa = subgroupAdd(pa);
+    pb = subgroupAdd(pb);
+
+    if (lane == 0u) {
+        vec2 adt = adt_buf.adt[h];   // .x = ssm_a (negativo), .y = dt_bias
+        float z = pa + adt.y;
+        // softplus estavel: para z grande, ln(1+e^z) -> z.
+        float sp = z > 20.0 ? z : log(1.0 + exp(z));
+        out_buf.gb[h] = vec2(adt.x * sp, 1.0 / (1.0 + exp(-pb)));
+    }
+}

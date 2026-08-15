@@ -291,6 +291,15 @@ pub(crate) struct Prof {
 }
 
 /// Uma operação de GPU posicionada no relógio da CPU, para a timeline.
+/// Qual shader de atenção linear rodar em `ResidentForward::dbg_dn`.
+#[derive(Clone, Copy)]
+pub enum DnPipe {
+    DeltaNet,
+    Conv,
+    Gates,
+    Norm,
+}
+
 #[derive(Clone, Debug)]
 pub struct GpuSpan {
     pub name: &'static str,
@@ -313,6 +322,11 @@ pub struct ResidentForward<'ctx> {
     pub(crate) attention: ComputePipeline,
     pub(crate) swiglu: ComputePipeline,
     pub(crate) add: ComputePipeline,
+    // Camadas de atenção linear (qwen35).
+    pub(crate) delta_net: ComputePipeline,
+    pub(crate) dn_conv: ComputePipeline,
+    pub(crate) dn_gates: ComputePipeline,
+    pub(crate) dn_norm: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState>,
 }
@@ -517,6 +531,12 @@ impl<'ctx> ResidentForward<'ctx> {
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 24, &[])?;
         let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
+        // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
+        // (x, alpha, beta, a|dt, saída) e (x, w, z, saída).
+        let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 12, &[])?;
+        let dn_conv = ComputePipeline::with(d, crate::DN_CONV_SPV, 4, 12, &[])?;
+        let dn_gates = ComputePipeline::with(d, crate::DN_GATES_SPV, 5, 12, &[])?;
+        let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 16, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -547,6 +567,10 @@ impl<'ctx> ResidentForward<'ctx> {
             attention,
             swiglu,
             add,
+            delta_net,
+            dn_conv,
+            dn_gates,
+            dn_norm,
             desc_pool,
             state: None,
         })
@@ -891,6 +915,51 @@ impl<'ctx> ResidentForward<'ctx> {
     /// nº de workgroups para cobrir `n` elementos com local_size_x=64.
     pub(crate) fn groups_for(n: usize) -> u32 {
         ((n + 63) / 64) as u32
+    }
+
+    /// Roda um shader de atenção linear com buffers f32 e devolve o conteúdo final de
+    /// todos eles, na ordem dos bindings.
+    ///
+    /// Serve para validar os shaders do qwen35 contra `llama_model::delta_net`: os
+    /// buffers `inout` (o estado recorrente, a janela da convolução) voltam atualizados,
+    /// e é justamente essa atualização que precisa bater com a referência de CPU.
+    pub fn dbg_dn(
+        &self,
+        qual: DnPipe,
+        bufs: &[Vec<f32>],
+        push: &[u8],
+        groups: u32,
+    ) -> Result<Vec<Vec<f32>>, MatmulError> {
+        let d = &self.dev.device;
+        let pipe = match qual {
+            DnPipe::DeltaNet => &self.delta_net,
+            DnPipe::Conv => &self.dn_conv,
+            DnPipe::Gates => &self.dn_gates,
+            DnPipe::Norm => &self.dn_norm,
+        };
+        let mut gpu = Vec::with_capacity(bufs.len());
+        for b in bufs {
+            let buf = Buf::device(
+                self.ctx,
+                self.phys(),
+                d,
+                (b.len() * 4).max(4) as vk::DeviceSize,
+            )?;
+            self.upload_f32(&buf, b)?;
+            gpu.push(buf);
+        }
+        let set = self.alloc_set(pipe)?;
+        let bindings: Vec<_> = gpu.iter().map(|b| (b.buffer, 0, b.size)).collect();
+        self.dispatch1(pipe, set, &bindings, push, groups)?;
+
+        let mut out = Vec::with_capacity(bufs.len());
+        for (buf, orig) in gpu.iter().zip(bufs) {
+            out.push(self.readback(buf, orig.len())?);
+        }
+        for buf in gpu {
+            buf.destroy(d);
+        }
+        Ok(out)
     }
 
     pub fn dbg_swiglu(&self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, MatmulError> {

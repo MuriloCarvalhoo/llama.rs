@@ -12,6 +12,11 @@ fn main() {
         ("attention.comp", "ATTENTION_SPV"),
         ("swiglu.comp", "SWIGLU_SPV"),
         ("add.comp", "ADD_SPV"),
+        // Camadas de atenção linear (qwen35) — ver docs/qwen35-arquitetura.md.
+        ("delta_net.comp", "DELTA_NET_SPV"),
+        ("dn_conv.comp", "DN_CONV_SPV"),
+        ("dn_gates.comp", "DN_GATES_SPV"),
+        ("dn_norm.comp", "DN_NORM_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
