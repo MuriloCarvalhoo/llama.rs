@@ -1,0 +1,66 @@
+#version 450
+
+// Passo 2 de 2 da norma fundida: fecha a redução, escala e quantiza a ativação.
+//
+//   escala = rsqrt(sum(parciais) / dim + eps)
+//   out    = x * escala * w
+//   xq, xd = quantiza(out) em int8 por bloco de 32
+//
+// Ver `norm_fused.comp` para por que a redução é dividida em dois dispatches.
+//
+// Um bloco de 32 por lane: é o mesmo sub-bloco de 32 que os K-quants usam, então as escalas
+// da ativação casam com as dos pesos sem nenhuma conversão — o que permite ao matvec usar
+// `dotPacked4x8` direto.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } xb;
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; } wb;
+layout(set = 0, binding = 2) readonly buffer PBuf { float p[]; } pb;
+layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; } ob;
+layout(set = 0, binding = 4) writeonly buffer XqBuf { int xq[]; } xqb;
+layout(set = 0, binding = 5) writeonly buffer XdBuf { float xd[]; } xdb;
+
+layout(push_constant) uniform PC {
+    uint dim;
+    float eps;
+    uint n_parciais;   // workgroups que o passo 1 usou
+} pc;
+
+void main() {
+    // Cada lane refaz a soma das parciais em vez de reduzi-las: são poucas (≤ 32 no n_embd
+    // dos modelos que rodamos) e assim `escala` sai uniforme sem LDS nem barreira.
+    float total = 0.0;
+    for (uint k = 0u; k < pc.n_parciais; k++) {
+        total += pb.p[k];
+    }
+    float escala = inversesqrt(total / float(pc.dim) + pc.eps);
+
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.dim / 32u) { return; }
+    uint base = b * 32u;
+
+    float amax = 0.0;
+    for (uint k = 0u; k < 32u; k++) {
+        float v = xb.x[base + k] * escala * wb.w[base + k];
+        ob.o[base + k] = v;
+        amax = max(amax, abs(v));
+    }
+
+    float d_x = amax / 127.0;
+    float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+    xdb.xd[b] = d_x;
+
+    // Recalcula o normalizado em vez de guardar os 32 valores: `x` e `w` acabaram de ser
+    // lidos pela própria lane, então saem do L1, e 32 floats vivos custariam 32 VGPRs.
+    for (uint g = 0u; g < 8u; g++) {
+        int packed = 0;
+        for (uint j = 0u; j < 4u; j++) {
+            uint i = base + g * 4u + j;
+            int q = int(round(xb.x[i] * escala * wb.w[i] * inv));
+            q = clamp(q, -127, 127);
+            packed |= (q & 0xff) << (8u * j);
+        }
+        xqb.xq[b * 8u + g] = packed;
+    }
+}

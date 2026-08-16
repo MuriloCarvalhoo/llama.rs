@@ -1,6 +1,7 @@
 //! Backend de decode 100% na GPU: todas as ativações e o KV-cache residentes em VRAM.
-//! Só os logits finais voltam ao host. Cada op é 1 dispatch + 1 wait nesta fatia (1C);
-//! a fusão em 1 command buffer/token é a Fase 1D.
+//! Só os logits finais voltam ao host. O token inteiro é um command buffer, e dentro dele
+//! as ops só são separadas por barreira quando há dependência de verdade — ver
+//! `marcar_barreiras`.
 
 use crate::device::{VulkanContext, VulkanDevice, VulkanPhysicalDevice};
 use crate::matmul::MatmulError;
@@ -14,6 +15,31 @@ use std::cell::RefCell;
 pub(crate) const MATVEC_NUM_ROWS: u32 = 2;
 /// local_size_x do matvec (wave64 no MI50).
 pub(crate) const MATVEC_WG: u32 = 64;
+
+/// Teto de workgroups do passo 1 da norma. Cada um produz uma soma parcial, e o passo 2
+/// soma todas em cada lane — então subir muito custa mais no passo 2 do que rende no 1.
+pub(crate) const NORM_P1_WG: u32 = 32;
+
+/// Geometria dos matvec K-quant: (lanes por workgroup, linhas de saída por wave).
+///
+/// Vira specialization constant nos shaders, então o compilador desenrola os laços sobre as
+/// linhas e o par escolhido muda a pressão de registrador — que na MI50 decide a ocupância:
+/// são 256 VGPRs por SIMD, e o Q5_K com 40 VGPRs cabe 6 waves em vez de 10. Menos linhas por
+/// wave = menos acumuladores vivos = mais waves, ao custo de reler a ativação.
+///
+/// `LLAMA_RS_MATVEC_GEOM=wg,linhas` sobrescreve, para a varredura de `scripts/tune-matvec.sh`.
+pub(crate) fn matvec_geom() -> (u32, u32) {
+    std::env::var("LLAMA_RS_MATVEC_GEOM")
+        .ok()
+        .and_then(|v| {
+            let (wg, rows) = v.split_once(',')?;
+            Some((wg.trim().parse().ok()?, rows.trim().parse().ok()?))
+        })
+        .filter(|&(wg, rows): &(u32, u32)| {
+            wg % 64 == 0 && (64..=1024).contains(&wg) && (1..=4).contains(&rows)
+        })
+        .unwrap_or((256, 2))
+}
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
@@ -244,7 +270,10 @@ pub(crate) enum PipeId {
     MatvecQ5K,
     MatvecQ6K,
     QuantizeX,
-    Rmsnorm,
+    /// Residual + parciais da RMSNorm — ver `norm_fused.comp`.
+    NormFused,
+    /// Escala + quantização, fechando a redução do `NormFused`.
+    NormP2,
     Rope,
     Attention,
     Swiglu,
@@ -263,7 +292,8 @@ impl PipeId {
             PipeId::MatvecQ5K => "matvec_q5k",
             PipeId::MatvecQ6K => "matvec_q6k",
             PipeId::QuantizeX => "quantize_x",
-            PipeId::Rmsnorm => "rmsnorm",
+            PipeId::NormFused => "norm_fused",
+            PipeId::NormP2 => "norm_p2",
             PipeId::Rope => "rope",
             PipeId::Attention => "attention",
             PipeId::Swiglu => "swiglu",
@@ -286,11 +316,14 @@ impl PipeId {
     fn acessos(self) -> (&'static [usize], &'static [usize]) {
         match self {
             // weight, xq, xd → out
-            PipeId::Matvec | PipeId::MatvecQ5K | PipeId::MatvecQ6K | PipeId::Attention => {
-                (&[0, 1, 2], &[3])
-            }
+            // weight, xq, xd, bias → out
+            PipeId::Matvec | PipeId::MatvecQ5K | PipeId::MatvecQ6K => (&[0, 1, 2, 4], &[3]),
+            PipeId::Attention => (&[0, 1, 2], &[3]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
-            PipeId::Rmsnorm | PipeId::Swiglu => (&[0, 1], &[2]),
+            PipeId::Swiglu => (&[0, 1], &[2]),
+            // x é inout (recebe o residual); sai a soma parcial por workgroup.
+            PipeId::NormFused => (&[0, 1], &[0, 2]),
+            PipeId::NormP2 => (&[0, 1, 2], &[3, 4, 5]),
             // x é inout: o RoPE gira em cima do próprio buffer, o Add acumula nele.
             PipeId::Rope | PipeId::Add | PipeId::GateMul => (&[0, 1], &[0]),
             // o estado recorrente (binding 0) é lido e reescrito no mesmo dispatch.
@@ -356,6 +389,8 @@ pub(crate) struct ResidentState {
     pub vcache: Buf,
     pub b_x: Buf,
     pub b_normed: Buf,
+    /// Somas parciais dos quadrados, uma por workgroup do `NormFused` (ver `norm_fused.comp`).
+    pub b_parciais: Buf,
     pub b_q: Buf,
     pub b_k: Buf,
     pub b_v: Buf,
@@ -439,6 +474,8 @@ pub struct ResidentForward<'ctx> {
     pub(crate) matvec_q5k: ComputePipeline,
     pub(crate) matvec_q6k: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
+    pub(crate) norm_fused: ComputePipeline,
+    pub(crate) norm_p2: ComputePipeline,
     pub(crate) rope: ComputePipeline,
     pub(crate) attention: ComputePipeline,
     pub(crate) swiglu: ComputePipeline,
@@ -646,9 +683,15 @@ impl<'ctx> ResidentForward<'ctx> {
         let quantize_x = ComputePipeline::with(d, crate::QUANTIZE_X_SPV, 3, 12, &[])?;
         // Matvecs K-quant: os mesmos 4 bindings do Q8_0 (pesos, xq, xd, saída) e o mesmo push.
         let push_mv = std::mem::size_of::<crate::pipeline::PushConstants>() as u32;
-        let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 4, push_mv, &[])?;
-        let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 4, push_mv, &[])?;
+        let (mv_wg, mv_rows) = matvec_geom();
+        let geom = [(0, mv_wg), (1, mv_rows)];
+        let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 5, push_mv, &geom)?;
+        let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
+        // dim:u32 + tem_residual:u32
+        let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
+        // dim:u32 + eps:f32 + n_parciais:u32
+        let norm_p2 = ComputePipeline::with(d, crate::NORM_P2_SPV, 6, 12, &[])?;
         let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 20, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
         let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
@@ -686,6 +729,8 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q5k,
             matvec_q6k,
             rmsnorm,
+            norm_fused,
+            norm_p2,
             rope,
             attention,
             swiglu,
@@ -961,6 +1006,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 vcache,
                 b_x: nf(config.n_embd)?,
                 b_normed: nf(config.n_embd)?,
+                // NORM_P1_WG é o teto de workgroups do passo 1, então basta esse tanto de floats.
+                b_parciais: nf(NORM_P1_WG as usize)?,
                 // No qwen35 a projeção de Q sai com query **e** gate por cabeça, e o
                 // conjunto de cabeças não tem exatamente n_embd (24 × 256 = 6144 contra
                 // 5120), então os buffers da atenção seguem head_dim × n_head.
@@ -1848,7 +1895,8 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::DnNorm => &self.dn_norm,
             PipeId::GateMul => &self.gate_mul,
             PipeId::QuantizeX => &self.quantize_x,
-            PipeId::Rmsnorm => &self.rmsnorm,
+            PipeId::NormFused => &self.norm_fused,
+            PipeId::NormP2 => &self.norm_p2,
             PipeId::Rope => &self.rope,
             PipeId::Attention => &self.attention,
             PipeId::Swiglu => &self.swiglu,
@@ -1868,18 +1916,6 @@ impl<'ctx> ResidentForward<'ctx> {
         let d = &self.dev.device;
         let mut plan = Vec::new();
 
-        let rms_push = || -> Vec<u8> {
-            #[repr(C)]
-            struct P {
-                dim: u32,
-                eps: f32,
-            }
-            let p = P {
-                dim: c.n_embd as u32,
-                eps: c.rms_eps,
-            };
-            unsafe { std::slice::from_raw_parts(&p as *const P as *const u8, 8) }.to_vec()
-        };
         let n_push = |n: usize| -> Vec<u8> {
             #[repr(C)]
             struct P {
@@ -1903,12 +1939,35 @@ impl<'ctx> ResidentForward<'ctx> {
             .to_vec()
         };
         let mv_groups = |n_out: usize| -> u32 { (n_out as u32).div_ceil(MATVEC_NUM_ROWS) };
+        // Linhas que um workgroup do Q5_K cobre — tem de casar com as spec constants da
+        // pipeline, senão sobram ou faltam workgroups.
+        let rows_q5k = {
+            let (wg, rows) = matvec_geom();
+            (wg / 64 * rows) as usize
+        };
         // Push do quantize: n_in + 2 pads (o range declarado no pipeline e de 12 bytes).
         let qx_push = |n_in: usize| -> Vec<u8> {
             let p: [u32; 3] = [n_in as u32, 0, 0];
             unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), 12) }.to_vec()
         };
         let qx_groups = |n_in: usize| -> u32 { ((n_in / 32) as u32).div_ceil(64) };
+        // Workgroups do passo 1 da norma: um por 256 elementos, até o teto.
+        let np1_wg = ((c.n_embd as u32).div_ceil(256)).clamp(1, NORM_P1_WG);
+        // Push do passo 1: dim, tem_residual.
+        let np1_push = |tem_residual: bool| -> Vec<u8> {
+            let mut v = Vec::with_capacity(8);
+            v.extend_from_slice(&u32::try_from(c.n_embd).unwrap_or(0).to_le_bytes());
+            v.extend_from_slice(&u32::from(tem_residual).to_le_bytes());
+            v
+        };
+        // Push do passo 2: dim, eps, n_parciais.
+        let np2_push = || -> Vec<u8> {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&u32::try_from(c.n_embd).unwrap_or(0).to_le_bytes());
+            v.extend_from_slice(&c.rms_eps.to_le_bytes());
+            v.extend_from_slice(&np1_wg.to_le_bytes());
+            v
+        };
 
         let mk = |pipe: PipeId,
                   binds: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
@@ -1974,10 +2033,11 @@ impl<'ctx> ResidentForward<'ctx> {
                         PushSpec::Static(mv_push(n_in, n_out)),
                     ),
                     ty => {
-                        // Os dois shaders K-quant fazem 4 waves x 2 linhas por wave: a
-                        // ativação é lida uma vez para as duas linhas.
+                        // A ativação é lida uma vez para todas as linhas do wave; quantas
+                        // linhas cada workgroup cobre sai de `matvec_geom` (Q5_K) ou da
+                        // geometria fixa do shader Q6_K.
                         let (pipe, rows_por_wg) = if ty == gguf::GgmlType::Q5_K {
-                            (PipeId::MatvecQ5K, 8)
+                            (PipeId::MatvecQ5K, rows_q5k)
                         } else {
                             (PipeId::MatvecQ6K, 8)
                         };
@@ -1999,11 +2059,10 @@ impl<'ctx> ResidentForward<'ctx> {
                       n_out: usize|
          -> Result<PlannedOp, MatmulError> {
             let (xq, xd) = ativ;
-            let rows_por_wg = 8;
-            let pipe = if w.ty == gguf::GgmlType::Q5_K {
-                PipeId::MatvecQ5K
+            let (pipe, rows_por_wg) = if w.ty == gguf::GgmlType::Q5_K {
+                (PipeId::MatvecQ5K, rows_q5k)
             } else {
-                PipeId::MatvecQ6K
+                (PipeId::MatvecQ6K, 8)
             };
             mk(
                 pipe,
@@ -2018,6 +2077,36 @@ impl<'ctx> ResidentForward<'ctx> {
             )
         };
 
+        // As duas ops da norma, em sequência: `r` é o residual a somar (ignorado quando
+        // `tem_residual` é falso) e `w` o peso da norma.
+        let norma = |r: &Buf, w: &Buf, tem_residual: bool| -> Result<[PlannedOp; 2], MatmulError> {
+            Ok([
+                mk(
+                    PipeId::NormFused,
+                    &[
+                        (st.b_x.buffer, 0, nb(c.n_embd)),
+                        (r.buffer, 0, nb(c.n_embd)),
+                        (st.b_parciais.buffer, 0, st.b_parciais.size),
+                    ],
+                    np1_wg,
+                    PushSpec::Static(np1_push(tem_residual)),
+                )?,
+                mk(
+                    PipeId::NormP2,
+                    &[
+                        (st.b_x.buffer, 0, nb(c.n_embd)),
+                        (w.buffer, 0, w.size),
+                        (st.b_parciais.buffer, 0, st.b_parciais.size),
+                        (st.b_normed.buffer, 0, nb(c.n_embd)),
+                        (st.b_xq.buffer, 0, st.b_xq.size),
+                        (st.b_xd.buffer, 0, st.b_xd.size),
+                    ],
+                    qx_groups(c.n_embd),
+                    PushSpec::Static(np2_push()),
+                )?,
+            ])
+        };
+
         // Presente em todos os shards: no primeiro copia a linha do token da tabela de
         // embedding; nos demais copia a stream residual vinda da GPU anterior. Nos dois
         // casos o host escreve em `embd_stage` e a cópia entra no command buffer do token.
@@ -2029,6 +2118,9 @@ impl<'ctx> ResidentForward<'ctx> {
         let parar_em: Option<usize> = std::env::var("LLAMA_RS_STOP_LAYER")
             .ok()
             .and_then(|v| v.parse().ok());
+        // Com `LLAMA_RS_STOP_LAYER=0` nenhuma camada roda, e aí não há residual do FFN a
+        // somar: `b_ffn` guarda o que sobrou do token anterior.
+        let rodou_camada = c.n_layer > 0 && parar_em != Some(0);
         for l in 0..c.n_layer {
             if parar_em.is_some_and(|n| l >= n) {
                 break;
@@ -2036,26 +2128,11 @@ impl<'ctx> ResidentForward<'ctx> {
             let lq = &st.qw[l];
             let la = &st.aux[l];
 
-            plan.push(mk(
-                PipeId::Rmsnorm,
-                &[
-                    (st.b_x.buffer, 0, nb(c.n_embd)),
-                    (la.attn_norm.buffer, 0, la.attn_norm.size),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                ],
-                1,
-                PushSpec::Static(rms_push()),
-            )?);
-            plan.push(mk(
-                PipeId::QuantizeX,
-                &[
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                ],
-                qx_groups(c.n_embd),
-                PushSpec::Static(qx_push(c.n_embd)),
-            )?);
+            // Norma de entrada da camada. Ela **absorve o residual do FFN da camada
+            // anterior** (`b_ffn`), que antes era um `Add` próprio no fim do laço: com
+            // `l == 0` não há o que somar, porque `b_x` acabou de vir do embedding (ou da
+            // GPU anterior, nos shards seguintes).
+            plan.extend(norma(&st.b_ffn, &la.attn_norm, l > 0)?);
             // Camada de atenção linear (qwen35): caminho próprio, que troca o KV-cache
             // por estado recorrente. Os dois caminhos deixam o resultado em `b_proj`, e o
             // fecho da camada (residual + norma + FFN) é comum.
@@ -2244,35 +2321,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
                 plan.push(mv(w_o, &st.b_proj, attn_dim, c.n_embd)?);
             }
-            plan.push(mk(
-                PipeId::Add,
-                &[
-                    (st.b_x.buffer, 0, nb(c.n_embd)),
-                    (st.b_proj.buffer, 0, nb(c.n_embd)),
-                ],
-                Self::groups_for(c.n_embd),
-                PushSpec::Static(n_push(c.n_embd)),
-            )?);
-            plan.push(mk(
-                PipeId::Rmsnorm,
-                &[
-                    (st.b_x.buffer, 0, nb(c.n_embd)),
-                    (la.ffn_norm.buffer, 0, la.ffn_norm.size),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                ],
-                1,
-                PushSpec::Static(rms_push()),
-            )?);
-            plan.push(mk(
-                PipeId::QuantizeX,
-                &[
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                ],
-                qx_groups(c.n_embd),
-                PushSpec::Static(qx_push(c.n_embd)),
-            )?);
+            // Norma do FFN, absorvendo o residual do mixer (`b_proj`).
+            plan.extend(norma(&st.b_proj, &la.ffn_norm, true)?);
             plan.push(mv(&lq.ffn_gate, &st.b_gate, c.n_embd, c.n_ff)?);
             plan.push(mv(&lq.ffn_up, &st.b_up, c.n_embd, c.n_ff)?);
             plan.push(mk(
@@ -2296,6 +2346,17 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(qx_push(c.n_ff)),
             )?);
             plan.push(mv(&lq.ffn_down, &st.b_ffn, c.n_ff, c.n_embd)?);
+            // Sem `Add` aqui: o residual do FFN é somado pela norma da camada seguinte, ou
+            // pela norma final logo abaixo.
+        }
+
+        if c.shard.is_last() {
+            // Norma final, absorvendo o residual do FFN da última camada.
+            plan.extend(norma(&st.b_ffn, &st.output_norm_buf, rodou_camada)?);
+            plan.push(mv(&st.output_w, &st.b_logits, c.n_embd, c.vocab)?);
+        } else if rodou_camada {
+            // Shard intermediário: a stream residual que segue para a próxima GPU precisa
+            // do último residual, e aqui não há norma para absorvê-lo.
             plan.push(mk(
                 PipeId::Add,
                 &[
@@ -2305,30 +2366,6 @@ impl<'ctx> ResidentForward<'ctx> {
                 Self::groups_for(c.n_embd),
                 PushSpec::Static(n_push(c.n_embd)),
             )?);
-        }
-
-        if c.shard.is_last() {
-            plan.push(mk(
-                PipeId::Rmsnorm,
-                &[
-                    (st.b_x.buffer, 0, nb(c.n_embd)),
-                    (st.output_norm_buf.buffer, 0, st.output_norm_buf.size),
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                ],
-                1,
-                PushSpec::Static(rms_push()),
-            )?);
-            plan.push(mk(
-                PipeId::QuantizeX,
-                &[
-                    (st.b_normed.buffer, 0, nb(c.n_embd)),
-                    (st.b_xq.buffer, 0, st.b_xq.size),
-                    (st.b_xd.buffer, 0, st.b_xd.size),
-                ],
-                qx_groups(c.n_embd),
-                PushSpec::Static(qx_push(c.n_embd)),
-            )?);
-            plan.push(mv(&st.output_w, &st.b_logits, c.n_embd, c.vocab)?);
         }
 
         Ok(plan)
@@ -2830,6 +2867,8 @@ impl Drop for ResidentForward<'_> {
         for p in [
             &self.matvec,
             &self.rmsnorm,
+            &self.norm_fused,
+            &self.norm_p2,
             &self.rope,
             &self.attention,
             &self.swiglu,

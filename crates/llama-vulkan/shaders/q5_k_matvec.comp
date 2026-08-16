@@ -50,16 +50,41 @@
 // em vez de 4 — ainda +3%. Trocar ~8 instrucoes VALU por bytes lidos e mau negocio aqui:
 // depois do dot empacotado o kernel e limitado por memoria, nao por ALU.
 
-// 4 waves por workgroup, uma linha de saida cada. O trabalho por wave e o mesmo de um
-// workgroup de 64, mas o numero de workgroups cai 4x: com 1 wave por workgroup a GPU
-// esbarra no limite de workgroups residentes por CU antes de encher os slots de wave, e
-// a latencia dos loads deixa de ser escondida.
-layout(local_size_x = 256) in;
-const uint WAVES_PER_WG = 4u;
-// Duas linhas de saida por wave: os loads da ativacao (2 ivec4 de xq + a escala) sao os
-// mesmos para as duas, entao os requests por linha caem de 8 para 6.5.
-const uint ROWS_PER_WAVE = 2u;
-const uint ROWS_PER_WG = WAVES_PER_WG * ROWS_PER_WAVE;
+// Geometria do dispatch, por specialization constant — os dois valores mudam a pressao de
+// registrador e com ela a ocupancia, e o melhor par depende do modelo. Ver `MATVEC_GEOM`
+// no Rust, e `scripts/tune-matvec.sh` para a varredura.
+//
+//   WG_SIZE        lanes por workgroup (multiplo de 64; 256 = 4 waves)
+//   ROWS_PER_WAVE  linhas de saida que cada wave acumula
+//
+// Varredura medida no Qwen2.5-32B (2x MI50, `scripts/tune-matvec.sh`), tok/s de ponta a
+// ponta e ocupancia relatada pelo RADV:
+//
+//   geom     VGPRs  waves/SIMD  tok/s
+//   64,1        36      7       18.26
+//   128,1       36      7       18.21
+//   256,1       36      7       17.83
+//   64,2        40      6       19.30
+//   128,2       40      6       19.26
+//   256,2       40      6       19.32   <- default
+//   512,2       40      6       19.32
+//   256,3       40      6       19.25
+//   256,4       40      6       19.07
+//   1024,1      64      4       16.93
+//
+// **Mais ocupancia e pior aqui.** Com 1 linha por wave o kernel cai para 36 VGPRs e a GPU
+// passa a caber 7 waves por SIMD em vez de 6 — e mede 6% MAIS LENTO. O que decide nao e ter
+// mais waves em voo, e reler a ativacao menos vezes: com 2 linhas os loads de xq/xd valem
+// para as duas e os requests por linha caem de 8 para 6.5. A partir de 3 linhas o ganho
+// para (os acumuladores ja nao cabem sem custo) e a curva volta a descer.
+//
+// O tamanho do workgroup quase nao importa entre 64 e 512, desde que ROWS_PER_WAVE=2; so
+// 1024 destoa, porque 64 VGPRs derrubam a ocupancia para 4.
+layout(local_size_x_id = 0) in;
+layout(constant_id = 0) const uint WG_SIZE = 256u;
+layout(constant_id = 1) const uint ROWS_PER_WAVE = 2u;
+const uint WAVES_PER_WG = WG_SIZE / 64u;
+const uint MAX_ROWS = 4u;   // teto do array de acumuladores
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada) = 2 ivec4.
@@ -67,11 +92,18 @@ layout(set = 0, binding = 1) readonly buffer XqBuf { ivec4 xq4[]; } xq_buf;
 // Escala (d_x) por bloco de 32 da ativacao.
 layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
 layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
+// O bias da projecao entra aqui em vez de num dispatch `add` proprio: eram 3 adds por
+// camada (q, k, v) movendo 20 KB cada em ~4.8 us, ou seja latencia de lancamento pura.
+// Somar no fim do matvec custa uma leitura de 4 bytes por linha de saida. E o que o
+// llama.cpp faz ao fundir mul_mat com o bias.
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float b[]; } bias_buf;
+
 
 layout(push_constant) uniform PC {
     uint n_in;
     uint n_out;
     uint row_offset; // vestigial (saida indexada por row absoluta)
+    uint tem_bias;   // 0 quando o binding 4 nao tem bias de verdade ligado
 } pc;
 
 const uint UVEC4_PER_SB = 11u;   // 176 bytes
@@ -136,7 +168,6 @@ void main() {
     uint row = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE;
     // `row` nao depende de `lane`, entao o return e uniforme no subgroup.
     if (row >= pc.n_out) { return; }
-    bool tem_par = (row + 1u) < pc.n_out;
 
     uint n_sb = pc.n_in / 256u;                    // superblocos por linha
     uint linha4 = n_sb * UVEC4_PER_SB;             // uvec4 por linha
@@ -150,8 +181,12 @@ void main() {
     uint qs_v0 = 3u + (j >> 1u) * 2u;   // qs[] comeca no uvec4 3
     bool hi_nibble = (j & 1u) != 0u;
 
-    float acc = 0.0;
-    float acc_b = 0.0;
+    // `ROWS_PER_WAVE` e constante de compilacao, entao os dois lacos sobre `r` sao
+    // desenrolados e `acc[]` fica em registrador — indexacao dinamica aqui iria para
+    // scratch e custaria mais do que todo o resto do kernel.
+    float acc[MAX_ROWS];
+    for (uint r = 0u; r < MAX_ROWS; r++) { acc[r] = 0.0; }
+
     for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
         uint sb = sb0 + sb_in_grp;
         if (sb >= n_sb) { continue; }
@@ -174,16 +209,18 @@ void main() {
         isx = dotPacked4x8AccSatEXT(0x01010101, xb.z, isx);
         isx = dotPacked4x8AccSatEXT(0x01010101, xb.w, isx);
 
-        acc += linha(base4, j, qs_v0, hi_nibble, xa, xb, isx, xd);
-        if (tem_par) {
-            acc_b += linha(base4 + linha4, j, qs_v0, hi_nibble, xa, xb, isx, xd);
+        for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+            // Uniforme no subgroup (`row` nao depende de lane): sem divergencia.
+            if (row + r < pc.n_out) {
+                acc[r] += linha(base4 + r * linha4, j, qs_v0, hi_nibble, xa, xb, isx, xd);
+            }
         }
     }
 
-    acc = subgroupAdd(acc);
-    acc_b = subgroupAdd(acc_b);
-    if (lane == 0u) {
-        out_buf.y[row] = acc;
-        if (tem_par) { out_buf.y[row + 1u] = acc_b; }
+    for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
+        float s = subgroupAdd(acc[r]);
+        if (lane == 0u && row + r < pc.n_out) {
+            out_buf.y[row + r] = pc.tem_bias != 0u ? s + bias_buf.b[row + r] : s;
+        }
     }
 }

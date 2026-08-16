@@ -1,0 +1,68 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Passo 1 de 2 da norma fundida: aplica o residual e acumula as somas parciais dos
+// quadrados, uma por workgroup.
+//
+//   x += r                       (residual do mixer ou do FFN; opcional)
+//   parciais[wg] = sum(x^2) do pedaço que este workgroup cobre
+//
+// Por que dois passos e não um: a RMSNorm precisa da soma sobre o vetor **inteiro** antes
+// de poder escalar qualquer elemento, e uma redução global só cabe num workgroup — ou
+// seja, 1 CU dos 60. Foi assim que o `rmsnorm.comp` sempre funcionou, e custava 11 us para
+// mover 40 KB: 3,7 GB/s numa GPU de 717 GB/s.
+//
+// Já medimos a versão de um passo só, com `add` e quantização dentro do mesmo workgroup da
+// redução: 34,6 us por chamada com 256 lanes, 20,5 us com 1024. Mesmo a melhor delas ficou
+// atrás das três ops separadas (21 us), porque o `add` sozinho tinha 80 workgroups e a
+// quantização 3 — fundir tudo no workgroup único da redução troca 60 CUs por 1.
+//
+// Aqui os dois passos são paralelos: este espalha o residual e a soma por vários
+// workgroups, e o `norm_p2` lê as poucas parciais que sobraram. São 2 dispatches no lugar
+// de 3 (add + rmsnorm + quantize), sem abrir mão dos 60 CUs em nenhum deles.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer XBuf { float x[]; } xb;          // inout
+layout(set = 0, binding = 1) readonly buffer RBuf { float r[]; } rb; // residual
+layout(set = 0, binding = 2) writeonly buffer PBuf { float p[]; } pb;
+
+layout(push_constant) uniform PC {
+    uint dim;
+    // 0 na primeira norma do shard, onde `x` vem do embedding e não há o que somar. O
+    // binding 1 continua ligado (Vulkan exige), só não é lido.
+    uint tem_residual;
+} pc;
+
+const uint WG = 256u;
+// Um slot por subgrupo. 8 cobre wave64 (4 subgrupos) e wave32 (8 subgrupos).
+shared float partial[8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint passo = gl_NumWorkGroups.x * WG;
+
+    float ss = 0.0;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.dim; i += passo) {
+        float v = xb.x[i];
+        if (pc.tem_residual != 0u) {
+            v += rb.r[i];
+            xb.x[i] = v;   // a stream residual segue para a próxima camada
+        }
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) {
+        partial[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; k++) {
+            total += partial[k];
+        }
+        pb.p[gl_WorkGroupID.x] = total;
+    }
+}

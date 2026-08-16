@@ -304,6 +304,7 @@ pub fn dispatch_q5_k_matvec(
     n_out: usize,
 ) -> Result<Vec<f32>, MatmulError> {
     // Q5_K sobe cru: 176 bytes por superbloco já são 44 uints alinhados.
+    let (wg, rows) = crate::resident_forward::matvec_geom();
     dispatch_k_matvec(
         ctx,
         phys,
@@ -313,7 +314,8 @@ pub fn dispatch_q5_k_matvec(
         x_f32,
         n_in,
         n_out,
-        8, // 4 waves x 2 linhas por wave
+        wg / 64 * rows,
+        &[(0, wg), (1, rows)],
     )
 }
 
@@ -343,7 +345,8 @@ pub fn dispatch_q6_k_matvec(
         x_f32,
         n_in,
         n_out,
-        8, // 4 waves x 2 linhas por wave
+        8, // 4 waves x 2 linhas por wave, fixas no shader
+        &[],
     )
 }
 
@@ -361,6 +364,9 @@ fn dispatch_k_matvec(
     n_in: usize,
     n_out: usize,
     rows_por_wg: u32,
+    // `spec`: specialization constants da geometria. Têm de ser as mesmas com que a pipeline
+    // residente é criada — o shader não tem default utilizável para `local_size_x_id`.
+    spec: &[(u32, u32)],
 ) -> Result<Vec<f32>, MatmulError> {
     use crate::pipeline::{ComputePipeline, PushConstants};
     use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
@@ -414,7 +420,7 @@ fn dispatch_k_matvec(
     )?;
     let y_mem = alloc_and_bind(ctx, phys, d, y_buf, false)?;
 
-    let pipe = ComputePipeline::with(d, spv, 4, size_of::<PushConstants>() as u32, &[])?;
+    let pipe = ComputePipeline::with(d, spv, 5, size_of::<PushConstants>() as u32, spec)?;
     let push = PushConstants {
         n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,

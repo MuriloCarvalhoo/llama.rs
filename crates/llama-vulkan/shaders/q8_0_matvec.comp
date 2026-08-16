@@ -17,11 +17,18 @@ layout(set = 0, binding = 1) readonly buffer XqBuf { int xq[]; } xq_buf;
 layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
 // Y: saida f32 (n_out floats).
 layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
+// O bias da projecao entra aqui em vez de num dispatch `add` proprio: eram 3 adds por
+// camada (q, k, v) movendo 20 KB cada em ~4.8 us, ou seja latencia de lancamento pura.
+// Somar no fim do matvec custa uma leitura de 4 bytes por linha de saida. E o que o
+// llama.cpp faz ao fundir mul_mat com o bias.
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float b[]; } bias_buf;
+
 
 layout(push_constant) uniform PC {
     uint n_in;
     uint n_out;
     uint row_offset; // vestigial (saida indexada por row absoluta)
+    uint tem_bias;   // 0 quando o binding 4 nao tem bias de verdade ligado
 } pc;
 
 // A quantizacao da ativacao saiu daqui para um dispatch proprio: dentro do matvec ela
@@ -55,7 +62,7 @@ void main() {
         }
         acc = subgroupAdd(acc);
         if (gl_SubgroupInvocationID == 0u) {
-            out_buf.y[row] = acc;
+            out_buf.y[row] = pc.tem_bias != 0u ? acc + bias_buf.b[row] : acc;
         }
     }
 }

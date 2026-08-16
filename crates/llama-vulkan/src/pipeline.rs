@@ -13,6 +13,9 @@ pub(crate) struct PushConstants {
     pub n_in: u32,
     pub n_out: u32,
     pub row_offset: u32,
+    /// 1 quando o binding 4 traz o bias da projeção; 0 quando ele é só um buffer qualquer
+    /// ligado para satisfazer o layout.
+    pub tem_bias: u32,
 }
 
 /// Pipeline Vulkan para o shader Q8_0 matmul-vector.
@@ -26,12 +29,12 @@ pub struct ComputePipeline {
 }
 
 impl ComputePipeline {
-    /// Pipeline do matvec Q8_0 (3 bindings STORAGE_BUFFER + push de `PushConstants`).
+    /// Pipeline do matvec Q8_0 (5 bindings STORAGE_BUFFER + push de `PushConstants`).
     pub fn new(dev: &ash::Device) -> Result<Self, PipelineError> {
         Self::with(
             dev,
             crate::Q8_0_MATVEC_SPV,
-            4,
+            5,
             std::mem::size_of::<PushConstants>() as u32,
             &[
                 (0, crate::resident_forward::MATVEC_WG),

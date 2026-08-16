@@ -26,6 +26,8 @@ pub(crate) const Q5_K_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q5_K_MATV
 pub(crate) const Q6_K_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q6_K_MATVEC_SPV")));
 #[allow(dead_code)]
 pub(crate) const RMSNORM_SPV: &[u8] = include_bytes!(concat!(env!("RMSNORM_SPV")));
+pub(crate) const NORM_FUSED_SPV: &[u8] = include_bytes!(concat!(env!("NORM_FUSED_SPV")));
+pub(crate) const NORM_P2_SPV: &[u8] = include_bytes!(concat!(env!("NORM_P2_SPV")));
 #[allow(dead_code)]
 pub(crate) const ROPE_SPV: &[u8] = include_bytes!(concat!(env!("ROPE_SPV")));
 #[allow(dead_code)]
