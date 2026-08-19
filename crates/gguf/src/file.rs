@@ -103,6 +103,18 @@ mod tests {
     }
 
     #[test]
+    fn get_missing_key_is_error() {
+        let bytes = GgufBuilder::new()
+            .kv_string("general.architecture", "llama")
+            .build_meta_only();
+        let f = GgufFile::parse(&bytes).unwrap();
+        assert!(matches!(
+            f.get("tokenizer.ggml.bos_token_id"),
+            Err(GgufError::MissingKey(_))
+        ));
+    }
+
+    #[test]
     fn tensor_data_q8_0_size() {
         // Q8_0 (id 8): block_size 32, type_size 34. 32 elementos = 1 bloco = 34 bytes.
         let bytes = GgufBuilder::new()

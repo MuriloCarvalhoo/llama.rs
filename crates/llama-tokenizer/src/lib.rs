@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 //! Tokenizer SPM (Llama) e BPE (Qwen2/GPT-2) — encode/decode bit-exact vs llama.cpp.
+//!
+//! Contexto delimitado (DDD): tokenização, isolado do domínio do modelo.
+//! - Value object: [`Vocab`] — tokens/scores/merges lidos do GGUF, imutável após
+//!   construção.
+//! - Serviço de domínio (facade): [`Tokenizer`] — decide a estratégia (SPM ou BPE)
+//!   e expõe `encode`/`decode`; delega às estratégias privadas em `spm`/`bpe`.
 
 mod bpe;
 mod error;

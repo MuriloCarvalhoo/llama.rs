@@ -1,5 +1,17 @@
 #![deny(unsafe_code)]
 //! Inferência forward (CPU, f32) da arquitetura Llama. Escopo: stories260K.
+//!
+//! Contexto delimitado (DDD): definição e execução do modelo, independente do
+//! backend (CPU aqui; Vulkan em `llama-vulkan`, atrás dos traits `GpuMatmul` /
+//! `GpuResidentDecode`).
+//! - Value object: [`LlamaConfig`]/[`DeltaNetConfig`] — hiperparâmetros lidos do GGUF
+//!   (`config.rs`), incluindo a distinção MTP/NextN e o mixer híbrido do Qwen3.8.
+//! - Entidade/aggregate root: [`Model`] — pesos + config carregados, com identidade
+//!   própria (um `Model` por arquivo carregado) e estado mutável via `KvCache`.
+//! - Serviços de domínio: `attention`, `ops`, `delta_net` — funções livres e sem
+//!   estado (matemática pura de RoPE/RMSNorm/SwiGLU/matmul quantizado); mantidas como
+//!   funções, não classes, por serem primitivas numéricas na hot-path de prefill/GPU.
+//! - Camada `gpu` (feature `gpu`): ponte para o backend Vulkan residente.
 
 mod attention;
 mod config;

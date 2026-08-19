@@ -552,3 +552,76 @@ fn choose_sampler(args: &Args) -> Sampler {
     }
     Sampler::Temperature { temp: args.temp }
 }
+
+#[cfg(test)]
+mod choose_sampler_tests {
+    //! `choose_sampler` mapeia os args da CLI para uma estratégia — lógica pura, sem
+    //! I/O nem GPU, então testável sem nenhum modelo.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn base_args() -> Args {
+        Args {
+            model: PathBuf::new(),
+            prompt: String::new(),
+            n_predict: 1,
+            temp: 0.8,
+            top_k: 40,
+            top_p: 0.9,
+            seed: 0,
+            ctx: 4096,
+            no_display_prompt: false,
+            timings: false,
+            gpu: false,
+            gpu_single: false,
+            gpu_resident: false,
+            gpu_layer_split: false,
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn temp_zero_e_greedy() {
+        let args = Args {
+            temp: 0.0,
+            ..base_args()
+        };
+        assert!(matches!(choose_sampler(&args), Sampler::Greedy));
+    }
+
+    #[test]
+    fn top_k_positivo_prevalece() {
+        let args = Args {
+            top_k: 40,
+            ..base_args()
+        };
+        assert!(matches!(choose_sampler(&args), Sampler::TopK { k: 40, .. }));
+    }
+
+    #[test]
+    fn top_p_abaixo_de_um_quando_top_k_desabilitado() {
+        let args = Args {
+            top_k: 0,
+            top_p: 0.9,
+            ..base_args()
+        };
+        assert!(matches!(
+            choose_sampler(&args),
+            Sampler::TopP { p, .. } if p == 0.9
+        ));
+    }
+
+    #[test]
+    fn temperatura_pura_quando_top_k_e_top_p_desabilitados() {
+        let args = Args {
+            top_k: 0,
+            top_p: 1.0,
+            temp: 0.5,
+            ..base_args()
+        };
+        assert!(matches!(
+            choose_sampler(&args),
+            Sampler::Temperature { temp } if temp == 0.5
+        ));
+    }
+}

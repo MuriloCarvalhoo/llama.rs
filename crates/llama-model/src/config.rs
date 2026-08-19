@@ -188,6 +188,165 @@ impl LlamaConfig {
 }
 
 #[cfg(test)]
+mod synthetic_tests {
+    //! Testes de `LlamaConfig::from_gguf` sobre bytes GGUF sintéticos (sem ler nenhum
+    //! `.gguf` do disco) — cobrem especificamente a distinção MTP/NextN e o mixer
+    //! híbrido (`qwen35`/Qwen3.8) que os testes em `tests` (abaixo) só exercitam se
+    //! houver um modelo real em `models/`.
+    use super::*;
+
+    struct MiniGguf {
+        kv: Vec<u8>,
+        kv_count: u64,
+    }
+
+    impl MiniGguf {
+        fn new() -> Self {
+            Self {
+                kv: Vec::new(),
+                kv_count: 0,
+            }
+        }
+
+        fn push_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+
+        fn str(mut self, key: &str, val: &str) -> Self {
+            Self::push_str(&mut self.kv, key);
+            self.kv.extend_from_slice(&8u32.to_le_bytes());
+            Self::push_str(&mut self.kv, val);
+            self.kv_count += 1;
+            self
+        }
+
+        fn u32(mut self, key: &str, val: u32) -> Self {
+            Self::push_str(&mut self.kv, key);
+            self.kv.extend_from_slice(&4u32.to_le_bytes());
+            self.kv.extend_from_slice(&val.to_le_bytes());
+            self.kv_count += 1;
+            self
+        }
+
+        fn f32(mut self, key: &str, val: f32) -> Self {
+            Self::push_str(&mut self.kv, key);
+            self.kv.extend_from_slice(&6u32.to_le_bytes());
+            self.kv.extend_from_slice(&val.to_le_bytes());
+            self.kv_count += 1;
+            self
+        }
+
+        fn str_array(mut self, key: &str, vals: &[&str]) -> Self {
+            Self::push_str(&mut self.kv, key);
+            self.kv.extend_from_slice(&9u32.to_le_bytes());
+            self.kv.extend_from_slice(&8u32.to_le_bytes());
+            self.kv
+                .extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            for v in vals {
+                Self::push_str(&mut self.kv, v);
+            }
+            self.kv_count += 1;
+            self
+        }
+
+        fn build(&self) -> GgufFile {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"GGUF");
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            out.extend_from_slice(&self.kv_count.to_le_bytes());
+            out.extend_from_slice(&self.kv);
+            GgufFile::parse(&out).unwrap()
+        }
+    }
+
+    /// Config densa mínima válida (arquitetura `llama`, 2 camadas, sem MTP/delta-net).
+    fn dense_base() -> MiniGguf {
+        MiniGguf::new()
+            .str("general.architecture", "llama")
+            .u32("llama.embedding_length", 8)
+            .u32("llama.attention.head_count", 2)
+            .u32("llama.attention.head_count_kv", 2)
+            .u32("llama.feed_forward_length", 16)
+            .u32("llama.context_length", 128)
+            .u32("llama.block_count", 2)
+            .f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .str_array("tokenizer.ggml.tokens", &["<unk>", "<s>", "</s>"])
+            .u32("tokenizer.ggml.bos_token_id", 1)
+            .u32("tokenizer.ggml.eos_token_id", 2)
+    }
+
+    #[test]
+    fn dense_minimal_config_parses() {
+        let f = dense_base().build();
+        let c = LlamaConfig::from_gguf(&f).unwrap();
+        assert_eq!(c.n_embd, 8);
+        assert_eq!(c.n_layer, 2);
+        assert_eq!(c.head_dim, 4); // n_embd / n_head, sem attention.key_length
+        assert_eq!(c.n_layer_nextn, 0);
+        assert!(c.delta_net.is_none());
+    }
+
+    #[test]
+    fn nextn_predict_layers_removidos_de_n_layer() {
+        // block_count=6, nextn_predict_layers=2 → n_layer efetivo = 4 (os 2 blocos MTP
+        // no fim não entram no forward normal). Ver comentário em `from_gguf`.
+        let f = dense_base()
+            .u32("llama.block_count", 6)
+            .u32("llama.nextn_predict_layers", 2)
+            .build();
+        let c = LlamaConfig::from_gguf(&f).unwrap();
+        assert_eq!(c.n_layer, 4);
+        assert_eq!(c.n_layer_nextn, 2);
+    }
+
+    #[test]
+    fn nextn_maior_que_block_count_e_erro() {
+        let f = dense_base()
+            .u32("llama.block_count", 2)
+            .u32("llama.nextn_predict_layers", 3)
+            .build();
+        assert!(LlamaConfig::from_gguf(&f).is_err());
+    }
+
+    #[test]
+    fn hybrid_delta_net_detectado_via_ssm_conv_kernel() {
+        // Presença de `ssm.conv_kernel` liga o mixer híbrido (qwen35/Qwen3.8): 3 em
+        // cada 4 camadas viram atenção linear (delta net), sem KV-cache.
+        let f = dense_base()
+            .u32("llama.ssm.conv_kernel", 4)
+            .u32("llama.ssm.inner_size", 8)
+            .u32("llama.ssm.state_size", 2)
+            .u32("llama.ssm.time_step_rank", 2)
+            .u32("llama.ssm.group_count", 1)
+            .build();
+        let c = LlamaConfig::from_gguf(&f).unwrap();
+        let dn = c.delta_net.expect("delta_net deveria estar presente");
+        assert_eq!(dn.full_attn_interval, 4); // default quando a chave não existe
+        assert!(dn.eh_linear(0)); // camada 0 é linear (delta)
+        assert!(!dn.eh_linear(3)); // camada 3 (il+1 == 4) é atenção completa
+    }
+
+    #[test]
+    fn n_head_zero_e_erro() {
+        let f = dense_base().u32("llama.attention.head_count", 0).build();
+        assert!(matches!(
+            LlamaConfig::from_gguf(&f),
+            Err(ModelError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn attention_key_length_sobrepoe_head_dim_derivado() {
+        // Qwen3.8-27B: head_dim=256 explícito não bate com n_embd/n_head.
+        let f = dense_base().u32("llama.attention.key_length", 256).build();
+        let c = LlamaConfig::from_gguf(&f).unwrap();
+        assert_eq!(c.head_dim, 256);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
