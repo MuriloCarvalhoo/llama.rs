@@ -164,11 +164,12 @@ impl<'ctx> ResidentGpu<'ctx> {
         let pipeline = ComputePipeline::new(&dev.device)
             .map_err(|e| ModelError::Gpu(format!("pipeline: {e}")))?;
 
-        // Descriptor pool/set persistentes: 1 set com 3 bindings STORAGE_BUFFER.
+        // Descriptor pool/set persistentes: 1 set com os 5 bindings STORAGE_BUFFER do
+        // matvec (pesos, xq, xd, saída, bias).
         let d = &dev.device;
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 3,
+            descriptor_count: 5,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo {
             max_sets: 1,
@@ -311,6 +312,13 @@ impl<'ctx> ResidentGpu<'ctx> {
                 offset: 0,
                 range: y_size,
             },
+            // 4 = bias. Este caminho não soma bias: liga as escalas de x só para completar
+            // o layout de 5 bindings do shader, e `tem_bias: 0` faz o shader ignorar.
+            vk::DescriptorBufferInfo {
+                buffer: buffers.x_dev,
+                offset: xq_size,
+                range: xd_size,
+            },
         ];
         let writes: Vec<vk::WriteDescriptorSet> = buf_infos
             .iter()
@@ -346,6 +354,7 @@ impl<'ctx> ResidentGpu<'ctx> {
             n_in: n_in as u32,
             n_out: n_out as u32,
             row_offset: 0,
+            tem_bias: 0,
         };
         unsafe {
             // SAFETY: cmd recém-alocado; desc_set/pipeline válidos.

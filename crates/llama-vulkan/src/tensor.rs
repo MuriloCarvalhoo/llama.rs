@@ -27,6 +27,7 @@ impl GpuTensor {
     ///
     /// - **Q8_0**: repack de blocos de 34 B para 36 B (ver `upload_q8_0`).
     /// - **Q5_K**: cru — o superbloco já tem 176 B = 44 uints alinhados.
+    /// - **Q4_K**: cru — o superbloco tem 144 B = 36 uints alinhados (sem o `qh` do Q5_K).
     /// - **Q6_K**: superbloco de 210 B alinhado em 212, para as leituras de 32 bits do
     ///   shader ficarem alinhadas (mesmo motivo do repack do Q8_0).
     pub fn upload_quant(
@@ -40,7 +41,9 @@ impl GpuTensor {
     ) -> Result<Self, TensorError> {
         match ty {
             gguf::GgmlType::Q8_0 => Self::upload_q8_0(ctx, phys, dev, bytes, n_in, n_out),
-            gguf::GgmlType::Q5_K => Self::upload_raw(ctx, phys, dev, bytes, n_in, n_out),
+            gguf::GgmlType::Q5_K | gguf::GgmlType::Q4_K => {
+                Self::upload_raw(ctx, phys, dev, bytes, n_in, n_out)
+            }
             gguf::GgmlType::Q6_K => {
                 let n_sb = bytes.len() / 210;
                 let mut padded = vec![0u8; n_sb * 212];
@@ -65,7 +68,7 @@ impl GpuTensor {
         let d = &dev.device;
         let size = bytes.len() as vk::DeviceSize;
         let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        let staging_mem = alloc_and_bind(ctx, phys, d, staging, true)?;
+        let staging_mem = alloc_and_bind_cached(ctx, phys, d, staging)?;
         // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
         unsafe {
             let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
@@ -137,7 +140,7 @@ impl GpuTensor {
 
         // 1. Staging buffer (host-visible)
         let staging_buf = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
-        let staging_mem = alloc_and_bind(ctx, phys, d, staging_buf, true)?;
+        let staging_mem = alloc_and_bind_cached(ctx, phys, d, staging_buf)?;
 
         // 2. map -> copy -> unmap
         unsafe {

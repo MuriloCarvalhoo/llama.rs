@@ -1185,3 +1185,72 @@ fn q5_k_matvec_caso(
         &cpu[..4]
     );
 }
+
+#[test]
+fn q4_k_matvec_gpu_bate_com_a_referencia_de_cpu() {
+    // Mesmo esquema do teste Q5_K acima: `ggml_cpu::dequant_to_f32` + matmul f32 ingênuo
+    // como referência. Q4_K é o Q5_K sem o 5º bit (`qh`) — mesmo bug class possível se o
+    // shader novo (`q4_k_matvec.comp`) errar o offset de `qs` sem o `qh` no meio.
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let dev = llama_vulkan::VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    for n_in in [512usize, 4096, 5120] {
+        q4_k_matvec_caso(&ctx, &phys[0], &dev, n_in);
+    }
+}
+
+fn q4_k_matvec_caso(
+    ctx: &llama_vulkan::VulkanContext,
+    phys: &llama_vulkan::VulkanPhysicalDevice,
+    dev: &llama_vulkan::VulkanDevice,
+    n_in: usize,
+) {
+    let n_out = 16usize;
+    let sb_per_row = n_in / 256;
+    let mut w = vec![0u8; n_out * sb_per_row * 144];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (i.wrapping_mul(101).wrapping_add(i / 7) % 251) as u8;
+    }
+    for sb in 0..n_out * sb_per_row {
+        let o = sb * 144;
+        w[o..o + 2].copy_from_slice(&half::f16::from_f32(0.0123).to_le_bytes()); // d
+        w[o + 2..o + 4].copy_from_slice(&half::f16::from_f32(0.0045).to_le_bytes()); // dmin
+    }
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+        .collect();
+
+    let gpu = llama_vulkan::matmul::dispatch_q4_k_matvec(ctx, phys, dev, &w, &x, n_in, n_out)
+        .expect("dispatch Q4_K");
+
+    let row_bytes = sb_per_row * 144;
+    let x_int8 = quant_dequant_x(&x);
+    let mut cpu = vec![0f32; n_out];
+    for (r, out) in cpu.iter_mut().enumerate() {
+        let deq =
+            ggml_cpu::dequant_to_f32(&w[r * row_bytes..(r + 1) * row_bytes], gguf::GgmlType::Q4_K)
+                .expect("dequant");
+        *out = deq.iter().zip(&x_int8).map(|(a, b)| a * b).sum();
+    }
+
+    let max_abs = cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let max_rel = gpu
+        .iter()
+        .zip(&cpu)
+        .fold(0f32, |m, (&a, &b)| m.max((a - b).abs() / max_abs));
+    eprintln!("Q4_K matvec (n_in={n_in}): erro relativo maximo = {max_rel:.3e}");
+    assert!(
+        max_rel < 1e-5,
+        "shader Q4_K divergiu da referencia de CPU (erro rel {max_rel})\ngpu={:?}\ncpu={:?}",
+        &gpu[..4],
+        &cpu[..4]
+    );
+}

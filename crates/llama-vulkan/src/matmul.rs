@@ -126,7 +126,7 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
 
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 3,
+        descriptor_count: 5,
     }];
     let pool_info = vk::DescriptorPoolCreateInfo {
         max_sets: 1,
@@ -147,7 +147,9 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
     let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info)? };
     let desc_set = desc_sets[0];
 
-    // Escrever descriptors: 0=weights, 1=x quantizado, 2=escalas de x, 3=output
+    // Escrever descriptors: 0=weights, 1=x quantizado, 2=escalas de x, 3=output, 4=bias.
+    // Este caminho não soma bias: liga `xd_buf` no 4 só para o layout ficar completo, e
+    // `tem_bias: 0` faz o shader ignorá-lo.
     let buf_infos = [
         vk::DescriptorBufferInfo {
             buffer: w_tensor.buffer,
@@ -168,6 +170,11 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
             buffer: y_buf,
             offset: 0,
             range: y_size,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: xd_buf,
+            offset: 0,
+            range: xd_size,
         },
     ];
 
@@ -208,6 +215,7 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
         n_in: n_in as u32,
         n_out: n_out_local as u32,
         row_offset: row_offset as u32,
+        tem_bias: 0,
     };
 
     unsafe {
@@ -310,6 +318,32 @@ pub fn dispatch_q5_k_matvec(
         phys,
         dev,
         crate::Q5_K_MATVEC_SPV,
+        w_bytes,
+        x_f32,
+        n_in,
+        n_out,
+        wg / 64 * rows,
+        &[(0, wg), (1, rows)],
+    )
+}
+
+/// Matvec Q4_K numa GPU: mesma estrutura do Q5_K (`dispatch_q5_k_matvec`), sem o 5º bit —
+/// superbloco de 144 B = 36 uints, já alinhado, sobe cru.
+pub fn dispatch_q4_k_matvec(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    let (wg, rows) = crate::resident_forward::matvec_geom();
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::Q4_K_MATVEC_SPV,
         w_bytes,
         x_f32,
         n_in,
@@ -425,11 +459,13 @@ fn dispatch_k_matvec(
         n_in: u32::try_from(n_in).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         n_out: u32::try_from(n_out).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?,
         row_offset: 0,
+        tem_bias: 0,
     };
-    // Descriptor pool + set com os 4 bindings (pesos, xq, xd, saída).
+    // Descriptor pool + set com os 5 bindings (pesos, xq, xd, saída, bias). Sem bias
+    // aqui: o binding 4 recebe `xd` só para completar o layout, e `tem_bias: 0` o ignora.
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 4,
+        descriptor_count: 5,
     }];
     let pool_info = vk::DescriptorPoolCreateInfo {
         max_sets: 1,
@@ -468,6 +504,11 @@ fn dispatch_k_matvec(
             buffer: y_buf,
             offset: 0,
             range: y_size,
+        },
+        vk::DescriptorBufferInfo {
+            buffer: xd_buf,
+            offset: 0,
+            range: xd_bytes.len() as vk::DeviceSize,
         },
     ];
     let writes: Vec<vk::WriteDescriptorSet> = infos

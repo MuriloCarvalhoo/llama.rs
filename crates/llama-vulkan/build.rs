@@ -7,6 +7,7 @@ fn main() {
         ("quantize_x.comp", "QUANTIZE_X_SPV"),
         ("q5_k_matvec.comp", "Q5_K_MATVEC_SPV"),
         ("q6_k_matvec.comp", "Q6_K_MATVEC_SPV"),
+        ("q4_k_matvec.comp", "Q4_K_MATVEC_SPV"),
         ("rmsnorm.comp", "RMSNORM_SPV"),
         ("norm_fused.comp", "NORM_FUSED_SPV"),
         ("norm_p2.comp", "NORM_P2_SPV"),

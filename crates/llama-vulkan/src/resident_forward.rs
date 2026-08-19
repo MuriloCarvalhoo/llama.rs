@@ -269,6 +269,7 @@ pub(crate) enum PipeId {
     Matvec,
     MatvecQ5K,
     MatvecQ6K,
+    MatvecQ4K,
     QuantizeX,
     /// Residual + parciais da RMSNorm — ver `norm_fused.comp`.
     NormFused,
@@ -291,6 +292,7 @@ impl PipeId {
             PipeId::Matvec => "matvec",
             PipeId::MatvecQ5K => "matvec_q5k",
             PipeId::MatvecQ6K => "matvec_q6k",
+            PipeId::MatvecQ4K => "matvec_q4k",
             PipeId::QuantizeX => "quantize_x",
             PipeId::NormFused => "norm_fused",
             PipeId::NormP2 => "norm_p2",
@@ -317,7 +319,9 @@ impl PipeId {
         match self {
             // weight, xq, xd → out
             // weight, xq, xd, bias → out
-            PipeId::Matvec | PipeId::MatvecQ5K | PipeId::MatvecQ6K => (&[0, 1, 2, 4], &[3]),
+            PipeId::Matvec | PipeId::MatvecQ5K | PipeId::MatvecQ6K | PipeId::MatvecQ4K => {
+                (&[0, 1, 2, 4], &[3])
+            }
             PipeId::Attention => (&[0, 1, 2], &[3]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
             PipeId::Swiglu => (&[0, 1], &[2]),
@@ -473,6 +477,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) quantize_x: ComputePipeline,
     pub(crate) matvec_q5k: ComputePipeline,
     pub(crate) matvec_q6k: ComputePipeline,
+    pub(crate) matvec_q4k: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) norm_fused: ComputePipeline,
     pub(crate) norm_p2: ComputePipeline,
@@ -687,6 +692,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let geom = [(0, mv_wg), (1, mv_rows)];
         let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 5, push_mv, &geom)?;
         let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[])?;
+        // Mesma geometria tunada do Q5_K: a estrutura de acesso é idêntica (só sem o `qh`).
+        let matvec_q4k = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom)?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         // dim:u32 + tem_residual:u32
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
@@ -728,6 +735,7 @@ impl<'ctx> ResidentForward<'ctx> {
             quantize_x,
             matvec_q5k,
             matvec_q6k,
+            matvec_q4k,
             rmsnorm,
             norm_fused,
             norm_p2,
@@ -1889,6 +1897,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::Matvec => &self.matvec,
             PipeId::MatvecQ5K => &self.matvec_q5k,
             PipeId::MatvecQ6K => &self.matvec_q6k,
+            PipeId::MatvecQ4K => &self.matvec_q4k,
             PipeId::DeltaNet => &self.delta_net,
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
@@ -1929,6 +1938,9 @@ impl<'ctx> ResidentForward<'ctx> {
                 n_in: n_in as u32,
                 n_out: n_out as u32,
                 row_offset: 0,
+                // O bias das projeções entra por ops `Add` próprias, adiante no plano; o
+                // binding 4 é preenchido só para completar o layout.
+                tem_bias: 0,
             };
             unsafe {
                 std::slice::from_raw_parts(
@@ -2025,10 +2037,13 @@ impl<'ctx> ResidentForward<'ctx> {
                     (st.b_xd.buffer, 0, st.b_xd.size),
                 ];
                 let saida = (dst.buffer, 0, nb(n_out));
+                // Binding 4 = bias; sem bias fundido no matvec, repete `xd` (já lido no
+                // binding 2, então `marcar_barreiras` enxerga a mesma faixa).
+                let bias = comum[2];
                 match w.ty {
                     gguf::GgmlType::Q8_0 => mk(
                         PipeId::Matvec,
-                        &[comum[0], comum[1], comum[2], saida],
+                        &[comum[0], comum[1], comum[2], saida, bias],
                         mv_groups(n_out),
                         PushSpec::Static(mv_push(n_in, n_out)),
                     ),
@@ -2036,14 +2051,14 @@ impl<'ctx> ResidentForward<'ctx> {
                         // A ativação é lida uma vez para todas as linhas do wave; quantas
                         // linhas cada workgroup cobre sai de `matvec_geom` (Q5_K) ou da
                         // geometria fixa do shader Q6_K.
-                        let (pipe, rows_por_wg) = if ty == gguf::GgmlType::Q5_K {
-                            (PipeId::MatvecQ5K, rows_q5k)
-                        } else {
-                            (PipeId::MatvecQ6K, 8)
+                        let (pipe, rows_por_wg) = match ty {
+                            gguf::GgmlType::Q5_K => (PipeId::MatvecQ5K, rows_q5k),
+                            gguf::GgmlType::Q4_K => (PipeId::MatvecQ4K, rows_q5k),
+                            _ => (PipeId::MatvecQ6K, 8),
                         };
                         mk(
                             pipe,
-                            &[comum[0], comum[1], comum[2], saida],
+                            &[comum[0], comum[1], comum[2], saida, bias],
                             u32::try_from(n_out.div_ceil(rows_por_wg)).unwrap_or(u32::MAX),
                             PushSpec::Static(mv_push(n_in, n_out)),
                         )
@@ -2059,10 +2074,10 @@ impl<'ctx> ResidentForward<'ctx> {
                       n_out: usize|
          -> Result<PlannedOp, MatmulError> {
             let (xq, xd) = ativ;
-            let (pipe, rows_por_wg) = if w.ty == gguf::GgmlType::Q5_K {
-                (PipeId::MatvecQ5K, rows_q5k)
-            } else {
-                (PipeId::MatvecQ6K, 8)
+            let (pipe, rows_por_wg) = match w.ty {
+                gguf::GgmlType::Q5_K => (PipeId::MatvecQ5K, rows_q5k),
+                gguf::GgmlType::Q4_K => (PipeId::MatvecQ4K, rows_q5k),
+                _ => (PipeId::MatvecQ6K, 8),
             };
             mk(
                 pipe,
@@ -2071,6 +2086,8 @@ impl<'ctx> ResidentForward<'ctx> {
                     (xq.buffer, 0, xq.size),
                     (xd.buffer, 0, xd.size),
                     (dst.buffer, 0, nb(n_out)),
+                    // Binding 4 = bias; sem bias aqui, repete `xd` (ver `mv`).
+                    (xd.buffer, 0, xd.size),
                 ],
                 u32::try_from(n_out.div_ceil(rows_por_wg)).unwrap_or(u32::MAX),
                 PushSpec::Static(mv_push(n_in, n_out)),

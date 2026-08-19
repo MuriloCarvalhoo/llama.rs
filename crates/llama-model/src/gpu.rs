@@ -76,7 +76,7 @@ pub struct GpuRawWeights<'a> {
 }
 
 impl<'a> GpuRawWeights<'a> {
-    /// Lê e valida os pesos quantizados do GGUF. Aceita Q8_0, Q5_K e Q6_K — os tipos
+    /// Lê e valida os pesos quantizados do GGUF. Aceita Q8_0, Q5_K, Q6_K e Q4_K — os tipos
     /// para os quais existe shader de matvec. Valida a granularidade que cada um exige:
     /// 32 elementos por bloco no Q8_0, 256 por superbloco nos K-quants.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
@@ -92,9 +92,10 @@ impl<'a> GpuRawWeights<'a> {
                 GgmlType::Q8_0 => (32usize, 34usize),
                 GgmlType::Q5_K => (256, 176),
                 GgmlType::Q6_K => (256, 210),
+                GgmlType::Q4_K => (256, 144),
                 other => {
                     return Err(ModelError::Gpu(format!(
-                        "tensor {name} é {other:?} — a GPU só tem shader para Q8_0, Q5_K e Q6_K"
+                        "tensor {name} é {other:?} — a GPU só tem shader para Q8_0, Q5_K, Q6_K e Q4_K"
                     )));
                 }
             };
