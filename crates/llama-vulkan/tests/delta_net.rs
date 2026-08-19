@@ -115,6 +115,89 @@ fn delta_net_bate_com_a_referencia_de_cpu() {
     assert!(dif_out < 1e-4, "saída divergiu: {dif_out}");
 }
 
+/// GQA: q/k têm menos cabeças que v (`n_k_heads < n_v_heads`, `rep = n_v_heads/n_k_heads`
+/// no Qwen3.8). O llama.cpp expande via `ggml_repeat`, cuja semântica é **módulo**
+/// (`dest[h] = src[h % n_k_heads]`, entrelaçado) — não blocos (`h / rep`). Este teste
+/// existe porque `delta_net_bate_com_a_referencia_de_cpu` usa `rep=1` e não exercita esse
+/// mapeamento; sem ele, um shader com o agrupamento errado ainda passaria.
+#[test]
+fn delta_net_gqa_mapeia_cabeca_de_valor_para_chave_por_modulo() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let d = 64usize;
+    let n_k_heads = 2usize;
+    let rep = 3usize;
+    let n_heads = n_k_heads * rep; // 6 cabeças de valor, como no teste acima
+
+    let estado0 = pseudo(n_heads * d * d, 41);
+    let q_kheads = pseudo(n_k_heads * d, 42);
+    let k_kheads = pseudo(n_k_heads * d, 43);
+    let v = pseudo(n_heads * d, 44);
+    let gb: Vec<f32> = (0..n_heads)
+        .flat_map(|h| [-0.05 * (h as f32 + 1.0), 0.3 + 0.05 * h as f32])
+        .collect();
+
+    // Buffers do shader já vêm no tamanho de n_k_heads (o shader indexa `h % n_k_heads`
+    // internamente); a referência de CPU replica esse `%` explicitamente abaixo.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct P {
+        d: u32,
+        n_heads: u32,
+        rep: u32,
+    }
+    let push = push_bytes(&P {
+        d: d as u32,
+        n_heads: n_heads as u32,
+        rep: rep as u32,
+    });
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::DeltaNet,
+            &[
+                estado0.clone(),
+                q_kheads.clone(),
+                k_kheads.clone(),
+                v.clone(),
+                gb.clone(),
+                vec![0f32; n_heads * d],
+            ],
+            &push,
+            (n_heads * d / 4) as u32,
+        )
+        .expect("dispatch delta_net (GQA)");
+    let estado_gpu = &saida[0];
+    let out_gpu = &saida[5];
+
+    // Referência: cabeça de valor `h` lê a cabeça de chave `h % n_k_heads` (módulo,
+    // entrelaçado) — a semântica de `ggml_repeat`, não `h / rep` (blocos).
+    let mut estado_cpu = estado0.clone();
+    let mut out_cpu = vec![0f32; n_heads * d];
+    for h in 0..n_heads {
+        let hk = h % n_k_heads;
+        llama_model::delta_net::delta_net_step(
+            &mut estado_cpu[h * d * d..(h + 1) * d * d],
+            &q_kheads[hk * d..(hk + 1) * d],
+            &k_kheads[hk * d..(hk + 1) * d],
+            &v[h * d..(h + 1) * d],
+            gb[h * 2],
+            gb[h * 2 + 1],
+            &mut out_cpu[h * d..(h + 1) * d],
+        );
+    }
+
+    let dif_estado = max_dif(estado_gpu, &estado_cpu);
+    let dif_out = max_dif(out_gpu, &out_cpu);
+    eprintln!("delta_net GQA: dif estado={dif_estado:.3e} saída={dif_out:.3e}");
+    assert!(
+        dif_estado < 1e-4,
+        "estado recorrente (GQA) divergiu: {dif_estado}"
+    );
+    assert!(dif_out < 1e-4, "saída (GQA) divergiu: {dif_out}");
+}
+
 #[test]
 fn conv_causal_bate_com_a_referencia_e_desliza_a_janela() {
     let Some((ctx, ())) = ctx_fwd() else { return };

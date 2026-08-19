@@ -56,9 +56,15 @@ void main() {
     if (h >= pc.n_heads || col >= pc.d) { return; }
 
     uint por_lane = pc.d / LANES;
-    // q e k tem menos cabecas que v (GQA): a cabeca de chave `h / rep` serve `rep`
-    // cabecas de valor. Indexar aqui evita materializar a repeticao num buffer.
-    uint base_qk = (h / pc.rep) * pc.d;
+    // q e k tem menos cabecas que v (GQA): o llama.cpp expande de num_k_heads para
+    // num_v_heads com `ggml_repeat`, cuja semantica e MODULO (`dest[i] = src[i %
+    // ne_src]`), nao blocos — confirmado em ggml_compute_forward_repeat_f32
+    // (ggml/src/ggml-cpu/ops.cpp): o indice de destino e `i1*ne01 + k1` e ele copia de
+    // `k1 = i1*ne01+k1) % ne01`. Cabeca de valor `h` le a cabeca de chave `h % n_k_heads`
+    // (entrelacado: h=0,1,2,3,4,5 -> chave 0,1,0,1,0,1 quando n_k_heads=2), NAO `h / rep`
+    // (blocos: 0,0,0,1,1,1). Indexar aqui evita materializar a repeticao num buffer.
+    uint n_k_heads = pc.n_heads / pc.rep;
+    uint base_qk = (h % n_k_heads) * pc.d;
     uint base_h = h * pc.d;
     uint base_col = h * pc.d * pc.d + col * pc.d;
 
