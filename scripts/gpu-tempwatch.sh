@@ -6,7 +6,7 @@
 #
 # Parse: ler SO o campo 2 de cada linha. Um grep solto casa o `crit = +105.0` e dispara
 # com as placas frias.
-LOG=/tmp/claude-1000/-home-murilo-llama-rs/e2f6862b-0a29-43ac-a4d3-b2f8a95779b6/scratchpad/tempwatch.log
+LOG="${LLAMA_RS_TEMPWATCH_LOG:-/tmp/llama-rs-tempwatch.log}"
 LIM_JUNCTION=105
 LIM_MEM=94
 

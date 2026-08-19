@@ -1627,17 +1627,13 @@ impl<'ctx> ResidentForward<'ctx> {
     ///
     /// Ops entre duas barreiras podem rodar concorrentes na GPU. Uma barreira só faz falta
     /// quando a op conflita com o que o grupo corrente já fez: lê o que foi escrito (RAW),
-    /// escreve o que foi lido (WAR) ou escreve o que já foi escrito (WAW).
+    /// escreve o que foi lido (WAR) ou escreve o que já foi escrito (WAW). O critério é
+    /// conservador em dois pontos, de propósito: compara as faixas **inteiras** dos bindings
+    /// (não o que o shader de fato toca) e trata o KV-cache como um buffer só, já que o
+    /// offset do append depende de `pos` e não é conhecido aqui.
     ///
-    /// Antes emitíamos uma barreira depois de **todo** dispatch, e isso custa um "tail" por
-    /// op: nenhum workgroup do próximo começa antes que o último do anterior termine, e o
-    /// fim de um matvec ocupa poucas waves de 240 SIMDs. Numa camada densa do Qwen2.5 as
-    /// projeções Q/K/V leem a mesma ativação e escrevem buffers distintos — assim como
-    /// `ffn_gate`/`ffn_up` —, então não havia dependência nenhuma a respeitar entre elas.
-    ///
-    /// O critério é conservador em dois pontos, de propósito: compara as faixas **inteiras**
-    /// dos bindings (não o que o shader de fato toca) e trata o KV-cache como um buffer só,
-    /// já que o offset do append depende de `pos` e não é conhecido aqui.
+    /// `LLAMA_RS_NO_GROUP=1` volta a uma barreira por op, para comparar. Motivação e ganho
+    /// medido em `docs/performance-tuning.md`.
     fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState) -> Vec<bool> {
         // `LLAMA_RS_NO_GROUP=1` volta ao comportamento antigo (uma barreira por op) para
         // poder medir o efeito do agrupamento no mesmo binário.
@@ -2660,20 +2656,11 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Espera o fence do token **sondando**, sem dormir.
     ///
-    /// Um `wait_for_fences` bloqueante entrega a thread ao escalonador pelos ~25 ms do
-    /// shard. Nesse tempo o governor (schedutil) vê utilização baixa e derruba a
-    /// frequência, e a CPU entra em C-state profundo — o wakeup pela IRQ da GPU passa a
-    /// custar milissegundos. O sintoma era o tempo por token **bimodal**, 53 ou 57 ms com
-    /// o tempo de GPU idêntico até o décimo de µs; qualquer busy-loop rodando em paralelo
-    /// "consertava" o número, o que fecha o diagnóstico.
-    ///
-    /// Medido no Qwen2.5-32B em layer-split: 17.5-18.9 tok/s oscilando com o wait
-    /// bloqueante contra **19.4 estável** sondando. Dormir 90% do tempo previsto e sondar
-    /// o resto NÃO resolve — a latência já é paga ao acordar do sono longo, mesmo por
-    /// timeout.
-    ///
-    /// O preço é um núcleo ocupado enquanto a GPU trabalha (~3.5% desta máquina de 28).
-    /// É o mesmo compromisso que o llama.cpp faz no seu laço de espera.
+    /// Um `wait_for_fences` bloqueante entrega a thread ao escalonador do SO, que reduz o
+    /// clock da CPU por baixa utilização e a deixa entrar em C-state profundo — o wakeup
+    /// pela IRQ da GPU passa a custar milissegundos em vez de microssegundos. O custo é um
+    /// núcleo ocupado enquanto a GPU trabalha; é o mesmo compromisso que o llama.cpp faz no
+    /// seu laço de espera. Diagnóstico e números medidos em `docs/performance-tuning.md`.
     fn espera_fence(&self, st: &ResidentState) -> Result<(), MatmulError> {
         let d = &self.dev.device;
         loop {

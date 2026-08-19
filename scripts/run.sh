@@ -14,13 +14,13 @@
 # não couber. Qualquer flag --gpu* passada por você desliga essa escolha.
 #
 # Variáveis de ambiente do script:
-#   LLAMA_RS_MODELS  onde procurar os .gguf   (padrão: /run/media/murilo/BACKUP/MODELOS)
+#   LLAMA_RS_MODELS  onde procurar os .gguf   (padrão: models/)
 #   RUN_FEATURES     features do cargo        (padrão: gpu; use "" para CPU pura,
 #                                              "gpu profiling" para habilitar --trace)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODELS_DIR="${LLAMA_RS_MODELS:-/run/media/murilo/BACKUP/MODELOS}"
+MODELS_DIR="${LLAMA_RS_MODELS:-models}"
 FEATURES="${RUN_FEATURES-gpu}"
 BIN=target/release/llama-cli
 

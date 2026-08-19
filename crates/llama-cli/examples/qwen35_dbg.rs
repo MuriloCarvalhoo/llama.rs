@@ -2,7 +2,7 @@
 //! `llama-eval-callback` do llama.cpp.
 #[allow(unsafe_code)]
 fn main() {
-    let path = "/home/murilo/llama.rs/models/Qwen3.8-27B-Q5_K_M.gguf";
+    let path = "models/Qwen3.8-27B-Q5_K_M.gguf";
     let file = std::fs::File::open(path).unwrap();
     let bytes = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     let f = gguf::GgufFile::parse(&bytes).unwrap();
@@ -23,7 +23,10 @@ fn main() {
         let m = v.len();
         println!(
             "{nome}: [{:.4}, {:.4}, {:.4}, ..., {:.4}] soma={:.6}",
-            v[0], v[1], v[2], v[m - 1],
+            v[0],
+            v[1],
+            v[2],
+            v[m - 1],
             v.iter().sum::<f32>()
         );
     };
@@ -53,7 +56,13 @@ fn main() {
     let da = aux.layers[0].delta.as_ref().unwrap();
     let proj = |w: &[f32], nh: usize| -> Vec<f32> {
         (0..nh)
-            .map(|h| w[h * n..(h + 1) * n].iter().zip(&x).map(|(a, b)| a * b).sum())
+            .map(|h| {
+                w[h * n..(h + 1) * n]
+                    .iter()
+                    .zip(&x)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
             .collect()
     };
     let alpha: Vec<f32> = proj(&da.alpha, dn.n_v_heads);
@@ -71,8 +80,7 @@ fn main() {
 
     // Convolução causal com janela zerada (primeiro token) e SiLU.
     let mut janela = vec![0f32; conv_dim * (dn.d_conv - 1)];
-    let conv_bruto =
-        llama_model::delta_net::conv1d_step(&mut janela, &qkv, &da.conv1d, dn.d_conv);
+    let conv_bruto = llama_model::delta_net::conv1d_step(&mut janela, &qkv, &da.conv1d, dn.d_conv);
     let conv: Vec<f32> = conv_bruto
         .iter()
         .map(|&v| llama_model::delta_net::silu(v))

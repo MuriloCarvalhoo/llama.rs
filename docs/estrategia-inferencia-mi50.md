@@ -52,7 +52,7 @@ o que medimos no nosso próprio spike (§ `bench-results/fase8-0-baseline-14b-e-
 ## 1. Quantização: o ganho é real, mas menor do que a conta sugere
 
 > **Correção de 2026-08-14.** A versão original desta seção projetava Q4_K_M em ~71 tok/s assumindo
-> `tok/s ∝ 1/bytes`. Os benchmarks da própria máquina (`/home/murilo/llama.cpp/ORNITH-GFX906-NOTES.md`)
+> `tok/s ∝ 1/bytes`. Benchmarks de referência do llama.cpp neste mesmo hardware (gfx906)
 > mostram que **isso não vale para K-quants aqui**: o Qwen3.6-27B denso roda a 42 ms/token contra um
 > teto de banda de ~15 ms — **compute-bound**, porque a Radeon Pro VII tem HBM2 rápida e pouco
 > compute (sem matrix cores), e K-quants custam mais ALU para desquantizar que o Q8_0.
@@ -196,8 +196,8 @@ Sinal relevante: existem ao menos 4–5 projetos "engine LLM em Rust + Vulkan do
 
 ## 7. Veredito, revisado com os benchmarks da própria máquina
 
-> Esta seção foi **reescrita em 2026-08-14** depois de ler
-> `/home/murilo/llama.cpp/{ORNITH-GFX906-NOTES.md,BUILD-GFX906.md,benches/radeon-pro-vii-gfx906/}`,
+> Esta seção foi **reescrita em 2026-08-14** depois de ler os benchmarks de referência do
+> llama.cpp (`ORNITH-GFX906-NOTES.md`, `BUILD-GFX906.md`, `benches/radeon-pro-vii-gfx906/`),
 > que medem este hardware exato. Duas conclusões anteriores caíram.
 
 ### O que roda mais rápido nesta máquina (medido, não estimado)

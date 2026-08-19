@@ -16,70 +16,27 @@
 // Paralelizacao: o superbloco tem 8 sub-blocos de 32 elementos, cada um com escala e
 // minimo proprios — entao 8 lanes cobrem um superbloco e as 64 lanes do wave cobrem 8.
 //
-// **Ler em uvec4 e o que fecha a banda.** Com loads escalares cada lane emitia 17 requests
-// de 4 B por superbloco (1 de d/dmin, 3 de scales, 8 de qh, 8 de qs = 68 B); em uvec4 sao
-// **5 requests de 16 B** — os mesmos 80 B, com 3.4x menos requests ao L1. O kernel nao
-// estava limitado por bytes de HBM (o L2 ja deduplicava a redundancia entre lanes), estava
-// limitado pela taxa de requests: medimos 465 GB/s efetivos de 717 GB/s de pico.
-//
-// Ja medimos a alternativa de reduzir a *redundancia* em vez dos requests (uma lane
-// cuidando do par de sub-blocos que compartilha os mesmos bytes de qs, 4 lanes por
-// superbloco): ficou **4% mais lento**. Com 20 superblocos por linha — o n_embd/256 do
-// 32B — 4 lanes por superbloco deixam 16 das 64 lanes ociosas na ultima rodada, e a
-// ociosidade custa mais do que a leitura duplicada, que o cache absorve.
-//
-// Duas linhas por wave amortizam o resto: a ativacao (2 ivec4 + a escala) e a soma dos
-// int8 do bloco valem para as duas, entao os requests por linha caem de 8 para 6.5 —
-// mediu **-8%** no kernel. Com QUATRO linhas piora 3%: os acumuladores extras derrubam a
-// ocupancia, e ai a latencia dos loads deixa de ser escondida.
+// Leitura em uvec4 (em vez de escalar) e duas linhas de saida por wave sao o que fecham a
+// maior parte da banda — o kernel e limitado pela taxa de requests ao L1, nao pelos bytes
+// em si. Alternativas medidas e descartadas em `docs/performance-tuning.md`.
 //
 // A ativacao chega ja quantizada em int8 por `quantize_x.comp`, em blocos de 32 elementos.
 // Isso casa exatamente com o sub-bloco do Q5_K, o que permite usar o mesmo dot empacotado
 // (`V_DOT4_I32_I8`) do caminho Q8_0 — 4 MACs por instrucao.
 //
 // O truque que torna isso barato: num uint de qs os 4 nibbles ja estao em *bytes
-// separados*, entao `qsw & 0x0F0F0F0F` produz o operando do dot em UMA instrucao. A versao
-// anterior desempacotava byte a byte em f32 e gastava ~38 instrucoes VALU por 4 elementos.
+// separados*, entao `qsw & 0x0F0F0F0F` produz o operando do dot em UMA instrucao.
 //
 // O minimo sai do laco: soma((d*sc*q - dmin*m) * x) = d*sc*soma(q*x) - dmin*m*soma(x),
 // e soma(x) vem de um segundo dot contra 0x01010101 sobre o mesmo `xq` ja em registrador.
-//
-// Ja tentamos pre-calcular soma(x) no `quantize_x.comp` (ela nao depende dos pesos, entao
-// e recalculada por todas as n_out linhas) de duas formas: em buffer proprio, +6%; e
-// empacotada num `vec2` junto da escala que este laco ja lia — sem load adicional, so 8 B
-// em vez de 4 — ainda +3%. Trocar ~8 instrucoes VALU por bytes lidos e mau negocio aqui:
-// depois do dot empacotado o kernel e limitado por memoria, nao por ALU.
 
 // Geometria do dispatch, por specialization constant — os dois valores mudam a pressao de
 // registrador e com ela a ocupancia, e o melhor par depende do modelo. Ver `MATVEC_GEOM`
-// no Rust, e `scripts/tune-matvec.sh` para a varredura.
+// no Rust, `scripts/tune-matvec.sh` para a varredura, e `docs/performance-tuning.md` para
+// os numeros medidos e por que mais ocupancia nao ajuda aqui.
 //
 //   WG_SIZE        lanes por workgroup (multiplo de 64; 256 = 4 waves)
 //   ROWS_PER_WAVE  linhas de saida que cada wave acumula
-//
-// Varredura medida no Qwen2.5-32B (2x MI50, `scripts/tune-matvec.sh`), tok/s de ponta a
-// ponta e ocupancia relatada pelo RADV:
-//
-//   geom     VGPRs  waves/SIMD  tok/s
-//   64,1        36      7       18.26
-//   128,1       36      7       18.21
-//   256,1       36      7       17.83
-//   64,2        40      6       19.30
-//   128,2       40      6       19.26
-//   256,2       40      6       19.32   <- default
-//   512,2       40      6       19.32
-//   256,3       40      6       19.25
-//   256,4       40      6       19.07
-//   1024,1      64      4       16.93
-//
-// **Mais ocupancia e pior aqui.** Com 1 linha por wave o kernel cai para 36 VGPRs e a GPU
-// passa a caber 7 waves por SIMD em vez de 6 — e mede 6% MAIS LENTO. O que decide nao e ter
-// mais waves em voo, e reler a ativacao menos vezes: com 2 linhas os loads de xq/xd valem
-// para as duas e os requests por linha caem de 8 para 6.5. A partir de 3 linhas o ganho
-// para (os acumuladores ja nao cabem sem custo) e a curva volta a descer.
-//
-// O tamanho do workgroup quase nao importa entre 64 e 512, desde que ROWS_PER_WAVE=2; so
-// 1024 destoa, porque 64 VGPRs derrubam a ocupancia para 4.
 layout(local_size_x_id = 0) in;
 layout(constant_id = 0) const uint WG_SIZE = 256u;
 layout(constant_id = 1) const uint ROWS_PER_WAVE = 2u;

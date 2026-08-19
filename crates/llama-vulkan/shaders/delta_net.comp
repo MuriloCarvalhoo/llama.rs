@@ -20,12 +20,8 @@
 // internos viram `subgroupAdd`. Assim o estado e lido **uma vez** e escrito **uma vez**,
 // e lanes vizinhas leem posicoes vizinhas da coluna — acesso coalescido.
 //
-// A versao anterior deste shader punha uma thread por *linha*, cada uma percorrendo os
-// seus `d` floats: sem reducao nenhuma, o que parecia melhor, mas com dois problemas que
-// custam mais que a reducao — o estado era lido e escrito **duas vezes** por token (uma
-// para o decaimento e o produto com k, outra para a atualizacao e o produto com q), e as
-// 64 lanes de uma wave liam endereços separados por `d * 4` bytes, ou seja, uma linha de
-// cache inteira por lane. O desenho atual segue o kernel CUDA do llama.cpp.
+// O desenho segue o kernel CUDA de referência do llama.cpp; o desenho anterior (thread por
+// linha, sem redução) e por que ele custava mais estão em `docs/performance-tuning.md`.
 
 layout(local_size_x = 64, local_size_y = 4) in;  // 4 colunas por workgroup, uma wave cada
 
