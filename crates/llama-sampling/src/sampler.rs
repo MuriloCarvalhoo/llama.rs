@@ -1,6 +1,7 @@
 //! Estratégias de amostragem: greedy, temperatura, top-k, top-p.
 
 use rand::Rng;
+use rayon::prelude::*;
 
 /// Estratégia de amostragem para selecionar o próximo token a partir de logits.
 #[derive(Clone, Debug)]
@@ -64,20 +65,50 @@ impl Sampler {
 }
 
 /// Returns indices of the top-k logits (by value), unordered.
-// SAFETY: k <= indexed.len() because of the .min(logits.len()) clamp below.
-#[allow(clippy::indexing_slicing)]
+///
+/// Paraleliza com `rayon`: cada chunk seleciona seu próprio top-k local (barato — `k`
+/// é pequeno) e um merge final reduz os candidatos ao top-k global. Fazer isso numa
+/// única thread sobre o vocabulário inteiro (~250k logits no Qwen3.8) media ~8.6
+/// ms/token nesta máquina — mais caro que qualquer op de GPU do decode.
 fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
     let k = k.min(logits.len()).max(1);
-    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    // partial sort: move top-k to the front
-    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-    indexed[..k].iter().map(|(i, _)| *i).collect()
+    if k >= logits.len() {
+        return (0..logits.len()).collect();
+    }
+    let n_chunks = rayon::current_num_threads().max(1);
+    let chunk_size = logits.len().div_ceil(n_chunks).max(k).max(1);
+    let mut candidates: Vec<(usize, f32)> = logits
+        .par_chunks(chunk_size)
+        .enumerate()
+        .flat_map_iter(|(ci, chunk)| {
+            let base = ci * chunk_size;
+            let mut local: Vec<(usize, f32)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (base + i, v))
+                .collect();
+            let kk = k.min(local.len());
+            if kk < local.len() {
+                local.select_nth_unstable_by(kk - 1, |a, b| b.1.total_cmp(&a.1));
+                local.truncate(kk);
+            }
+            local
+        })
+        .collect();
+    let kk = k.min(candidates.len());
+    if kk < candidates.len() {
+        candidates.select_nth_unstable_by(kk - 1, |a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(kk);
+    }
+    candidates.into_iter().map(|(i, _)| i).collect()
 }
 
 /// Returns indices whose cumulative probability (sorted desc) covers at least `p`.
 fn top_p_indices(probs: &[f32], p: f32) -> Vec<usize> {
     let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    // Sort paralelo: mesma semântica do `sort_unstable_by` serial, mais rápido no
+    // vocabulário inteiro (top_p precisa da ordem completa, não só do top-k).
+    indexed.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let mut cumsum = 0.0_f32;
     let mut result = Vec::new();
     for (i, prob) in &indexed {
