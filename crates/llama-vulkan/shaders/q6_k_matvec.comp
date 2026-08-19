@@ -34,8 +34,13 @@
 // ints de xq, a escala e a soma dos int8) e a mesma para as duas: os requests por linha
 // caem de 15 para 12.5.
 layout(local_size_x = 256) in;
+// Colunas (tokens) acumuladas contra o mesmo peso ja lido. COLS=1 e o decode; COLS>1 e o
+// prefill em batch — ver `docs/prefill-em-batch.md`. Diferente do Q4_K/Q5_K, aqui a
+// geometria e fixa no shader, entao COLS e o unico `constant_id`.
+layout(constant_id = 0) const uint COLS = 1u;
 const uint WAVES_PER_WG = 4u;
 const uint ROWS_PER_WAVE = 2u;
+const uint MAX_COLS = 8u;   // teto de colunas por dispatch
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uint w[]; } weight_buf;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
@@ -68,22 +73,19 @@ int sb_scale(uint base_u, uint j) {
     return int(sb_byte(base_u, 192u + j) << 24u) >> 24;
 }
 
-// Contribuicao de um superbloco de uma linha: le ql/qh/escala e faz os 4 dots contra a
-// ativacao ja em registrador.
-float linha(uint base_u, uint sub, uint ql_u0, uint qh_u0, uint shift, bool hi_nibble,
-            ivec4 xw, int isx, float xd) {
+// Le ql/qh/escala de um superbloco de uma linha e devolve os 4 pesos ja empacotados em
+// bytes, prontos para o dot. Separado do produto porque o mesmo peso e consumido por COLS
+// colunas: e ler isto uma vez, e nao uma vez por token, que faz o batch valer.
+void desempacota(uint base_u, uint sub, uint ql_u0, uint qh_u0, uint shift, bool hi_nibble,
+                 out float ds, out int wp[4]) {
     float d = unpackHalf2x16(weight_buf.w[base_u + 52u]).x; // bytes 208..209
-    float ds = d * float(sb_scale(base_u, sub));
-
-    int isum = 0;  // soma q*xq
+    ds = d * float(sb_scale(base_u, sub));
     for (uint t = 0u; t < 4u; t++) {
         uint qlw = weight_buf.w[base_u + ql_u0 + t];
         uint qhw = weight_buf.w[base_u + qh_u0 + t];
-        uint wp = ((hi_nibble ? (qlw >> 4u) : qlw) & 0x0F0F0F0Fu)
-                | (((qhw >> shift) & 0x03030303u) << 4u);
-        isum = dotPacked4x8AccSatEXT(int(wp), xw[t], isum);
+        wp[t] = int(((hi_nibble ? (qlw >> 4u) : qlw) & 0x0F0F0F0Fu)
+                  | (((qhw >> shift) & 0x03030303u) << 4u));
     }
-    return ds * xd * float(isum - 32 * isx);
 }
 
 void main() {
@@ -96,6 +98,8 @@ void main() {
     uint n_sb = pc.n_in / 256u;
     uint linha_u = n_sb * UINTS_PER_SB;
     uint row_u = row * linha_u;
+    uint n_int = pc.n_in / 4u;    // ints de ativacao por coluna (4 int8 por int)
+    uint n_blk = pc.n_in / 32u;   // blocos de ativacao por coluna
 
     uint sub = lane & 15u;        // qual sub-bloco de 16 elementos (0..15)
     uint sb_in_grp = lane >> 4u;  // qual superbloco do grupo de 4
@@ -114,8 +118,9 @@ void main() {
     uint ql_u0 = (half_i * 64u + (quarter & 1u) * 32u + idx16) >> 2u;
     uint qh_u0 = (128u + half_i * 32u + idx16) >> 2u;
 
-    float acc = 0.0;
-    float acc_b = 0.0;
+    float acc[MAX_COLS];
+    float acc_b[MAX_COLS];
+    for (uint c = 0u; c < MAX_COLS; c++) { acc[c] = 0.0; acc_b[c] = 0.0; }
     for (uint sb0 = 0u; sb0 < n_sb; sb0 += 4u) {
         uint sbi = sb0 + sb_in_grp;
         if (sbi >= n_sb) { continue; }
@@ -127,27 +132,48 @@ void main() {
         uint blk = sbi * 8u + (sub >> 1u);
         uint xq0 = blk * 8u + (sub & 1u) * 4u;
 
-        ivec4 xw = ivec4(xq_buf.xq[xq0], xq_buf.xq[xq0 + 1u],
-                         xq_buf.xq[xq0 + 2u], xq_buf.xq[xq0 + 3u]);
-        float xd = xd_buf.xd[blk];
-        // soma xq: so depende da ativacao, entao vale para as duas linhas.
-        int isx = 0;
-        for (uint t = 0u; t < 4u; t++) {
-            isx = dotPacked4x8AccSatEXT(0x01010101, xw[t], isx);
+        // O peso das duas linhas: lido uma vez, consumido pelas COLS colunas abaixo.
+        float ds_a;
+        int wp_a[4];
+        desempacota(base_u, sub, ql_u0, qh_u0, shift, hi_nibble, ds_a, wp_a);
+
+        float ds_b = 0.0;
+        int wp_b[4];
+        for (uint t = 0u; t < 4u; t++) { wp_b[t] = 0; }
+        if (tem_par) {
+            desempacota(base_u + linha_u, sub, ql_u0, qh_u0, shift, hi_nibble, ds_b, wp_b);
         }
 
-        acc += linha(base_u, sub, ql_u0, qh_u0, shift, hi_nibble, xw, isx, xd);
-        if (tem_par) {
-            acc_b += linha(base_u + linha_u, sub, ql_u0, qh_u0, shift, hi_nibble, xw, isx, xd);
+        for (uint c = 0u; c < COLS; c++) {
+            uint cq = c * n_int + xq0;
+            ivec4 xw = ivec4(xq_buf.xq[cq], xq_buf.xq[cq + 1u],
+                             xq_buf.xq[cq + 2u], xq_buf.xq[cq + 3u]);
+            float xd = xd_buf.xd[c * n_blk + blk];
+
+            int isx = 0;
+            int isum_a = 0;
+            int isum_b = 0;
+            for (uint t = 0u; t < 4u; t++) {
+                isx = dotPacked4x8AccSatEXT(0x01010101, xw[t], isx);
+                isum_a = dotPacked4x8AccSatEXT(wp_a[t], xw[t], isum_a);
+                isum_b = dotPacked4x8AccSatEXT(wp_b[t], xw[t], isum_b);
+            }
+            acc[c] += ds_a * xd * float(isum_a - 32 * isx);
+            if (tem_par) {
+                acc_b[c] += ds_b * xd * float(isum_b - 32 * isx);
+            }
         }
     }
 
-    acc = subgroupAdd(acc);
-    acc_b = subgroupAdd(acc_b);
-    if (lane == 0u) {
-        out_buf.y[row] = pc.tem_bias != 0u ? acc + bias_buf.b[row] : acc;
-        if (tem_par) {
-            out_buf.y[row + 1u] = pc.tem_bias != 0u ? acc_b + bias_buf.b[row + 1u] : acc_b;
+    for (uint c = 0u; c < COLS; c++) {
+        float s_a = subgroupAdd(acc[c]);
+        float s_b = subgroupAdd(acc_b[c]);
+        if (lane == 0u) {
+            uint o = c * pc.n_out;
+            out_buf.y[o + row] = pc.tem_bias != 0u ? s_a + bias_buf.b[row] : s_a;
+            if (tem_par) {
+                out_buf.y[o + row + 1u] = pc.tem_bias != 0u ? s_b + bias_buf.b[row + 1u] : s_b;
+            }
         }
     }
 }

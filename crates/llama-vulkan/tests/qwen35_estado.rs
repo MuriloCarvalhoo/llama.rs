@@ -161,6 +161,7 @@ fn buffers_da_camada_0() {
             &normed,
             n_in,
             cfg.n_embd,
+            1,
         )
         .unwrap();
         eprintln!("  isolado={:?}", &iso[..3]);
@@ -218,6 +219,7 @@ fn matvec_ssm_out_bate_com_a_cpu() {
         &x,
         n_in,
         n_out,
+        1,
     )
     .expect("dispatch");
 

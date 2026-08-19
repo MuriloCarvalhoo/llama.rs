@@ -1083,8 +1083,9 @@ fn q6_k_matvec_gpu_bate_com_a_referencia_de_cpu() {
         .map(|i| ((i % 23) as f32 - 11.0) * 0.027)
         .collect();
 
-    let gpu = llama_vulkan::matmul::dispatch_q6_k_matvec(&ctx, &phys[0], &dev, &w, &x, n_in, n_out)
-        .expect("dispatch Q6_K");
+    let gpu =
+        llama_vulkan::matmul::dispatch_q6_k_matvec(&ctx, &phys[0], &dev, &w, &x, n_in, n_out, 1)
+            .expect("dispatch Q6_K");
 
     let row_bytes = sb_per_row * 210;
     let x_int8 = quant_dequant_x(&x);
@@ -1158,7 +1159,7 @@ fn q5_k_matvec_caso(
         .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
         .collect();
 
-    let gpu = llama_vulkan::matmul::dispatch_q5_k_matvec(ctx, phys, dev, &w, &x, n_in, n_out)
+    let gpu = llama_vulkan::matmul::dispatch_q5_k_matvec(ctx, phys, dev, &w, &x, n_in, n_out, 1)
         .expect("dispatch Q5_K");
 
     // Referência: desquantiza cada linha e faz o produto interno em f32.
@@ -1228,7 +1229,7 @@ fn q4_k_matvec_caso(
         .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
         .collect();
 
-    let gpu = llama_vulkan::matmul::dispatch_q4_k_matvec(ctx, phys, dev, &w, &x, n_in, n_out)
+    let gpu = llama_vulkan::matmul::dispatch_q4_k_matvec(ctx, phys, dev, &w, &x, n_in, n_out, 1)
         .expect("dispatch Q4_K");
 
     let row_bytes = sb_per_row * 144;
@@ -1253,4 +1254,135 @@ fn q4_k_matvec_caso(
         &gpu[..4],
         &cpu[..4]
     );
+}
+
+/// Qual K-quant o caso de batch exercita. Os três têm o mesmo contrato de `cols`, mas
+/// layouts de superbloco (e, no Q6_K, `constant_id`) diferentes.
+#[derive(Clone, Copy)]
+enum QuantK {
+    Q4,
+    Q5,
+    Q6,
+}
+
+impl QuantK {
+    fn bytes_por_sb(self) -> usize {
+        match self {
+            Self::Q4 => 144,
+            Self::Q5 => 176,
+            Self::Q6 => 210,
+        }
+    }
+
+    fn nome(self) -> &'static str {
+        match self {
+            Self::Q4 => "Q4_K",
+            Self::Q5 => "Q5_K",
+            Self::Q6 => "Q6_K",
+        }
+    }
+
+    /// Pesos determinísticos com cabeçalho são: escalas f16 moderadas para o resultado não
+    /// estourar, e todo o resto pseudoaleatório para cobrir nibbles, qh e escalas de 6 bits.
+    fn pesos(self, n_out: usize, sb_per_row: usize) -> Vec<u8> {
+        let sbb = self.bytes_por_sb();
+        let mut w = vec![0u8; n_out * sb_per_row * sbb];
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(101).wrapping_add(i / 7) % 251) as u8;
+        }
+        for sb in 0..n_out * sb_per_row {
+            let o = sb * sbb;
+            match self {
+                Self::Q4 | Self::Q5 => {
+                    w[o..o + 2].copy_from_slice(&half::f16::from_f32(0.0123).to_le_bytes());
+                    w[o + 2..o + 4].copy_from_slice(&half::f16::from_f32(0.0045).to_le_bytes());
+                }
+                Self::Q6 => {
+                    for j in 0..16 {
+                        w[o + 192 + j] = ((j as i32 * 7 % 40) - 20) as i8 as u8;
+                    }
+                    w[o + 208..o + 210].copy_from_slice(&half::f16::from_f32(0.0091).to_le_bytes());
+                }
+            }
+        }
+        w
+    }
+
+    fn dispatch(
+        self,
+        ctx: &llama_vulkan::VulkanContext,
+        phys: &llama_vulkan::VulkanPhysicalDevice,
+        dev: &llama_vulkan::VulkanDevice,
+        w: &[u8],
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        cols: usize,
+    ) -> Vec<f32> {
+        use llama_vulkan::matmul::{
+            dispatch_q4_k_matvec, dispatch_q5_k_matvec, dispatch_q6_k_matvec,
+        };
+        let r = match self {
+            Self::Q4 => dispatch_q4_k_matvec(ctx, phys, dev, w, x, n_in, n_out, cols),
+            Self::Q5 => dispatch_q5_k_matvec(ctx, phys, dev, w, x, n_in, n_out, cols),
+            Self::Q6 => dispatch_q6_k_matvec(ctx, phys, dev, w, x, n_in, n_out, cols),
+        };
+        r.unwrap_or_else(|e| panic!("dispatch {} cols={cols} falhou: {e:?}", self.nome()))
+    }
+}
+
+#[test]
+fn matvec_k_em_batch_bate_coluna_a_coluna() {
+    // Etapa 1 do prefill em batch (docs/prefill-em-batch.md): com COLS>1 o shader lê cada
+    // peso uma vez e acumula contra COLS ativações. O invariante é ser indistinguível de
+    // COLS chamadas separadas — cada coluna faz os mesmos dots na mesma ordem, então a
+    // igualdade aqui é exata, não aproximada. Um erro de indexação por coluna (ler sempre
+    // a coluna 0, ou escrever a saída embaralhada) quebra isto e não quebra o teste de
+    // coluna única contra a referência de CPU.
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let dev = llama_vulkan::VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    let (n_in, n_out) = (1024usize, 16usize);
+    let sb_per_row = n_in / 256;
+
+    for q in [QuantK::Q4, QuantK::Q5, QuantK::Q6] {
+        let w = q.pesos(n_out, sb_per_row);
+        for cols in [2usize, 4, 8] {
+            // Colunas propositalmente diferentes entre si: uma coluna repetida esconderia
+            // um erro de indexação que sempre lesse a coluna 0.
+            let xs: Vec<Vec<f32>> = (0..cols)
+                .map(|c| {
+                    (0..n_in)
+                        .map(|i| ((i % (29 + c)) as f32 - 14.0) * (0.031 + c as f32 * 0.004))
+                        .collect()
+                })
+                .collect();
+            let plano: Vec<f32> = xs.concat();
+
+            let batch = q.dispatch(&ctx, &phys[0], &dev, &w, &plano, n_in, n_out, cols);
+            assert_eq!(batch.len(), cols * n_out, "{} cols={cols}", q.nome());
+
+            for (c, x) in xs.iter().enumerate() {
+                let sozinha = q.dispatch(&ctx, &phys[0], &dev, &w, x, n_in, n_out, 1);
+                assert_eq!(
+                    &batch[c * n_out..(c + 1) * n_out],
+                    &sozinha[..],
+                    "{}: coluna {c} de {cols} divergiu do matvec de coluna única",
+                    q.nome()
+                );
+            }
+            eprintln!(
+                "{} batch COLS={cols}: {cols} colunas iguais ao caminho de coluna única",
+                q.nome()
+            );
+        }
+    }
 }

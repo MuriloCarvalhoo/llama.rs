@@ -302,6 +302,8 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
 /// bytes = 44 uints, então as leituras de 32 bits ficam alinhadas naturalmente. E a ativação
 /// vai em f32 — as escalas por sub-bloco do K-quant tornariam o dot empacotado em int8 bem
 /// mais complicado, e o ganho dele foi medido em ~0% neste kernel.
+///
+/// `cols`: ver `dispatch_q4_k_matvec`.
 pub fn dispatch_q5_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -310,9 +312,12 @@ pub fn dispatch_q5_k_matvec(
     x_f32: &[f32],
     n_in: usize,
     n_out: usize,
+    cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
     // Q5_K sobe cru: 176 bytes por superbloco já são 44 uints alinhados.
     let (wg, rows) = crate::resident_forward::matvec_geom();
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
     dispatch_k_matvec(
         ctx,
         phys,
@@ -322,13 +327,18 @@ pub fn dispatch_q5_k_matvec(
         x_f32,
         n_in,
         n_out,
+        cols,
         wg / 64 * rows,
-        &[(0, wg), (1, rows)],
+        &[(0, wg), (1, rows), (2, cols_u32)],
     )
 }
 
 /// Matvec Q4_K numa GPU: mesma estrutura do Q5_K (`dispatch_q5_k_matvec`), sem o 5º bit —
 /// superbloco de 144 B = 36 uints, já alinhado, sobe cru.
+///
+/// `cols` é quantas ativações de `n_in` estão concatenadas em `x_f32`: 1 reproduz o matvec
+/// do decode, N processa N tokens contra uma única leitura de cada peso (`docs/prefill-em-batch.md`).
+/// A saída sai coluna a coluna: `y[c * n_out + linha]`.
 pub fn dispatch_q4_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -337,8 +347,11 @@ pub fn dispatch_q4_k_matvec(
     x_f32: &[f32],
     n_in: usize,
     n_out: usize,
+    cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
     let (wg, rows) = crate::resident_forward::matvec_geom();
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
     dispatch_k_matvec(
         ctx,
         phys,
@@ -348,14 +361,18 @@ pub fn dispatch_q4_k_matvec(
         x_f32,
         n_in,
         n_out,
+        cols,
         wg / 64 * rows,
-        &[(0, wg), (1, rows)],
+        &[(0, wg), (1, rows), (2, cols_u32)],
     )
 }
 
 /// Matvec Q6_K. O superbloco tem 210 bytes, que não é múltiplo de 4 — cada um é alinhado
 /// em 212 bytes no upload para as leituras de 32 bits do shader ficarem alinhadas, o mesmo
 /// motivo do repack 34 → 36 do Q8_0.
+///
+/// `cols`: ver `dispatch_q4_k_matvec`. Aqui a geometria é fixa no shader, então `COLS` é o
+/// `constant_id` 0 — e não o 2, como nos outros dois K-quant.
 pub fn dispatch_q6_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -364,12 +381,15 @@ pub fn dispatch_q6_k_matvec(
     x_f32: &[f32],
     n_in: usize,
     n_out: usize,
+    cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
     let n_sb = w_bytes.len() / 210;
     let mut padded = vec![0u8; n_sb * 212];
     for i in 0..n_sb {
         padded[i * 212..i * 212 + 210].copy_from_slice(&w_bytes[i * 210..(i + 1) * 210]);
     }
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
     dispatch_k_matvec(
         ctx,
         phys,
@@ -379,8 +399,9 @@ pub fn dispatch_q6_k_matvec(
         x_f32,
         n_in,
         n_out,
+        cols,
         8, // 4 waves x 2 linhas por wave, fixas no shader
-        &[],
+        &[(0, cols_u32)],
     )
 }
 
@@ -397,6 +418,9 @@ fn dispatch_k_matvec(
     x_f32: &[f32],
     n_in: usize,
     n_out: usize,
+    // `cols`: quantas ativações de `n_in` vêm concatenadas em `x_f32`. 1 no decode; N no
+    // prefill em batch, onde a saída sai como `cols` blocos de `n_out` (coluna a coluna).
+    cols: usize,
     rows_por_wg: u32,
     // `spec`: specialization constants da geometria. Têm de ser as mesmas com que a pipeline
     // residente é criada — o shader não tem default utilizável para `local_size_x_id`.
@@ -446,7 +470,7 @@ fn dispatch_k_matvec(
     let (xq_buf, xq_mem) = upload(xq_bytes)?;
     let (xd_buf, xd_mem) = upload(xd_bytes)?;
 
-    let y_size = (n_out * size_of::<f32>()) as vk::DeviceSize;
+    let y_size = (cols * n_out * size_of::<f32>()) as vk::DeviceSize;
     let y_buf = create_buf(
         d,
         y_size,
@@ -577,8 +601,8 @@ fn dispatch_k_matvec(
         let read_mem = alloc_and_bind(ctx, phys, d, read, true)?;
         one_shot_copy(d, dev.queue, dev.cmd_pool, y_buf, read, y_size)?;
         let ptr = d.map_memory(read_mem, 0, y_size, vk::MemoryMapFlags::empty())?;
-        let mut v = vec![0f32; n_out];
-        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), n_out);
+        let mut v = vec![0f32; cols * n_out];
+        std::ptr::copy_nonoverlapping(ptr.cast::<f32>(), v.as_mut_ptr(), cols * n_out);
         d.unmap_memory(read_mem);
         d.destroy_buffer(read, None);
         d.free_memory(read_mem, None);
