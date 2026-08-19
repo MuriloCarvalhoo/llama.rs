@@ -176,4 +176,24 @@ else
     cargo build --release -p llama-cli
 fi
 
-exec "$BIN" -m "$MODELO" ${backend[@]+"${backend[@]}"} ${ARGS[@]+"${ARGS[@]}"}
+# ── NUMA ────────────────────────────────────────────────────────────────────
+# Sem isto a máquina *inteira* trava ao carregar um modelo grande, e o processo morre por
+# OOM com dezenas de GB livres. A máquina tem dois nós (uma GPU em cada); as alocações caem
+# todas no nó da CPU que roda o processo, esse nó estoura — o desktop já ocupa a maior parte
+# dele — e o kernel não faz fallback para o outro. O `gpu_reclaim` do amdgpu, que reporta
+# valores impossíveis (283 GB em 62 GB de RAM), faz o kswapd girar num shrinker que não
+# devolve nada: o PSI mostra `memory full`, ou seja todas as tarefas bloqueadas ao mesmo
+# tempo — daí o congelamento sem nada aparecer em 100%.
+#
+# `--interleave=all` espalha as alocações pelos dois nós. Medido: as três políticas NUMA
+# (interleave, membind, preferred) dão o mesmo tok/s, porque no decode residente os pesos
+# já estão na VRAM — então isto não distorce benchmark, só evita o travamento.
+numa=()
+if command -v numactl >/dev/null; then
+    numa=(numactl --interleave=all)
+else
+    echo "AVISO: numactl não encontrado — com modelo grande o sistema pode travar por" >&2
+    echo "       esgotar um único nó NUMA (pacote: numactl)." >&2
+fi
+
+exec ${numa[@]+"${numa[@]}"} "$BIN" -m "$MODELO" ${backend[@]+"${backend[@]}"} ${ARGS[@]+"${ARGS[@]}"}
