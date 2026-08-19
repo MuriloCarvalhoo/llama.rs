@@ -1,4 +1,4 @@
-{
+{  
   "enabledPlugins": {
     "ecc@ecc": false,
     "rust-analyzer-lsp@claude-plugins-official": true
