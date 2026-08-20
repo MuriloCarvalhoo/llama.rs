@@ -1535,3 +1535,182 @@ fn attention_em_batch_respeita_a_mascara_causal() {
         }
     }
 }
+
+/// A norma fundida em batch tem que dar, token a token, exatamente o mesmo que N chamadas
+/// de um token só.
+///
+/// São dois dispatches encadeados (`NormFused` acumula as parciais, `NormP2` fecha a
+/// redução e quantiza), e o batch os separa por token na dimensão Y — as parciais de um
+/// token não podem vazar para o outro. O layout de saída de `xq`/`xd` também é conferido
+/// aqui, porque é o que o matvec em batch lê: bloco `b` da coluna `t` em `t * n_blk + b`.
+#[test]
+fn norma_em_batch_bate_token_a_token() {
+    let Ok(ctx) = llama_vulkan::VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        return;
+    }
+    let fwd = llama_vulkan::ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    for (dim, n_tok) in [(5120usize, 2usize), (5120, 4), (2048, 3)] {
+        let n_blk = dim / 32;
+        // np1_wg do plano: um workgroup por 256 elementos, com teto.
+        let np1 = (u32::try_from(dim.div_ceil(256)).unwrap()).clamp(1, 32);
+        let eps = 1e-6f32;
+
+        let x: Vec<f32> = (0..dim * n_tok)
+            .map(|i| ((i % 61) as f32 - 30.0) * 1e-3)
+            .collect();
+        let r: Vec<f32> = (0..dim * n_tok)
+            .map(|i| ((i % 37) as f32 - 18.0) * 1e-4)
+            .collect();
+        let w: Vec<f32> = (0..dim).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+
+        let p1_push = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&u32::try_from(dim).unwrap().to_le_bytes());
+            v.extend_from_slice(&1u32.to_le_bytes()); // tem_residual
+            v
+        };
+        let p2_push = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&u32::try_from(dim).unwrap().to_le_bytes());
+            v.extend_from_slice(&eps.to_le_bytes());
+            v.extend_from_slice(&np1.to_le_bytes());
+            v
+        };
+
+        // Batch: um dispatch com Y = n_tok.
+        let p1 = fwd
+            .dbg_dn_xy(
+                llama_vulkan::DnPipe::NormFused,
+                &[x.clone(), r.clone(), vec![0f32; np1 as usize * n_tok]],
+                &p1_push,
+                np1,
+                u32::try_from(n_tok).unwrap(),
+            )
+            .expect("norm_fused em batch");
+        let p2 = fwd
+            .dbg_dn_xy(
+                llama_vulkan::DnPipe::NormP2,
+                &[
+                    p1[0].clone(),
+                    w.clone(),
+                    p1[2].clone(),
+                    vec![0f32; dim * n_tok],
+                    vec![0f32; n_blk * 8 * n_tok],
+                    vec![0f32; n_blk * n_tok],
+                ],
+                &p2_push,
+                u32::try_from(n_blk.div_ceil(64)).unwrap(),
+                u32::try_from(n_tok).unwrap(),
+            )
+            .expect("norm_p2 em batch");
+
+        // Referência: cada token sozinho, exatamente como o decode faz.
+        for t in 0..n_tok {
+            let xs = x[t * dim..(t + 1) * dim].to_vec();
+            let rs = r[t * dim..(t + 1) * dim].to_vec();
+            let s1 = fwd
+                .dbg_dn(
+                    llama_vulkan::DnPipe::NormFused,
+                    &[xs, rs, vec![0f32; np1 as usize]],
+                    &p1_push,
+                    np1,
+                )
+                .expect("norm_fused sozinho");
+            let s2 = fwd
+                .dbg_dn(
+                    llama_vulkan::DnPipe::NormP2,
+                    &[
+                        s1[0].clone(),
+                        w.clone(),
+                        s1[2].clone(),
+                        vec![0f32; dim],
+                        vec![0f32; n_blk * 8],
+                        vec![0f32; n_blk],
+                    ],
+                    &p2_push,
+                    u32::try_from(n_blk.div_ceil(64)).unwrap(),
+                )
+                .expect("norm_p2 sozinho");
+
+            // Saída normalizada e escalas: bit a bit, é o mesmo cálculo na mesma ordem.
+            assert_eq!(
+                &p2[3][t * dim..(t + 1) * dim],
+                &s2[3][..],
+                "dim={dim} n_tok={n_tok}: normed do token {t} divergiu"
+            );
+            assert_eq!(
+                &p2[5][t * n_blk..(t + 1) * n_blk],
+                &s2[5][..],
+                "dim={dim} n_tok={n_tok}: escalas do token {t} divergiram"
+            );
+            // `xq` é `int` no shader: comparar os **bits**, porque lido como f32 um
+            // empacotamento de int8 pode formar NaN, e NaN != NaN falharia à toa.
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&p2[4][t * n_blk * 8..(t + 1) * n_blk * 8]),
+                bits(&s2[4][..]),
+                "dim={dim} n_tok={n_tok}: int8 do token {t} divergiu"
+            );
+        }
+        eprintln!("norma batch dim={dim} n_tok={n_tok}: idêntica token a token");
+    }
+}
+
+/// O rope em batch tem que girar cada token pelo seu próprio ângulo.
+///
+/// `pos` no push é a posição do **último** token do bloco, então o token `t` de um bloco de
+/// `n_tok` gira por `pos - (n_tok - 1) + t`. Com n_tok=1 isso é exatamente `pos`, que é o
+/// que o decode sempre fez.
+#[test]
+fn rope_em_batch_usa_a_posicao_de_cada_token() {
+    let Ok(ctx) = llama_vulkan::VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        return;
+    }
+    let fwd = llama_vulkan::ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let (n_head, head_dim, rope_dim) = (8usize, 64usize, 64usize);
+    let freq: Vec<f32> = (0..rope_dim / 2)
+        .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / rope_dim as f32))
+        .collect();
+
+    for (pos0, n_tok) in [(0usize, 2usize), (5, 4), (17, 3)] {
+        let por_tok = n_head * head_dim;
+        let pos_ultimo = pos0 + n_tok - 1;
+        let x: Vec<f32> = (0..por_tok * n_tok)
+            .map(|i| ((i % 53) as f32 - 26.0) * 1e-2)
+            .collect();
+
+        let mut xb = x.clone();
+        let batch = fwd
+            .dbg_rope_xy(
+                &mut xb,
+                n_head,
+                head_dim,
+                rope_dim,
+                &freq,
+                pos_ultimo,
+                u32::try_from(n_tok).unwrap(),
+            )
+            .expect("rope em batch");
+
+        for t in 0..n_tok {
+            let mut xs = x[t * por_tok..(t + 1) * por_tok].to_vec();
+            let um = fwd
+                .dbg_rope(&mut xs, n_head, head_dim, rope_dim, &freq, pos0 + t)
+                .expect("rope de um token");
+            assert_eq!(
+                &batch[t * por_tok..(t + 1) * por_tok],
+                &um[..],
+                "pos0={pos0} n_tok={n_tok}: token {t} girou pelo ângulo errado"
+            );
+        }
+        eprintln!("rope batch pos0={pos0} n_tok={n_tok}: cada token no seu ângulo");
+    }
+}

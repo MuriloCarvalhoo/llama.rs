@@ -28,39 +28,46 @@ layout(push_constant) uniform PC {
 } pc;
 
 void main() {
+    // Token do bloco, pela dimensão Y do dispatch — ver `norm_fused.comp`. O peso da norma
+    // **não** leva offset: é o mesmo para todos os tokens do bloco.
+    uint t = gl_WorkGroupID.y;
+    uint n_blk = pc.dim / 32u;
+
     // Cada lane refaz a soma das parciais em vez de reduzi-las: são poucas (≤ 32 no n_embd
     // dos modelos que rodamos) e assim `escala` sai uniforme sem LDS nem barreira.
     float total = 0.0;
     for (uint k = 0u; k < pc.n_parciais; k++) {
-        total += pb.p[k];
+        total += pb.p[t * pc.n_parciais + k];
     }
     float escala = inversesqrt(total / float(pc.dim) + pc.eps);
 
     uint b = gl_GlobalInvocationID.x;
-    if (b >= pc.dim / 32u) { return; }
-    uint base = b * 32u;
+    if (b >= n_blk) { return; }
+    uint base = t * pc.dim + b * 32u;   // x e o, deslocados pelo token
+    uint wbase = b * 32u;               // w, compartilhado
 
     float amax = 0.0;
     for (uint k = 0u; k < 32u; k++) {
-        float v = xb.x[base + k] * escala * wb.w[base + k];
+        float v = xb.x[base + k] * escala * wb.w[wbase + k];
         ob.o[base + k] = v;
         amax = max(amax, abs(v));
     }
 
     float d_x = amax / 127.0;
     float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
-    xdb.xd[b] = d_x;
+    // Mesmo layout que o matvec em batch lê: bloco `b` da coluna `t` em `t * n_blk + b`.
+    xdb.xd[t * n_blk + b] = d_x;
 
     // Recalcula o normalizado em vez de guardar os 32 valores: `x` e `w` acabaram de ser
     // lidos pela própria lane, então saem do L1, e 32 floats vivos custariam 32 VGPRs.
     for (uint g = 0u; g < 8u; g++) {
         int packed = 0;
         for (uint j = 0u; j < 4u; j++) {
-            uint i = base + g * 4u + j;
-            int q = int(round(xb.x[i] * escala * wb.w[i] * inv));
+            uint d = g * 4u + j;
+            int q = int(round(xb.x[base + d] * escala * wb.w[wbase + d] * inv));
             q = clamp(q, -127, 127);
             packed |= (q & 0xff) << (8u * j);
         }
-        xqb.xq[b * 8u + g] = packed;
+        xqb.xq[(t * n_blk + b) * 8u + g] = packed;
     }
 }

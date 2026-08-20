@@ -43,12 +43,18 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint passo = gl_NumWorkGroups.x * WG;
 
+    // Prefill/verificação em batch: a dimensão Y do dispatch e o token do bloco, o mesmo
+    // truque do `attention.comp`. Cada token tem o seu proprio vetor e o seu proprio
+    // conjunto de parciais; com n_tok=1 tudo colapsa no caminho de decode de antes.
+    uint t = gl_WorkGroupID.y;
+    uint xoff = t * pc.dim;
+
     float ss = 0.0;
     for (uint i = gl_GlobalInvocationID.x; i < pc.dim; i += passo) {
-        float v = xb.x[i];
+        float v = xb.x[xoff + i];
         if (pc.tem_residual != 0u) {
-            v += rb.r[i];
-            xb.x[i] = v;   // a stream residual segue para a próxima camada
+            v += rb.r[xoff + i];
+            xb.x[xoff + i] = v;   // a stream residual segue para a próxima camada
         }
         ss += v * v;
     }
@@ -63,6 +69,6 @@ void main() {
         for (uint k = 0u; k < gl_NumSubgroups; k++) {
             total += partial[k];
         }
-        pb.p[gl_WorkGroupID.x] = total;
+        pb.p[t * gl_NumWorkGroups.x + gl_WorkGroupID.x] = total;
     }
 }

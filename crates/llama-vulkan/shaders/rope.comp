@@ -13,10 +13,16 @@ void main() {
     uint half_rope = pc.rope_dim / 2u;
     uint total = pc.n_head * half_rope;
     if (idx >= total) return;
+    // Batch: a dimensao Y do dispatch e o token do bloco, e `pc.pos` e a posicao do
+    // **ultimo** deles — o mesmo significado que ja tinha com n_tok=1, como no
+    // `attention.comp`. Cada token gira pelo seu proprio angulo.
+    uint t = gl_WorkGroupID.y;
+    uint n_tok = gl_NumWorkGroups.y;
+    float pos_t = pc.pos - float(n_tok - 1u) + float(t);
     uint h = idx / half_rope;
     uint i = idx % half_rope;
-    uint base = h * pc.stride;
-    float theta = pc.pos * fb.f[i];
+    uint base = t * pc.n_head * pc.stride + h * pc.stride;
+    float theta = pos_t * fb.f[i];
     float s = sin(theta);
     float c = cos(theta);
     float a = xb.x[base + 2u * i];

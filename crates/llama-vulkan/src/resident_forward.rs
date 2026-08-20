@@ -458,6 +458,9 @@ pub enum DnPipe {
     Norm,
     /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
     QuantizeX,
+    /// Idem — os dois passos da norma fundida, para testar o batch pela dimensão Y.
+    NormFused,
+    NormP2,
 }
 
 #[derive(Clone, Debug)]
@@ -1421,6 +1424,19 @@ impl<'ctx> ResidentForward<'ctx> {
         push: &[u8],
         groups: u32,
     ) -> Result<Vec<Vec<f32>>, MatmulError> {
+        self.dbg_dn_xy(qual, bufs, push, groups, 1)
+    }
+
+    /// Igual a `dbg_dn`, com a dimensão Y do dispatch exposta — que é como os shaders
+    /// recebem o token do bloco no batch (ver `attention.comp` e `norm_fused.comp`).
+    pub fn dbg_dn_xy(
+        &self,
+        qual: DnPipe,
+        bufs: &[Vec<f32>],
+        push: &[u8],
+        groups: u32,
+        groups_y: u32,
+    ) -> Result<Vec<Vec<f32>>, MatmulError> {
         let d = &self.dev.device;
         let pipe = match qual {
             DnPipe::DeltaNet => &self.delta_net,
@@ -1428,6 +1444,8 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::Gates => &self.dn_gates,
             DnPipe::Norm => &self.dn_norm,
             DnPipe::QuantizeX => &self.quantize_x,
+            DnPipe::NormFused => &self.norm_fused,
+            DnPipe::NormP2 => &self.norm_p2,
         };
         let mut gpu = Vec::with_capacity(bufs.len());
         for b in bufs {
@@ -1442,7 +1460,7 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         let set = self.alloc_set(pipe)?;
         let bindings: Vec<_> = gpu.iter().map(|b| (b.buffer, 0, b.size)).collect();
-        self.dispatch1(pipe, set, &bindings, push, groups)?;
+        self.dispatch_xy(pipe, set, &bindings, push, groups, groups_y)?;
 
         let mut out = Vec::with_capacity(bufs.len());
         for (buf, orig) in gpu.iter().zip(bufs) {
@@ -1595,6 +1613,22 @@ impl<'ctx> ResidentForward<'ctx> {
         freq: &[f32],
         pos: usize,
     ) -> Result<Vec<f32>, MatmulError> {
+        self.dbg_rope_xy(x, n_head, head_dim, rope_dim, freq, pos, 1)
+    }
+
+    /// Igual a `dbg_rope`, com `n_tok` tokens concatenados em `x`. `pos` é a posição do
+    /// **último** deles, que é o significado que o push já tinha com um token só.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_rope_xy(
+        &self,
+        x: &mut [f32],
+        n_head: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        freq: &[f32],
+        pos: usize,
+        n_tok: u32,
+    ) -> Result<Vec<f32>, MatmulError> {
         #[repr(C)]
         struct P {
             n_head: u32,
@@ -1629,12 +1663,13 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 20) };
         let pairs = n_head * (rope_dim / 2);
-        self.dispatch1(
+        self.dispatch_xy(
             &self.rope,
             set,
             &[(xb.buffer, 0, xb.size), (fb.buffer, 0, fb.size)],
             pb,
             Self::groups_for(pairs),
+            n_tok,
         )?;
         let out = self.readback(&xb, x.len())?;
         xb.destroy(d);
