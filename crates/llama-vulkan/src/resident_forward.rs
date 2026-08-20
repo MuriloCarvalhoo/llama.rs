@@ -527,6 +527,20 @@ impl<'ctx> ResidentForward<'ctx> {
         push: &[u8],
         groups: u32,
     ) -> Result<(), MatmulError> {
+        self.dispatch_xy(pipe, set, bindings, push, groups, 1)
+    }
+
+    /// Igual a `dispatch1`, com a dimensão Y do dispatch exposta. Só a atenção usa Y > 1,
+    /// para o prefill em batch: um workgroup por (cabeça, token do bloco).
+    pub(crate) fn dispatch_xy(
+        &self,
+        pipe: &ComputePipeline,
+        set: vk::DescriptorSet,
+        bindings: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)], // (buffer, offset, range)
+        push: &[u8],
+        groups: u32,
+        groups_y: u32,
+    ) -> Result<(), MatmulError> {
         let d = &self.dev.device;
         let dev = &self.dev;
 
@@ -580,7 +594,7 @@ impl<'ctx> ResidentForward<'ctx> {
             if !push.is_empty() {
                 d.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
-            d.cmd_dispatch(cmd, groups, 1, 1);
+            d.cmd_dispatch(cmd, groups, groups_y, 1);
             d.end_command_buffer(cmd)?;
         }
         let submit = vk::SubmitInfo {
@@ -1123,6 +1137,10 @@ impl<'ctx> ResidentForward<'ctx> {
         n_head_kv: usize,
         head_dim: usize,
         total_len: usize,
+        // Tokens do bloco de prefill. 1 reproduz o decode; N processa N tokens, cada um
+        // vendo `total_len - (N-1) + t` posições -- a máscara causal. `q` traz os N blocos
+        // de query concatenados e a saída sai igual.
+        n_tokens: usize,
     ) -> Result<Vec<f32>, MatmulError> {
         // O shader distribui até MAX_DPL=4 dimensões por lane sobre 64 lanes.
         if head_dim > 256 {
@@ -1162,7 +1180,7 @@ impl<'ctx> ResidentForward<'ctx> {
             self.ctx,
             self.phys(),
             d,
-            (n_head * head_dim * 4) as vk::DeviceSize,
+            (n_tokens * n_head * head_dim * 4) as vk::DeviceSize,
         )?;
         self.upload_f32(&qb, q)?;
         self.upload_f32(&kb, k_cache)?;
@@ -1179,7 +1197,7 @@ impl<'ctx> ResidentForward<'ctx> {
             q_stride: head_dim as u32,
         };
         let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 28) };
-        self.dispatch1(
+        self.dispatch_xy(
             &self.attention,
             set,
             &[
@@ -1189,9 +1207,10 @@ impl<'ctx> ResidentForward<'ctx> {
                 (ob.buffer, 0, ob.size),
             ],
             pb,
-            n_head as u32, // 1 workgroup por head
+            n_head as u32,   // 1 workgroup por head...
+            n_tokens as u32, // ...vezes um por token do bloco
         )?;
-        let out = self.readback(&ob, n_head * head_dim)?;
+        let out = self.readback(&ob, n_tokens * n_head * head_dim)?;
         qb.destroy(d);
         kb.destroy(d);
         vb.destroy(d);

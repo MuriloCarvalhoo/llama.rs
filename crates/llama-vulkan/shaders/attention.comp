@@ -39,6 +39,21 @@ void main() {
     uint h = gl_WorkGroupID.x;
     // Uniforme no workgroup — nenhum `barrier()` abaixo fica em fluxo divergente.
     if (h >= pc.n_head) { return; }
+
+    // Prefill em batch: a dimensao Y do dispatch e o token dentro do bloco. No decode o
+    // dispatch e (n_head, 1, 1), entao t=0 e n_tok=1 e tudo abaixo colapsa exatamente no
+    // caminho de antes -- por isso o batch nao precisou de campo novo no push constant.
+    //
+    // A mascara causal sai de graca: o token t so pode ver as posicoes 0..pos0+t, e o
+    // KV-cache ja tem o bloco inteiro escrito quando este shader roda. Basta encurtar o
+    // laco, sem mascara explicita. `total_len` no push e o total do **ultimo** token do
+    // bloco, o que mantem o significado que ele ja tinha quando n_tok=1.
+    uint t = gl_WorkGroupID.y;
+    uint n_tok = gl_NumWorkGroups.y;
+    uint total_len_t = pc.total_len - (n_tok - 1u) + t;
+    uint q_base = t * pc.n_head * pc.q_stride;
+    uint o_base = t * pc.n_head * pc.head_dim;
+
     uint w = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint n_rep = pc.n_head / pc.n_head_kv;
@@ -51,12 +66,12 @@ void main() {
     for (uint i = 0u; i < MAX_DPL; i++) { qd[i] = 0.0; acc[i] = 0.0; }
     for (uint i = 0u; i < dpl; i++) {
         uint d = lane + i * WG;
-        qd[i] = (d < pc.head_dim) ? qb.q[h * pc.q_stride + d] : 0.0;
+        qd[i] = (d < pc.head_dim) ? qb.q[q_base + h * pc.q_stride + d] : 0.0;
     }
 
     float m = -1.0e30;   // max corrente desta wave
     float l = 0.0;       // soma corrente de exp desta wave
-    for (uint j = w; j < pc.total_len; j += NWAVE) {
+    for (uint j = w; j < total_len_t; j += NWAVE) {
         uint kvbase = pc.kv_layer_off + j * pc.kv_dim + kv_h * pc.head_dim;
         // Produto interno q.k do head: soma parcial por lane sobre suas dimensoes,
         // depois reducao no subgroup -> score uniforme em todas as lanes.
@@ -78,7 +93,7 @@ void main() {
         m = m_new;
     }
 
-    // Publica o parcial da wave. Uma wave sem nenhuma posicao (total_len < NWAVE) sai com
+    // Publica o parcial da wave. Uma wave sem nenhuma posicao (total_len_t < NWAVE) sai com
     // l = 0 e peso exp(-1e30 - m_all) = 0, entao nao contamina a combinacao.
     if (lane == 0u) { s_m[w] = m; s_l[w] = l; }
     for (uint i = 0u; i < dpl; i++) {
@@ -103,7 +118,7 @@ void main() {
                 for (uint kk = 0u; kk < NWAVE; kk++) {
                     o += peso[kk] * s_acc[kk * pc.head_dim + d];
                 }
-                ob.o[h * pc.head_dim + d] = o / l_all;
+                ob.o[o_base + h * pc.head_dim + d] = o / l_all;
             }
         }
     }

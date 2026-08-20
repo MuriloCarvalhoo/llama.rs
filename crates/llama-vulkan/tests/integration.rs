@@ -817,7 +817,7 @@ fn attention_caso(
     }
 
     let gpu = fwd
-        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len)
+        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1)
         .unwrap();
     for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
         assert!(
@@ -1382,6 +1382,155 @@ fn matvec_k_em_batch_bate_coluna_a_coluna() {
             eprintln!(
                 "{} batch COLS={cols}: {cols} colunas iguais ao caminho de coluna única",
                 q.nome()
+            );
+        }
+    }
+}
+
+#[test]
+fn quantize_x_em_batch_bate_coluna_a_coluna() {
+    // O `quantize_x.comp` trata cada bloco de 32 de forma independente e indexa a saída
+    // pelo bloco global (`xq[blk*8+g]`, `xd[blk]`). Com as colunas concatenadas, o bloco
+    // global vira `c*n_blk + blk` -- exatamente o índice que o matvec com COLS>1 lê. Ou
+    // seja: o shader já serve ao prefill em batch sem alteração nenhuma, bastando passar
+    // `n_in = cols * n_in`. Este teste prende essa propriedade, que é uma coincidência de
+    // layout e não um contrato escrito em lugar nenhum -- mexer no empacotamento do
+    // `quantize_x` quebraria o batch silenciosamente.
+    let Ok(ctx) = llama_vulkan::VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let fwd = llama_vulkan::ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let qx = |x: &[f32]| -> (Vec<f32>, Vec<f32>) {
+        let n = x.len();
+        let mut push = Vec::new();
+        push.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
+        push.extend_from_slice(&0u32.to_le_bytes());
+        push.extend_from_slice(&0u32.to_le_bytes());
+        let saida = fwd
+            .dbg_dn(
+                llama_vulkan::DnPipe::QuantizeX,
+                &[x.to_vec(), vec![0f32; n / 32 * 8], vec![0f32; n / 32]],
+                &push,
+                u32::try_from((n / 32).div_ceil(64)).unwrap(),
+            )
+            .expect("dispatch quantize_x");
+        (saida[1].clone(), saida[2].clone())
+    };
+
+    let n_in = 5120usize;
+    let n_blk = n_in / 32;
+    for cols in [2usize, 4, 8] {
+        let xs: Vec<Vec<f32>> = (0..cols)
+            .map(|c| {
+                (0..n_in)
+                    .map(|i| ((i % (37 + c)) as f32 - 18.0) * (1e-4 + c as f32 * 2e-5))
+                    .collect()
+            })
+            .collect();
+
+        let (bq, bd) = qx(&xs.concat());
+        assert_eq!(bq.len(), cols * n_blk * 8);
+        assert_eq!(bd.len(), cols * n_blk);
+
+        for (c, x) in xs.iter().enumerate() {
+            let (sq, sd) = qx(x);
+            assert_eq!(
+                &bq[c * n_blk * 8..(c + 1) * n_blk * 8],
+                &sq[..],
+                "coluna {c} de {cols}: xq do batch difere do de coluna única"
+            );
+            assert_eq!(
+                &bd[c * n_blk..(c + 1) * n_blk],
+                &sd[..],
+                "coluna {c} de {cols}: xd do batch difere do de coluna única"
+            );
+        }
+        eprintln!("quantize_x batch cols={cols}: layout por coluna confirmado");
+    }
+}
+
+#[test]
+fn attention_em_batch_respeita_a_mascara_causal() {
+    // Prefill em batch: N tokens num dispatch só, cada um enxergando apenas as posições
+    // até a sua. O invariante é que o token t do bloco produza exatamente o mesmo que
+    // produziria sozinho com `total_len = pos0 + t + 1` -- que é como o decode o calcula
+    // hoje. Se a máscara vazasse (todo token vendo o bloco inteiro), os tokens iniciais
+    // divergiriam e os finais não: por isso a comparação é por token, e não agregada.
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    // (n_head, n_head_kv, head_dim): geometria densa e a do Qwen2.5-32B (head_dim=128,
+    // duas dimensões por lane). n_tokens cobre menos que as 8 waves, igual, e com sobra.
+    for (n_head, n_head_kv, head_dim) in [(14usize, 2usize, 64usize), (40, 8, 128)] {
+        for (pos0, n_tokens) in [(0usize, 4usize), (3, 8), (11, 5)] {
+            let kv_dim = n_head_kv * head_dim;
+            let total_len = pos0 + n_tokens; // posições vistas pelo último token do bloco
+
+            // KV-cache com o bloco inteiro já escrito, que é o estado em que a atenção
+            // roda no prefill: o kv_append do bloco vem antes dela no plano.
+            let kc: Vec<f32> = (0..total_len * kv_dim)
+                .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+                .collect();
+            let vc: Vec<f32> = (0..total_len * kv_dim)
+                .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+                .collect();
+            // Query diferente por token: uma query repetida esconderia um erro de offset
+            // que sempre lesse o token 0.
+            let q: Vec<f32> = (0..n_tokens * n_head * head_dim)
+                .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+                .collect();
+
+            let batch = fwd
+                .dbg_attention(
+                    &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_tokens,
+                )
+                .expect("attention em batch");
+            assert_eq!(batch.len(), n_tokens * n_head * head_dim);
+
+            let por_head = n_head * head_dim;
+            for t in 0..n_tokens {
+                let visiveis = pos0 + t + 1;
+                let qt = &q[t * por_head..(t + 1) * por_head];
+                let sozinho = fwd
+                    .dbg_attention(
+                        qt,
+                        &kc[..visiveis * kv_dim],
+                        &vc[..visiveis * kv_dim],
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        visiveis,
+                        1,
+                    )
+                    .expect("attention de token único");
+                for (i, (b, s)) in batch[t * por_head..(t + 1) * por_head]
+                    .iter()
+                    .zip(&sozinho)
+                    .enumerate()
+                {
+                    assert!(
+                        (b - s).abs() < 1e-5,
+                        "token {t}/{n_tokens} (pos0={pos0}, vê {visiveis}), elem {i}: \
+                         batch={b} sozinho={s} — máscara causal errada"
+                    );
+                }
+            }
+            eprintln!(
+                "attention batch n_head={n_head} head_dim={head_dim} pos0={pos0} \
+                 n_tokens={n_tokens}: causal confirmada"
             );
         }
     }
