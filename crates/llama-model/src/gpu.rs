@@ -52,6 +52,8 @@ impl<'a> GpuLayerRaw<'a> {
     /// # Panics
     /// Se chamada numa camada de atenção linear.
     #[must_use]
+    // O panic é o contrato documentado acima: chamar isto numa camada linear é erro de código.
+    #[allow(clippy::panic)]
     pub fn attn(&self) -> (&QTensor<'a>, &QTensor<'a>, &QTensor<'a>, &QTensor<'a>) {
         match &self.mixer {
             MixerRaw::Attn {

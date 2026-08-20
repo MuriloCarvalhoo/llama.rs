@@ -1,3 +1,6 @@
+//! Exemplo de diagnóstico: abortar na primeira falha é o comportamento desejado.
+#![allow(clippy::unwrap_used)]
+
 fn main() {
     let bytes = std::fs::read("models/Qwen3.8-27B-Q5_K_M.gguf").unwrap();
     let f = gguf::GgufFile::parse(&bytes).unwrap();

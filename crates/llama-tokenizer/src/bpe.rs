@@ -22,10 +22,9 @@ fn byte_table() -> &'static [char; 256] {
     TABLE.get_or_init(|| {
         let mut t = ['\0'; 256];
         let mut hi = 256u32;
-        for b in 0u16..=255 {
-            let b8 = b as u8;
-            t[b as usize] = match b8 {
-                33..=126 | 161..=172 | 174..=255 => b8 as char,
+        for b in 0u8..=255 {
+            t[b as usize] = match b {
+                33..=126 | 161..=172 | 174..=255 => char::from(b),
                 _ => {
                     let c = char::from_u32(hi).unwrap_or('\u{FFFD}');
                     hi += 1;
@@ -42,13 +41,15 @@ fn unicode_to_byte() -> &'static HashMap<char, u8> {
     static MAP: OnceLock<HashMap<char, u8>> = OnceLock::new();
     MAP.get_or_init(|| {
         let bt = byte_table();
-        bt.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect()
+        bt.iter().copied().zip(0u8..=255).collect()
     })
 }
 
 // ── Pre-tokenizador ───────────────────────────────────────────────────────────
 
 /// Regex do pre-tokenizador Qwen2 / GPT-4 (sem lookahead negativo).
+// O padrão é literal: se não compilar, é erro de digitação que o primeiro teste pega.
+#[allow(clippy::expect_used)]
 fn pretok_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

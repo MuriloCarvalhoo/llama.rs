@@ -1,5 +1,9 @@
 //! Compara valores intermediários da camada 0 do qwen35 com o dump do
 //! `llama-eval-callback` do llama.cpp.
+//!
+//! Exemplo de diagnóstico: abortar na primeira falha é o comportamento desejado.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 #[allow(unsafe_code)]
 fn main() {
     let path = "models/Qwen3.8-27B-Q5_K_M.gguf";

@@ -108,6 +108,9 @@ fn pin_to_cpus(cpus: &[usize]) {
 
 /// Inicializa o spin pool com `n_workers` threads de background (além da thread principal).
 /// `cpus`: lista de CPUs NUMA node 0 para pinar workers (evitar acesso remoto).
+// Falhar ao criar as threads do pool na inicialização não tem recuperação sensata:
+// o decode conta com elas, e seguir sem worker esconderia o problema.
+#[allow(clippy::expect_used)]
 pub(crate) fn init(n_workers: usize, cpus: Vec<usize>) {
     N_SPIN_WORKERS.get_or_init(|| {
         SHUTDOWN.store(0, Relaxed);

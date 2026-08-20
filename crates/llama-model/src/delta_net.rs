@@ -183,9 +183,9 @@ mod tests {
                 let kernel = &w[c * d_conv..(c + 1) * d_conv];
                 let mut esperado = 0f32;
                 for (i, kv) in kernel.iter().enumerate() {
-                    let pos = t as isize + i as isize - (d_conv as isize - 1);
+                    let pos = t.cast_signed() + i.cast_signed() - (d_conv.cast_signed() - 1);
                     if pos >= 0 {
-                        esperado += seq[pos as usize][c] * kv;
+                        esperado += seq[pos.cast_unsigned()][c] * kv;
                     }
                 }
                 let obtido = passo_a_passo[t][c];

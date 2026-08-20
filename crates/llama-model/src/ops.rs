@@ -273,7 +273,7 @@ fn q8_0_dot_scalar(w_row: &[u8], x_row: &[f32], n_blocks: usize) -> f32 {
         let xb = &x_row[b * Q..(b + 1) * Q];
         let mut dot = 0.0f32;
         for i in 0..Q {
-            dot += (qs[i] as i8 as f32) * xb[i];
+            dot += f32::from(qs[i].cast_signed()) * xb[i];
         }
         acc += d * dot;
     }
@@ -361,8 +361,10 @@ fn quantize_q8_0(x: &[f32]) -> Vec<u8> {
         let d_inv = if d > 0.0 { 1.0 / d } else { 0.0 };
         out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
         for &v in blk {
+            // O clamp acima já prende o valor no intervalo de i8: o cast não trunca.
+            #[allow(clippy::cast_possible_truncation)]
             let q = (v * d_inv).round().clamp(-128.0, 127.0) as i8;
-            out.push(q as u8);
+            out.push(q.cast_unsigned());
         }
     }
     out
@@ -713,7 +715,7 @@ fn q8_0_q8_0_dot_scalar(w_row: &[u8], x_q8_row: &[u8], n_blocks: usize) -> f32 {
         let qsx = &x_q8_row[bx + 2..bx + 2 + Q];
         let mut dot = 0i32;
         for i in 0..Q {
-            dot += (qsw[i] as i8 as i32) * (qsx[i] as i8 as i32);
+            dot += i32::from(qsw[i].cast_signed()) * i32::from(qsx[i].cast_signed());
         }
         acc += dw * dx * (dot as f32);
     }
