@@ -68,19 +68,38 @@ reserva o mesmo).
 gerar o último token do vocabulário, porque a saída vai para lugar nenhum. Já aconteceu
 neste projeto. Validar cada op nova contra referência de CPU antes de encadear.
 
-## Fase C — decode em batch (FALTA, é o pré-requisito do ganho)
+## Fase C — decode em batch (é o pré-requisito do ganho)
 
-`build_plan_batch`, irmão do `build_plan`, com `n_batch` colunas. Peças prontas:
+O plano generaliza para `n_tok` em vez de ganhar um irmão duplicado: o token do bloco vem
+sempre de `gl_WorkGroupID.y`, então com `n_tok=1` cada shader colapsa no caminho de decode
+de antes — o que os 28 testes de integração existentes confirmam a cada mudança.
 
-- **matvec K-quant com `COLS`** — `q4_k/q5_k/q6_k_matvec.comp` já aceitam N colunas contra
-  uma leitura de peso (commits `d93bb68`, `5a4d2fc`).
-- **`quantize_x`** — não precisou de mudança: os blocos de 32 já são independentes.
-- **`attention` causal em batch** — `gl_WorkGroupID.y` é o token do bloco (`bacc81f`).
+**Shaders prontos e testados:**
 
-Falta: `swiglu`/`add`/`gate_mul` (elementwise, triviais), `rope` (posição por token),
-`norm_fused`/`norm_p2` (um workgroup por token), `delta_net` (recorrência serial — os
-tokens do bloco têm de ser aplicados em ordem, mas as projeções em volta batcham), e os
-buffers `n_batch×` mais o `build_plan_batch`.
+| shader | como | commit |
+|---|---|---|
+| `q4_k/q5_k/q6_k_matvec` | spec constant `COLS`, N colunas por leitura de peso | `d93bb68`, `5a4d2fc` |
+| `attention` | `gl_WorkGroupID.y` é o token; máscara causal por laço curto | `bacc81f` |
+| `norm_fused` / `norm_p2` | parciais e `xq`/`xd` separados por token | `f9434ca` |
+| `rope` | `pos - (n_tok - 1) + t` por token | `f9434ca` |
+| `quantize_x`, `gate_mul`, `add`, `swiglu` | **nenhuma mudança** — já são token-major | — |
+
+`gate_mul` merece nota: com `n = attn_dim × n_tok`, o `h = i / head_dim` do shader avança
+sozinho para `t * n_head + hh`, e `b_q` tem exatamente esse layout. Foi sorte da estrutura,
+não projeto — mas está coberto pelo teste de ponta a ponta.
+
+**`kv_append` também não precisa de shader novo:** as posições do bloco são consecutivas no
+cache, então uma única `cmd_copy_buffer` de `n_tok × kv_dim` substitui as N cópias.
+
+**O que falta:**
+
+1. Buffers `n_batch×` (`b_x`, `b_q`, `b_k`, `b_v`, `b_attn`, `b_proj`, `b_gate`, `b_up`,
+   `b_normed`, `b_xq`, `b_xd`, `b_parciais`) e `n_batch` no `Cfg`.
+2. `decode_batch(tokens, pos0)` devolvendo os logits de cada token.
+3. `plano_delta` em batch: os matvec das projeções levam `COLS = n_tok`, mas a
+   **recorrência** (`delta_net`, `dn_conv`) roda `n_tok` dispatches em ordem, um por token.
+   São 48 das 65 camadas, mas a parte serial custa só 1,35 ms de 42,44 (3,2 %) — o grosso
+   dessas camadas são os matvec, que batcham.
 
 ## Fase D — rollback do estado recorrente (FALTA)
 
