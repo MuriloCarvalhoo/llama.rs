@@ -1,5 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 // Os dois escalares por cabeca que controlam a recorrencia do delta net:
 //
@@ -8,17 +9,25 @@
 //
 // `alpha` e `beta_proj` sao projecoes de `x` por matrizes **f32** de n_embd x n_heads
 // (o GGUF nao as quantiza — sao pequenas). Como o resultado tem so `n_heads` elementos,
-// o dispatch inteiro cabe num punhado de waves e o produto interno de cada cabeca e uma
-// reducao de subgrupo sobre n_embd.
+// o produto interno de cada cabeca e uma reducao sobre n_embd.
 //
 // Saida empacotada em vec2 (g, beta), que e como o `delta_net.comp` os consome: um load
 // de 8 B por cabeca em vez de dois de 4 B.
+//
+// **Geometria.** Apesar de pequenas *por camada*, as duas matrizes f32 somam ~94 MB por
+// token nas 48 camadas lineares — mais que qualquer tensor quantizado isolado. Com uma
+// wave por cabeca (a versao anterior) o dispatch punha 48 waves numa GPU de 240 SIMDs e
+// lia a 33 GB/s, contra 717 GB/s de pico: o mesmo defeito de ocupancia que a `attention`
+// ja teve. NWAVE waves por cabeca dividem o laco sobre n_embd e se somam no fim — a
+// reducao e associativa, entao o unico efeito e a ordem do somatorio. As leituras em
+// `vec4` cortam a taxa de requests por 4, que foi o que valeu 2.5x no `rmsnorm`.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
+const uint NWAVE = 4u;  // local_size_x / 64 (wave64 no MI50)
 
-layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } x_buf;          // [n_embd]
-layout(set = 0, binding = 1) readonly buffer AlphaBuf { float w[]; } alpha_buf;  // [n_heads][n_embd]
-layout(set = 0, binding = 2) readonly buffer BetaBuf { float w[]; } beta_buf;    // [n_heads][n_embd]
+layout(set = 0, binding = 0) readonly buffer XBuf { vec4 x[]; } x_buf;          // [n_embd/4]
+layout(set = 0, binding = 1) readonly buffer AlphaBuf { vec4 w[]; } alpha_buf;  // [n_heads][n_embd/4]
+layout(set = 0, binding = 2) readonly buffer BetaBuf { vec4 w[]; } beta_buf;    // [n_heads][n_embd/4]
 // (ssm_a, dt_bias) por cabeca.
 layout(set = 0, binding = 3) readonly buffer AdtBuf { vec2 adt[]; } adt_buf;     // [n_heads]
 layout(set = 0, binding = 4) writeonly buffer OutBuf { vec2 gb[]; } out_buf;     // [n_heads]
@@ -29,23 +38,35 @@ layout(push_constant) uniform PC {
     uint pad;
 } pc;
 
+// Parcial (alpha, beta) de cada wave, para a combinação final.
+shared vec2 s_part[NWAVE];
+
 void main() {
     uint h = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;
+    // Uniforme no workgroup — o `barrier()` abaixo nunca fica em fluxo divergente.
     if (h >= pc.n_heads) { return; }
 
-    uint base = h * pc.n_embd;
-    float pa = 0.0;
-    float pb = 0.0;
-    for (uint i = lane; i < pc.n_embd; i += gl_WorkGroupSize.x) {
-        float xv = x_buf.x[i];
-        pa += alpha_buf.w[base + i] * xv;
-        pb += beta_buf.w[base + i] * xv;
+    uint n4 = pc.n_embd / 4u;
+    uint base4 = h * n4;
+    vec4 pa4 = vec4(0.0);
+    vec4 pb4 = vec4(0.0);
+    for (uint i = lane; i < n4; i += gl_WorkGroupSize.x) {
+        vec4 xv = x_buf.x[i];
+        pa4 += alpha_buf.w[base4 + i] * xv;
+        pb4 += beta_buf.w[base4 + i] * xv;
     }
-    pa = subgroupAdd(pa);
-    pb = subgroupAdd(pb);
+    float pa = subgroupAdd(pa4.x + pa4.y + pa4.z + pa4.w);
+    float pb = subgroupAdd(pb4.x + pb4.y + pb4.z + pb4.w);
+
+    if (gl_SubgroupInvocationID == 0u) { s_part[gl_SubgroupID] = vec2(pa, pb); }
+    barrier();
 
     if (lane == 0u) {
+        vec2 tot = vec2(0.0);
+        for (uint k = 0u; k < NWAVE; k++) { tot += s_part[k]; }
+        pa = tot.x;
+        pb = tot.y;
         vec2 adt = adt_buf.adt[h];   // .x = ssm_a (negativo), .y = dt_bias
         float z = pa + adt.y;
         // softplus estavel: para z grande, ln(1+e^z) -> z.

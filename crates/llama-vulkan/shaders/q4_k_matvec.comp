@@ -40,8 +40,11 @@ layout(push_constant) uniform PC {
 } pc;
 
 const uint UVEC4_PER_SB = 9u;   // 144 bytes
-const uint MAX_ROWS = 4u;       // teto do array de acumuladores
-const uint MAX_COLS = 8u;       // teto de colunas por dispatch
+// Os acumuladores sao dimensionados pelas **constantes de especializacao**, nao por um teto
+// fixo: `ROWS_PER_WAVE * COLS` vale 2 no decode (2 linhas, 1 coluna). Com um array de teto
+// (4x8) o indice `r * MAX_COLS + c` espalha os elementos vivos pelas posicoes 0, 8, 16 e 24
+// de 32, e o compilador acaba reservando os 32 VGPRs — ocupancia paga por registradores que
+// nunca sao lidos.
 
 // Byte `i` (0..11) de scales[], nos bytes 4..15 do superbloco — .yzw do primeiro uvec4.
 uint scale_byte(uvec4 hdr, uint i) {
@@ -101,8 +104,8 @@ void main() {
     uint qs_v0 = 1u + (j >> 1u) * 2u;
     bool hi_nibble = (j & 1u) != 0u;
 
-    float acc[MAX_ROWS * MAX_COLS];
-    for (uint i = 0u; i < MAX_ROWS * MAX_COLS; i++) { acc[i] = 0.0; }
+    float acc[ROWS_PER_WAVE * COLS];
+    for (uint i = 0u; i < ROWS_PER_WAVE * COLS; i++) { acc[i] = 0.0; }
 
     for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
         uint sb = sb0 + sb_in_grp;
@@ -113,8 +116,8 @@ void main() {
 
         // Termos que so dependem da coluna. Reler xq dentro do laco das linhas custa um
         // acerto de L1; guarda-los aqui evita recomputar os 8 dots do `isx` por linha.
-        int isxv[MAX_COLS];
-        float xdv[MAX_COLS];
+        int isxv[COLS];
+        float xdv[COLS];
         for (uint c = 0u; c < COLS; c++) {
             uint cb = c * n_blk + blk;
             isxv[c] = soma_x(xq_buf.xq4[cb * 2u], xq_buf.xq4[cb * 2u + 1u]);
@@ -157,7 +160,7 @@ void main() {
                 isum = dotPacked4x8AccSatEXT(w6, xb.z, isum);
                 isum = dotPacked4x8AccSatEXT(w7, xb.w, isum);
 
-                acc[r * MAX_COLS + c] +=
+                acc[r * COLS + c] +=
                     xdv[c] * (dm.x * float(sc) * float(isum) - dm.y * float(m) * float(isxv[c]));
             }
         }
@@ -165,7 +168,7 @@ void main() {
 
     for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
         for (uint c = 0u; c < COLS; c++) {
-            float s = subgroupAdd(acc[r * MAX_COLS + c]);
+            float s = subgroupAdd(acc[r * COLS + c]);
             if (lane == 0u && row + r < pc.n_out) {
                 out_buf.y[c * pc.n_out + row + r] =
                     pc.tem_bias != 0u ? s + bias_buf.b[row + r] : s;

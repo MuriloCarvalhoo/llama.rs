@@ -46,8 +46,8 @@ layout(constant_id = 1) const uint ROWS_PER_WAVE = 2u;
 // (coluna c no offset c*n_in) e a saida sai coluna a coluna: y[c*n_out + linha].
 layout(constant_id = 2) const uint COLS = 1u;
 const uint WAVES_PER_WG = WG_SIZE / 64u;
-const uint MAX_ROWS = 4u;   // teto do array de acumuladores
-const uint MAX_COLS = 8u;   // teto de colunas por dispatch
+// Acumuladores dimensionados pelas constantes de especializacao — ver o comentario
+// equivalente em `q4_k_matvec.comp`: um array de teto fixo custa VGPRs que nunca sao lidos.
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada) = 2 ivec4.
@@ -135,8 +135,8 @@ void main() {
     // `ROWS_PER_WAVE` e constante de compilacao, entao os dois lacos sobre `r` sao
     // desenrolados e `acc[]` fica em registrador — indexacao dinamica aqui iria para
     // scratch e custaria mais do que todo o resto do kernel.
-    float acc[MAX_ROWS * MAX_COLS];
-    for (uint i = 0u; i < MAX_ROWS * MAX_COLS; i++) { acc[i] = 0.0; }
+    float acc[ROWS_PER_WAVE * COLS];
+    for (uint i = 0u; i < ROWS_PER_WAVE * COLS; i++) { acc[i] = 0.0; }
 
     for (uint sb0 = 0u; sb0 < n_sb; sb0 += 8u) {
         uint sb = sb0 + sb_in_grp;
@@ -147,8 +147,8 @@ void main() {
 
         // Termos que so dependem da coluna. Reler xq dentro do laco das linhas custa um
         // acerto de L1; guarda-los aqui evita recomputar os 8 dots do `isx` por linha.
-        int isxv[MAX_COLS];
-        float xdv[MAX_COLS];
+        int isxv[COLS];
+        float xdv[COLS];
         for (uint c = 0u; c < COLS; c++) {
             uint cb = c * n_blk + blk;
             isxv[c] = soma_x(xq_buf.xq4[cb * 2u], xq_buf.xq4[cb * 2u + 1u]);
@@ -195,7 +195,7 @@ void main() {
                 isum = dotPacked4x8AccSatEXT(w6, xb.z, isum);
                 isum = dotPacked4x8AccSatEXT(w7, xb.w, isum);
 
-                acc[r * MAX_COLS + c] +=
+                acc[r * COLS + c] +=
                     xdv[c] * (dm.x * float(sc) * float(isum) - dm.y * float(m) * float(isxv[c]));
             }
         }
@@ -203,7 +203,7 @@ void main() {
 
     for (uint r = 0u; r < ROWS_PER_WAVE; r++) {
         for (uint c = 0u; c < COLS; c++) {
-            float s = subgroupAdd(acc[r * MAX_COLS + c]);
+            float s = subgroupAdd(acc[r * COLS + c]);
             if (lane == 0u && row + r < pc.n_out) {
                 out_buf.y[c * pc.n_out + row + r] =
                     pc.tem_bias != 0u ? s + bias_buf.b[row + r] : s;
