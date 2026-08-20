@@ -4,8 +4,8 @@ Multi-token prediction usando a cabeça que o próprio Qwen3.8-27B traz
 (`nextn_predict_layers = 1`). O objetivo é gerar 2 tokens por passo de forward, já que o
 passo é dominado por **ler os pesos** e ler os mesmos 16,38 GB serve para 1 ou 2 tokens.
 
-`tok/s = base × (1 + taxa de aceitação)` — a aceitação é o teto, e é o número que ainda
-não conhecemos.
+`tok/s = base × (1 + taxa de aceitação)`. A aceitação foi **medida: 60,9 %** (fator 1,61),
+o que torna o alvo de 50 tok/s alcançável — ver `docs/decode-por-configuracao.md`.
 
 ## Fluxo
 
@@ -47,9 +47,25 @@ Barato o bastante para não atrapalhar mesmo com aceitação baixa.
 | `ffn_gate` / `ffn_up` | 5120 → 17408 | Q4_K |
 | `ffn_down` | 17408 → 5120 | Q6_K |
 
-## Fase B — executar a cabeça (FALTA)
+## Fase B — executar a cabeça (PRONTA, na CPU)
 
-Montar um plano no `ResidentForward` com peças que **já existem**, mais uma que não:
+`MtpHead::propor` em `crates/llama-model/src/mtp.rs` executa o bloco e devolve a proposta.
+Roda **na CPU** de propósito: o que se queria era a taxa de aceitação, que não depende da
+velocidade, e isso evitou montar um plano Vulkan antes de saber se o ganho existia.
+
+Medido pelo `crates/llama-vulkan/tests/mtp_aceitacao.rs`, greedy, 23 propostas verificadas
+contra o token que o modelo de fato produziu: **14 acertos, 60,9 %**.
+
+Os 60,9 % também servem de prova de que a cabeça está correta — ela espelha a camada de
+atenção do qwen35 incluindo dois detalhes fáceis de errar (queries com stride
+`2 × head_dim`, porque o portão mora ao lado de cada uma; e o portão entrando como
+`sigmoid` sobre a saída da atenção). Qualquer divergência derrubaria a aceitação para perto
+de zero.
+
+O matvec desquantiza **uma linha por vez** em vez de materializar o tensor: o
+`output.weight` tem 248 320 linhas e custaria 5 GB de RAM só para o vocabulário.
+
+**Para produção** a cabeça precisa migrar para a GPU, com estas peças — todas já existem:
 
 | passo | op | existe? |
 |---|---|---|
@@ -119,9 +135,12 @@ Flag no `llama-cli` (desligado por padrão), e registrar em
 `docs/decode-por-configuracao.md` os pares com/sem MTP na mesma build e com
 `LLAMA_RS_SPLIT` fixo.
 
-**Antes de investir nas fases C e D**, medir a **taxa de aceitação** com a Fase B pronta:
-basta rodar a cabeça, guardar a proposta e comparar com o token que o passo seguinte
-amostrar de verdade. Isso não precisa de batch nem de rollback, e é o número que decide se
-o resto compensa. Referência a bater: o llama.cpp mediu **+3,4%** neste modelo
-(`docs/mtp-e-k80.md`), o que implicaria aceitação baixa — mas mede a implementação dele
-num híbrido SSM, não o teto.
+A taxa de aceitação já está medida (60,9 %), então as fases C e D estão justificadas por
+dado, não por projeção. O `docs/mtp-e-k80.md` registra **+3,4 %** para o MTP no llama.cpp
+neste mesmo modelo — fator 1,03 contra os 1,61 medidos aqui. A explicação mais provável é
+que a implementação dele não faz batch eficiente num híbrido SSM; a cabeça do modelo prevê
+bem. Aquele número não deve ser usado como estimativa do potencial.
+
+**Conta do alvo:** com a base de hoje (22,3) o MTP dá 35,9 tok/s. Para 50 é preciso a base
+em ~31,1, o que exige também o matvec Q4_K perto dos 717 GB/s e a fusão das dispatches
+pequenas.
