@@ -13,7 +13,7 @@ gguf = { path = "crates/gguf" }
 llama-tokenizer = { path = "crates/llama-tokenizer" }
 half = "2"
 ggml-cpu = { path = "crates/ggml-cpu" }
-rand = "0.9"
+rand = "0.10"
 llama-sampling = { path = "crates/llama-sampling" }
 llama-model = { path = "crates/llama-model" }
 clap = { version = "4", features = ["derive"] }

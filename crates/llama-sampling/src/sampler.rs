@@ -1,6 +1,6 @@
 //! Estratégias de amostragem: greedy, temperatura, top-k, top-p.
 
-use rand::Rng;
+use rand::RngExt;
 use rayon::prelude::*;
 
 /// Estratégia de amostragem para selecionar o próximo token a partir de logits.
@@ -18,7 +18,7 @@ pub enum Sampler {
 
 impl Sampler {
     /// Retorna o índice do token amostrado dado o vetor de logits.
-    pub fn sample(&self, logits: &[f32], rng: &mut impl Rng) -> usize {
+    pub fn sample(&self, logits: &[f32], rng: &mut impl RngExt) -> usize {
         debug_assert!(!logits.is_empty(), "logits slice must not be empty");
         match self {
             Sampler::Greedy => argmax(logits),
@@ -139,7 +139,7 @@ pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
-pub(crate) fn sample_multinomial(probs: &[f32], rng: &mut impl Rng) -> usize {
+pub(crate) fn sample_multinomial(probs: &[f32], rng: &mut impl RngExt) -> usize {
     let r: f32 = rng.random();
     let mut cumsum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {

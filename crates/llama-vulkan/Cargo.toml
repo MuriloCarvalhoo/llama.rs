@@ -22,7 +22,7 @@ ggml-cpu = { path = "../ggml-cpu" }
 half.workspace = true
 
 [build-dependencies]
-shaderc = "0.8"
+shaderc = "0.10"
 
 [lints.rust]
 unsafe_code = "allow"
