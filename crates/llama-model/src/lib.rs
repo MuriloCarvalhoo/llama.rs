@@ -21,6 +21,8 @@ mod generate;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod model;
+#[cfg(feature = "gpu")]
+mod mtp;
 mod ops;
 pub(crate) mod spin_pool;
 mod weights;
@@ -33,6 +35,8 @@ pub use gpu::{
     MtpAux, MtpRaw, QTensor, gerar_streaming_residente,
 };
 pub use model::Model;
+#[cfg(feature = "gpu")]
+pub use mtp::MtpHead;
 
 /// Inicializa o spin pool com `n_workers` threads em background, pinados aos `cpus` fornecidos.
 pub fn init_spin_pool(n_workers: usize, cpus: Vec<usize>) {

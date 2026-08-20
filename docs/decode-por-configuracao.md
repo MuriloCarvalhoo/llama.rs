@@ -32,8 +32,25 @@ LLAMA_RS_SPLIT=31 numactl --interleave=all target/release/llama-cli \
 | `dn_gates` com NWAVE+vec4 (`5a4d2fc`) | — | **41,35** | 3 execuções: 41,44 41,56 41,04 |
 | greedy (`--temp 0`) | 22,35 | — | 3 execuções; a amostragem custa ~1,3 ms/token |
 | amostragem completa (temp 0.8, top-k 40) | 21,74 | — | 3 execuções, bem estável |
-| MTP | *pendente* | | a implementar |
+| MTP ligado | *pendente* | | falta o decode em batch |
 | MTP desligado (mesma build) | *pendente* | | controle do anterior |
+
+### Taxa de aceitação do MTP — **60,9 % medido**
+
+`cargo test -p llama-vulkan --test mtp_aceitacao -- --nocapture`, greedy, 23 propostas
+verificadas contra o token que o modelo de fato produziu: **14 acertos, 60,9 %**.
+
+Isso é o teto do ganho: `tok/s = base × (1 + aceitação) = base × 1,61`.
+
+| base | com MTP a 60,9 % |
+|---:|---:|
+| 22,3 (hoje) | 35,9 |
+| 28 (banda parcial) | 45,1 |
+| **31,1 (banda + fusão de ops)** | **50,1** |
+
+**Contradiz o +3,4 % do llama.cpp** na tabela abaixo. A explicação mais provável é que a
+implementação dele não faz batch eficiente num híbrido SSM — a cabeça do modelo prevê bem.
+Medido com greedy; com amostragem a temperatura alta a aceitação cai.
 
 ### Varredura de geometria do matvec — sem efeito
 
