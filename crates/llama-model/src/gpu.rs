@@ -75,6 +75,25 @@ impl<'a> GpuLayerRaw<'a> {
 pub struct GpuRawWeights<'a> {
     pub layers: Vec<GpuLayerRaw<'a>>,
     pub output: QTensor<'a>,
+    /// Bloco de multi-token prediction, quando o modelo traz um. `None` no resto.
+    pub mtp: Option<MtpRaw<'a>>,
+}
+
+/// Pesos quantizados do bloco MTP (`blk.{n_layer}.*`).
+///
+/// O bloco propõe o token **seguinte** ao que acabou de ser amostrado, a partir do hidden
+/// state do último layer e do embedding desse token:
+///
+/// ```text
+/// h  = eh_proj( [enorm(embed(t+1)) ; hnorm(h_t)] )   // 2*n_embd -> n_embd
+/// h' = camada_de_decoder(h)
+/// logits(t+2) = output( shared_head_norm(h') )
+/// ```
+pub struct MtpRaw<'a> {
+    /// Combina embedding e hidden state — entra com `2 * n_embd`, sai com `n_embd`.
+    pub eh_proj: QTensor<'a>,
+    /// A camada de decoder do bloco, com a mesma forma das camadas normais.
+    pub layer: GpuLayerRaw<'a>,
 }
 
 impl<'a> GpuRawWeights<'a> {
@@ -159,7 +178,47 @@ impl<'a> GpuRawWeights<'a> {
             });
         }
         let output = read("output.weight", cfg.n_embd, cfg.vocab)?;
-        Ok(Self { layers, output })
+
+        // Bloco MTP. `cfg.n_layer` já desconta os `nextn_predict_layers`, então esse índice
+        // é exatamente o primeiro bloco MTP empilhado no fim.
+        //
+        // A regra `eh_linear` **não** vale aqui: no Qwen3.8-27B o bloco é o 64, que por
+        // `(64 + 1) % 4 != 0` cairia como linear, mas o GGUF traz `attn_q/k/v/output` —
+        // o bloco MTP é de atenção mesmo nas posições que seriam de atenção linear.
+        let mtp = if cfg.n_layer_nextn > 0 {
+            let l = cfg.n_layer;
+            let p = |s: &str| format!("blk.{l}.{s}");
+            let q_out = if cfg.delta_net.is_some() {
+                cfg.head_dim * cfg.n_head * 2
+            } else {
+                cfg.n_embd
+            };
+            Some(MtpRaw {
+                eh_proj: read(&p("nextn.eh_proj.weight"), cfg.n_embd * 2, cfg.n_embd)?,
+                layer: GpuLayerRaw {
+                    mixer: MixerRaw::Attn {
+                        attn_q: read(&p("attn_q.weight"), cfg.n_embd, q_out)?,
+                        attn_k: read(&p("attn_k.weight"), cfg.n_embd, kv_dim)?,
+                        attn_v: read(&p("attn_v.weight"), cfg.n_embd, kv_dim)?,
+                        attn_output: read(
+                            &p("attn_output.weight"),
+                            cfg.head_dim * cfg.n_head,
+                            cfg.n_embd,
+                        )?,
+                    },
+                    ffn_gate: read(&p("ffn_gate.weight"), cfg.n_embd, cfg.n_ff)?,
+                    ffn_up: read(&p("ffn_up.weight"), cfg.n_embd, cfg.n_ff)?,
+                    ffn_down: read(&p("ffn_down.weight"), cfg.n_ff, cfg.n_embd)?,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            layers,
+            output,
+            mtp,
+        })
     }
 }
 
@@ -173,6 +232,19 @@ pub struct GpuAuxWeights<'a> {
     pub layers: Vec<AuxLayer>,
     pub output_norm: Vec<f32>, // [n_embd]
     pub freq_table: Vec<f32>,  // [rope_dim/2]
+    /// Auxiliares f32 do bloco MTP, quando existe. Ver [`MtpRaw`].
+    pub mtp: Option<MtpAux>,
+}
+
+/// Pesos f32 do bloco de multi-token prediction.
+pub struct MtpAux {
+    /// RMSNorm aplicada ao embedding do token amostrado, antes do `eh_proj`.
+    pub enorm: Vec<f32>, // [n_embd]
+    /// RMSNorm aplicada ao hidden state do último layer, antes do `eh_proj`.
+    pub hnorm: Vec<f32>, // [n_embd]
+    /// RMSNorm final, antes da projeção de saída — faz o papel do `output_norm`.
+    pub shared_head_norm: Vec<f32>, // [n_embd]
+    pub layer: AuxLayer,
 }
 
 /// Pesos auxiliares f32 por camada.
@@ -299,11 +371,45 @@ impl<'a> GpuAuxWeights<'a> {
             })
             .collect();
 
+        // Auxiliares do bloco MTP — ver `MtpRaw` para o porquê de ele ser sempre de atenção.
+        let mtp = if cfg.n_layer_nextn > 0 {
+            let l = cfg.n_layer;
+            let p = |s: &str| format!("blk.{l}.{s}");
+            let dn = cfg.delta_net.as_ref();
+            let segunda_norma = if dn.is_some() {
+                p("post_attention_norm.weight")
+            } else {
+                p("ffn_norm.weight")
+            };
+            Some(MtpAux {
+                enorm: f32s(&p("nextn.enorm.weight"), cfg.n_embd)?,
+                hnorm: f32s(&p("nextn.hnorm.weight"), cfg.n_embd)?,
+                shared_head_norm: f32s(&p("nextn.shared_head_norm.weight"), cfg.n_embd)?,
+                layer: AuxLayer {
+                    attn_norm: f32s(&p("attn_norm.weight"), cfg.n_embd)?,
+                    ffn_norm: f32s(&segunda_norma, cfg.n_embd)?,
+                    q_bias: None,
+                    k_bias: None,
+                    v_bias: None,
+                    q_norm: dn
+                        .map(|_| f32s(&p("attn_q_norm.weight"), cfg.head_dim))
+                        .transpose()?,
+                    k_norm: dn
+                        .map(|_| f32s(&p("attn_k_norm.weight"), cfg.head_dim))
+                        .transpose()?,
+                    delta: None,
+                },
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             token_embd: std::borrow::Cow::Owned(f32s("token_embd.weight", cfg.vocab * cfg.n_embd)?),
             layers,
             output_norm: f32s("output_norm.weight", cfg.n_embd)?,
             freq_table,
+            mtp,
         })
     }
 }
@@ -458,6 +564,9 @@ impl Model<'_> {
             layers,
             output_norm,
             freq_table,
+            // Este caminho parte do `Model` denso, que não carrega bloco MTP; quem lê o
+            // bloco é `GpuAuxWeights::from_gguf`.
+            mtp: None,
         })
     }
 
