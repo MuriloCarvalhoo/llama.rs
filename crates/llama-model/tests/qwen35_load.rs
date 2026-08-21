@@ -120,7 +120,12 @@ fn pesos_auxiliares_das_camadas_lineares() {
 
     let aux = llama_model::GpuAuxWeights::from_gguf(&f, &bytes, &cfg).expect("pesos auxiliares");
     assert_eq!(aux.layers.len(), 64);
-    assert_eq!(aux.token_embd.len(), cfg.vocab * cfg.n_embd);
+    // A tabela fica quantizada, emprestada do mmap: o que se confere é que a linha do
+    // primeiro e a do último token existem e têm n_embd valores — se os bytes não
+    // cobrissem o vocabulário inteiro, `linha` falharia.
+    let ultimo = u32::try_from(cfg.vocab - 1).unwrap();
+    assert_eq!(aux.token_embd.linha(0).unwrap().len(), cfg.n_embd);
+    assert_eq!(aux.token_embd.linha(ultimo).unwrap().len(), cfg.n_embd);
     assert_eq!(aux.freq_table.len(), cfg.rope_dim / 2);
 
     // Camada 0 (linear): tem os tensores SSM e não tem QK-norm.

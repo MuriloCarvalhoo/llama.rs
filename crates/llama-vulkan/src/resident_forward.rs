@@ -534,17 +534,18 @@ pub(crate) const MAX_SPLITS: usize = 16;
 
 /// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
-pub(crate) struct ResidentState {
+pub(crate) struct ResidentState<'w> {
     pub cfg: Cfg,
     pub qw: Vec<LayerQ>,
     pub output_w: QWeight,
     pub aux: Vec<LayerAux>,
     pub output_norm_buf: Buf,
     pub freq_buf: Buf,
-    /// Tabela de embedding f32 no host. Manter em VRAM custaria vocab*n_embd*4
-    /// (3.1 GB no 14B) para ler **uma** linha por token; a linha (n_embd f32,
-    /// ~20 KB) sobe por `embd_stage` a cada passo, ao custo de poucos µs.
-    pub token_embd: Vec<f32>,
+    /// Tabela de embedding **quantizada**, emprestada do GGUF. Manter em VRAM custaria
+    /// vocab*n_embd*4 (3.1 GB no 14B) para ler **uma** linha por token, e dequantizá-la
+    /// no host custaria a mesma coisa em RAM; a linha do token é dequantizada no passo e
+    /// sobe por `embd_stage`, ao custo de poucos µs. `None` fora do primeiro shard.
+    pub token_embd: Option<llama_model::TokenEmbd<'w>>,
     pub embd_stage: Buf,
     pub kcache: Buf,
     pub vcache: Buf,
@@ -670,7 +671,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_norm: ComputePipeline,
     pub(crate) gate_mul: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
-    pub(crate) state: Option<ResidentState>,
+    pub(crate) state: Option<ResidentState<'ctx>>,
 }
 
 impl<'ctx> ResidentForward<'ctx> {
@@ -990,7 +991,7 @@ impl<'ctx> ResidentForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
     ) -> Result<Self, MatmulError> {
         let dev = Self::pick_device(ctx);
         Self::new_shard(ctx, config, raw, aux, Shard::whole(dev, config.n_layer))
@@ -1006,7 +1007,7 @@ impl<'ctx> ResidentForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
         shard: Shard,
     ) -> Result<Self, MatmulError> {
         if config.head_dim > 256 {
@@ -1250,13 +1251,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 aux: aux_buf,
                 output_norm_buf,
                 freq_buf,
-                // Só o primeiro shard faz o embedding lookup; nos demais a tabela seria
-                // 3.1 GB de RAM sem uso (14B) — o suficiente para matar o processo por OOM.
-                token_embd: if shard.is_first() {
-                    aux.token_embd.to_vec()
-                } else {
-                    Vec::new()
-                },
+                // Só o primeiro shard faz o embedding lookup.
+                token_embd: shard.is_first().then_some(aux.token_embd),
                 embd_stage,
                 kcache,
                 vcache,
@@ -1682,7 +1678,7 @@ impl<'ctx> ResidentForward<'ctx> {
     #[allow(clippy::too_many_arguments)]
     fn plano_delta(
         plan: &mut Vec<PlannedOp>,
-        st: &ResidentState,
+        st: &ResidentState<'_>,
         la: &LayerAux,
         c: &Cfg,
         n_tok: usize,
@@ -2150,7 +2146,7 @@ impl<'ctx> ResidentForward<'ctx> {
     ///
     /// `LLAMA_RS_NO_GROUP=1` volta a uma barreira por op, para comparar. Motivação e ganho
     /// medido em `docs/performance-tuning.md`.
-    fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState) -> Vec<bool> {
+    fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState<'_>) -> Vec<bool> {
         // `LLAMA_RS_NO_GROUP=1` volta ao comportamento antigo (uma barreira por op) para
         // poder medir o efeito do agrupamento no mesmo binário.
         if std::env::var("LLAMA_RS_NO_GROUP").is_ok_and(|v| v != "0") {
@@ -2387,27 +2383,13 @@ impl<'ctx> ResidentForward<'ctx> {
                     // Fonte: a linha de cada token do bloco (primeiro shard) ou a stream
                     // residual que veio da GPU anterior. Vai para `embd_stage` e daí para b_x.
                     let bytes = (c.n_embd * n_tok * 4) as vk::DeviceSize;
-                    let linha = |&t: &u32| -> Option<&[f32]> {
-                        let row = t as usize * c.n_embd;
-                        st.token_embd.get(row..row + c.n_embd)
+                    // Dequantiza só as linhas deste passo: uma no decode, `n_tok` no
+                    // bloco de prefill. A tabela inteira em f32 custaria 5,1 GB de RAM.
+                    let linhas: Option<Vec<f32>> = match (x_in, st.token_embd.as_ref()) {
+                        (None, Some(te)) => te.linhas(tokens).ok(),
+                        _ => None,
                     };
-                    // O decode lê a linha direto da tabela, sem alocar — é o caminho
-                    // crítico. Só o bloco precisa concatenar as N linhas antes da cópia.
-                    let unica = if n_tok == 1 && x_in.is_none() {
-                        tokens.first().and_then(linha)
-                    } else {
-                        None
-                    };
-                    let bloco: Option<Vec<f32>> = if n_tok > 1 && x_in.is_none() {
-                        tokens
-                            .iter()
-                            .map(linha)
-                            .collect::<Option<Vec<_>>>()
-                            .map(|linhas| linhas.concat())
-                    } else {
-                        None
-                    };
-                    if let Some(src) = x_in.or(unica).or(bloco.as_deref()) {
+                    if let Some(src) = x_in.or(linhas.as_deref()) {
                         // SAFETY: embd_stage é host-visible/coherent com `bytes`;
                         // o ponteiro é válido até unmap e a cópia respeita n_embd floats.
                         unsafe {
@@ -3165,7 +3147,7 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Lê os timestamps do token e acumula o tempo de GPU por op. No-op sem profiling.
-    fn collect_prof(&self, st: &ResidentState, n_tok: usize) -> Result<(), MatmulError> {
+    fn collect_prof(&self, st: &ResidentState<'_>, n_tok: usize) -> Result<(), MatmulError> {
         let Some(pf) = &st.prof else { return Ok(()) };
         let plano = if n_tok > 1 { &st.plan_batch } else { &st.plan };
         let n = plano.len() + 1;
@@ -3257,7 +3239,7 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Uma tabela do perfil: `bloco` escolhe entre o plano do prefill e o do decode.
     #[allow(clippy::cast_precision_loss)]
-    fn perfil_de(&self, st: &ResidentState, bloco: bool) {
+    fn perfil_de(&self, st: &ResidentState<'_>, bloco: bool) {
         let Some(pf) = &st.prof else { return };
         let (plano, accum, passos) = if bloco {
             (&st.plan_batch, pf.accum_batch.borrow(), pf.blocos.get())
@@ -3490,7 +3472,7 @@ impl<'ctx> ResidentForward<'ctx> {
     /// pela IRQ da GPU passa a custar milissegundos em vez de microssegundos. O custo é um
     /// núcleo ocupado enquanto a GPU trabalha; é o mesmo compromisso que o llama.cpp faz no
     /// seu laço de espera. Diagnóstico e números medidos em `docs/performance-tuning.md`.
-    fn espera_fence(&self, st: &ResidentState) -> Result<(), MatmulError> {
+    fn espera_fence(&self, st: &ResidentState<'_>) -> Result<(), MatmulError> {
         let d = &self.dev.device;
         loop {
             // SAFETY: fence válido e submetido.

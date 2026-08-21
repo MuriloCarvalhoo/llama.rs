@@ -29,7 +29,7 @@ impl<'ctx> LayerSplitForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
     ) -> Result<Self, MatmulError> {
         let devs = ctx.amd_compute_devices();
         if devs.len() < 2 {

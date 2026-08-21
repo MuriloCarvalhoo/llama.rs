@@ -14,7 +14,7 @@ use rayon::prelude::*;
 
 use crate::config::LlamaConfig;
 use crate::error::ModelError;
-use crate::gpu::{MixerRaw, MtpAux, MtpRaw, QTensor};
+use crate::gpu::{MixerRaw, MtpAux, MtpRaw, QTensor, TokenEmbd};
 use crate::ops;
 
 /// Bytes de uma linha de `n_in` elementos, no tipo dado.
@@ -142,8 +142,9 @@ impl MtpHead {
 
     /// Propõe o token **seguinte** a `token`, a partir do hidden state `h` do último layer.
     ///
-    /// `h` é o hidden do passo que produziu `token`; `token_embd` é a tabela de embedding
-    /// já em f32; `output` é a projeção de vocabulário compartilhada com o modelo.
+    /// `h` é o hidden do passo que produziu `token`; `token_embd` é a tabela de embedding,
+    /// da qual só a linha do token é dequantizada; `output` é a projeção de vocabulário
+    /// compartilhada com o modelo.
     ///
     /// # Errors
     /// Se algum peso tiver forma incompatível com a config.
@@ -156,7 +157,7 @@ impl MtpHead {
         raw: &MtpRaw<'_>,
         aux: &MtpAux,
         output: &QTensor<'_>,
-        token_embd: &[f32],
+        token_embd: &TokenEmbd<'_>,
         freq: &[f32],
         h: &[f32],
         token: u32,
@@ -173,10 +174,8 @@ impl MtpHead {
         }
 
         // 1. eh_proj([enorm(embedding do token) ; hnorm(hidden)]).
-        let emb = token_embd
-            .get(token as usize * n_embd..(token as usize + 1) * n_embd)
-            .ok_or_else(|| ModelError::Gpu(format!("token {token} fora da tabela")))?;
-        let mut cat = ops::rmsnorm_and_scale(emb, &aux.enorm, n_embd, eps);
+        let emb = token_embd.linha(token)?;
+        let mut cat = ops::rmsnorm_and_scale(&emb, &aux.enorm, n_embd, eps);
         cat.extend(ops::rmsnorm_and_scale(h, &aux.hnorm, n_embd, eps));
         let mut x = matvec_q(&raw.eh_proj, n_embd * 2, n_embd, &cat)?;
 
