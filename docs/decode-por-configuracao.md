@@ -52,6 +52,50 @@ Isso é o teto do ganho: `tok/s = base × (1 + aceitação) = base × 1,61`.
 implementação dele não faz batch eficiente num híbrido SSM — a cabeça do modelo prevê bem.
 Medido com greedy; com amostragem a temperatura alta a aceitação cai.
 
+### Requests por superbloco do Q4_K — a conta não explica os 13%
+
+Não é medição, é a conta de papel e lápis que fechou o Q5_K, refeita para o Q4_K (topo de
+`shaders/q4_k_matvec.comp`). Por lane e por superbloco:
+
+| kernel | loads de 16 B por lane | bytes/superbloco | GB/s medido |
+|---|---:|---:|---:|
+| Q4_K | **3** (`hdr`, `qs0`, `qs1`) | 144 | 506 |
+| Q5_K | **5** (`hdr`, 2× `qh`, 2× `qs`) | 176 | 573 |
+
+As escalas do Q4_K não custam request: moram nos bytes 4..15 do mesmo `uvec4` do par
+`d|dmin`, que já é lido. As 8 lanes de um superbloco cobrem os 9 `uvec4` sem reler byte
+nenhum — **não há folga para empacotar**. E o kernel que faz *mais* requests é o mais
+rápido, o que descarta a taxa de requests como causa da diferença. Sobra ocupância:
+o Q4_K, sem os registradores de `qh`, cabe com mais waves por SIMD.
+
+Daí o knob `LLAMA_RS_MATVEC_LDS_PAD=K` (LDS morta por workgroup, `LDS_PAD_KIB` no shader,
+default 0 = kernel inalterado). Com a geometria padrão (WG=256), K KiB limitam os
+workgroups por CU — e portanto as waves por SIMD — a `floor(64/K)`:
+
+| K | 9 | 11 | 13 | 16 | 22 | 33 |
+|---|--:|---:|---:|---:|---:|---:|
+| waves/SIMD | 7 | 5 | 4 | 4 | 2 | 1 |
+
+**Nada medido ainda.** O teste de shader confirma só que o resultado não muda com o pad
+ligado (erro relativo idêntico em K = 0, 13 e 33).
+
+### Fusão das ops pequenas — implementada, **não medida**
+
+Quatro fusões da frente 1 (`docs/planos/2026-08-21-decode-base.md`). Todas validadas
+contra referência de CPU ou contra o shader que substituem, nenhuma medida ainda —
+a linha de tok/s e `TOTAL GPU` fica em aberto.
+
+| fusão | shader | efeito no plano | knob |
+|---|---|---|---|
+| L2 de q e k | `dn_l2_qk.comp` | 96 → 48 dispatches/token | — (padrão) |
+| portão + quantize | `gate_quant.comp` | −1 dispatch por camada de atenção | — (padrão) |
+| SwiGLU + quantize | `swiglu_quant.comp` | −1 dispatch por camada (são 65) | — (padrão) |
+| RoPE de K no cache | `rope_kv.comp` | −1 cópia e −1 barreira por camada de atenção | `LLAMA_RS_ROPE_KV=0` volta |
+
+As três primeiras são fusão pura (mesma matemática, menos dispatches) e entraram como
+padrão sem knob. A quarta não reduz dispatches — troca uma cópia por uma escrita direta —
+então tem saída de emergência para o A/B, como o `LLAMA_RS_NO_GROUP` das barreiras.
+
 ### Varredura de geometria do matvec — sem efeito
 
 `LLAMA_RS_MATVEC_GEOM=wg,linhas`, 3 execuções cada. Diferença de 1,2%, dentro do ruído:

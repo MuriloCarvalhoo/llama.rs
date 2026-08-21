@@ -1,0 +1,59 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// L2 por cabeça de **q e k na mesma passada** — o modo 0 do `dn_norm.comp`, fundido.
+//
+// Eram dois dispatches por token e por camada linear (96 por token no Qwen3.8, que tem 48
+// delta-net), cada um com 6 workgroups de 64 lanes: trabalho de microssegundo pagando tail
+// de barreira. Aqui é um dispatch de `2 * n_heads` workgroups.
+//
+// O que torna a fusão barata é o layout: em `conv` os canais saem na ordem q | k | v, com a
+// mesma distância `dim` entre cabeças, então `q` e `k` juntos são só `2 * n_heads` cabeças
+// contíguas — o workgroup `h` lê sempre em `h * dim`, sem caso especial. O que muda é o
+// destino, que são dois buffers distintos (`qn` e `kn`) e por isso não cabem num binding só.
+//
+// Fórmula idêntica à do `dn_norm` modo 0: x / sqrt(sum(x^2) + eps). É L2, **não** RMS — a
+// diferença é o `1/dim`, e trocar uma pela outra aqui muda a escala do produto interno do
+// delta rule e o modelo passa a gerar lixo.
+
+layout(local_size_x = 64) in;
+
+// [2 * n_heads][dim]: as cabeças de q seguidas das de k, como saem da convolução.
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } x_buf;
+layout(set = 0, binding = 1) writeonly buffer QBuf { float q[]; } q_buf;   // [n_heads][dim]
+layout(set = 0, binding = 2) writeonly buffer KBuf { float k[]; } k_buf;   // [n_heads][dim]
+
+layout(push_constant) uniform PC {
+    uint dim;       // d_state
+    uint n_heads;   // n_k_heads (cabeças de q; k tem as mesmas)
+    float eps;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (h >= 2u * pc.n_heads) { return; }
+
+    uint base = h * pc.dim;
+    float ss = 0.0;
+    for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x_buf.x[base + i];
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+
+    // `ss` sai uniforme no subgrupo, então cada lane calcula a escala sem barreira.
+    float escala = inversesqrt(ss + pc.eps);
+    // `h` não depende de lane: o ramo é uniforme no workgroup, sem divergência.
+    bool eh_k = h >= pc.n_heads;
+    uint saida = (eh_k ? h - pc.n_heads : h) * pc.dim;
+
+    for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x_buf.x[base + i] * escala;
+        if (eh_k) {
+            k_buf.k[saida + i] = v;
+        } else {
+            q_buf.q[saida + i] = v;
+        }
+    }
+}

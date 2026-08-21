@@ -14,6 +14,27 @@
 // (uvec4 1) em vez de depois de `qh` (uvec4 3). O resto — geometria, dot empacotado em
 // int8, minimo fatorado para fora do laço — é o mesmo kernel, comentado em
 // `q5_k_matvec.comp`.
+//
+// ## Requests por superbloco — a conta que fechou o Q5_K, refeita aqui
+//
+// A conta que levou o Q5_K de 465 a 573 GB/s foi contar loads por lane. Refeita para o
+// Q4_K, com a lane `j = lane & 7` cobrindo o sub-bloco `j` de 32 elementos:
+//
+//   hdr = w4[b4]              1 load de 16 B  (d, dmin **e** os 12 B de scales/mins)
+//   qs0 = w4[b4 + qs_v0]      1 load de 16 B
+//   qs1 = w4[b4 + qs_v0 + 1]  1 load de 16 B
+//   ------------------------------------------
+//                             3 loads por lane e por superbloco
+//
+// As 8 lanes de um superbloco tocam juntas 1 (hdr) + 4 pares × 2 (qs) = **9 uvec4 = 144 B**:
+// exatamente o superbloco, nem um byte a mais. As escalas **não** custam request nenhum —
+// elas moram nos bytes 4..15 do mesmo `uvec4` do par `d|dmin`, que já é lido. **Não há folga
+// para empacotar**: 3 loads é o piso desta estrutura.
+//
+// E a comparação fecha a hipótese: o Q5_K faz **5** loads por lane (hdr + 2 de qh + 2 de qs)
+// e sustenta 573 GB/s; este faz 3 e sustenta 506. A diferença de 13% (medida em
+// `docs/decode-por-configuracao.md`) portanto **não** vem da taxa de requests. O que sobra
+// como hipótese é ocupância — daí `LDS_PAD_KIB` abaixo.
 
 layout(local_size_x_id = 0) in;
 layout(constant_id = 0) const uint WG_SIZE = 256u;
@@ -23,7 +44,26 @@ layout(constant_id = 1) const uint ROWS_PER_WAVE = 2u;
 // uma vez por token — ver `docs/prefill-em-batch.md`. As ativacoes entram concatenadas
 // (coluna c no offset c*n_in) e a saida sai coluna a coluna: y[c*n_out + linha].
 layout(constant_id = 2) const uint COLS = 1u;
+// KiB de LDS **morta** por workgroup, para limitar quantos workgroups cabem por CU — e com
+// eles as waves por SIMD. É o truque que o backend Vulkan do llama.cpp usa em GCN
+// (`ggml-vulkan.cpp:3767-3777`, comentário "too many subgroups ... thrashing the cache").
+//
+// Na gfx906 são 64 KiB de LDS por CU e 4 SIMDs; com a geometria padrão (WG_SIZE=256 = 4
+// waves, uma por SIMD) o número de workgroups residentes por CU **é** o de waves por SIMD,
+// então K KiB o limitam a floor(64/K):
+//
+//   K          |  9 | 11 | 13 | 16 | 22 | 33
+//   waves/SIMD |  7 |  5 |  4 |  4 |  2 |  1
+//
+// 0 (o padrão) não aloca nada e mantém o kernel como está. `LLAMA_RS_MATVEC_LDS_PAD=K` liga
+// o experimento — **a medir**: o kernel já faz o mínimo de requests (ver acima), e ocupância
+// alta demais é a hipótese que sobrou para os 506 GB/s contra os 573 do Q6_K.
+layout(constant_id = 3) const uint LDS_PAD_KIB = 0u;
 const uint WAVES_PER_WG = WG_SIZE / 64u;
+
+// +1 porque um array de tamanho 0 é inválido em GLSL; com LDS_PAD_KIB=0 sobram 4 bytes, que
+// o driver arredonda para a granularidade de alocação e não chegam a limitar nada.
+shared uint lds_pad[LDS_PAD_KIB * 256u + 1u];
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
 layout(set = 0, binding = 1) readonly buffer XqBuf { ivec4 xq4[]; } xq_buf;
@@ -88,6 +128,17 @@ int soma_x(ivec4 xa, ivec4 xb) {
 }
 
 void main() {
+    if (LDS_PAD_KIB > 0u) {
+        // Escrita + barreira + leitura: LDS que ninguém toca é eliminada pelo otimizador, e
+        // com ela o efeito na ocupância. `min` mantém o índice dentro do array mesmo com
+        // WG_SIZE > K*256, e a comparação nunca é verdadeira (`n_in` é uma dimensão), então
+        // o `return` é morto — mas o compilador não consegue provar isso através da barreira.
+        // O `if` é sobre constante de especialização: some na criação da pipeline.
+        uint slot = min(gl_LocalInvocationID.x, LDS_PAD_KIB * 256u);
+        lds_pad[slot] = pc.n_in;
+        barrier();
+        if (lds_pad[slot] == 0xFFFFFFFFu) { return; }
+    }
     uint lane = gl_SubgroupInvocationID;
     uint row = (gl_WorkGroupID.x * WAVES_PER_WG + gl_SubgroupID) * ROWS_PER_WAVE;
     if (row >= pc.n_out) { return; }

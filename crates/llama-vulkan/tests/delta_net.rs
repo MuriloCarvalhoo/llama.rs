@@ -380,3 +380,297 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
     assert!(dif_l2 < 1e-6, "L2 divergiu: {dif_l2}");
     assert!(dif_gated < 1e-5, "norma gated divergiu: {dif_gated}");
 }
+
+/// `dn_l2_qk` funde as duas L2 (q e k) que eram dois dispatches. O teste compara com a
+/// mesma referência do modo 0 do `dn_norm`, e o que ele de fato protege é o **roteamento**:
+/// q e k entram contíguos num binding só e saem em dois buffers distintos, então um shader
+/// que trocasse os destinos, ou que normalizasse as 2×n_heads cabeças como se fossem um
+/// tensor só, ainda produziria números plausíveis. Por isso q e k usam sementes diferentes
+/// e o teste confere buffer a buffer.
+#[test]
+fn l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let dim = 128usize; // d_state do Qwen3.8
+    let n_heads = 6usize; // n_k_heads
+    let eps = 1e-6f32;
+    // Entrada como sai da convolução: as cabeças de q seguidas das de k, contíguas.
+    let qk = pseudo(2 * n_heads * dim, 51);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct P {
+        dim: u32,
+        n_heads: u32,
+        eps: f32,
+    }
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::L2Qk,
+            &[
+                qk.clone(),
+                vec![0f32; n_heads * dim],
+                vec![0f32; n_heads * dim],
+            ],
+            &push_bytes(&P {
+                dim: dim as u32,
+                n_heads: n_heads as u32,
+                eps,
+            }),
+            (2 * n_heads) as u32,
+        )
+        .expect("dispatch dn_l2_qk");
+
+    // Referência: a mesma L2 por linha da CPU, sobre o bloco inteiro de 2*n_heads cabeças.
+    let mut esperado = qk.clone();
+    llama_model::delta_net::l2_norm_rows(&mut esperado, dim, eps);
+    let dif_q = max_dif(&saida[1], &esperado[..n_heads * dim]);
+    let dif_k = max_dif(&saida[2], &esperado[n_heads * dim..]);
+
+    eprintln!("dn_l2_qk: dif q={dif_q:.3e} k={dif_k:.3e}");
+    assert!(dif_q < 1e-6, "q divergiu: {dif_q}");
+    assert!(dif_k < 1e-6, "k divergiu: {dif_k}");
+    // A metade de k não pode ter caído no buffer de q: sem isto, um shader que ignorasse
+    // `eh_k` e escrevesse tudo em `qn` passaria no `dif_q` acima.
+    assert_ne!(
+        saida[1], saida[2],
+        "q e k saíram iguais — o roteamento entre os dois destinos está errado"
+    );
+}
+
+/// `gate_quant` funde o portão sigmoide do qwen35 com a quantização em int8 que vinha logo
+/// depois. São duas verificações independentes, porque as duas metades podem errar sozinhas:
+///
+/// 1. o portão contra a referência de CPU (`sigmoid` de `llama_model::delta_net`) — o índice
+///    do gate é o que mais tem como errar, porque ele mora na **segunda** metade de cada
+///    cabeça de `b_q`, entrelaçado com a query;
+/// 2. `xq`/`xd` contra o `quantize_x.comp` rodado sobre a saída que o próprio shader
+///    produziu — igualdade **exata**, já que a entrada do quantizador é a mesma nos dois
+///    caminhos. É o que prende a fusão como "mesma matemática".
+#[test]
+fn gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    // Geometria do Qwen3.8: head_dim 256, 24 cabeças. `n` é múltiplo de 32 (o bloco de
+    // quantização), como o plano garante.
+    let head_dim = 256usize;
+    let n_head = 24usize;
+    let n = head_dim * n_head;
+    let attn = pseudo(n, 61);
+    // `b_q`: por cabeça, query na primeira metade e portão na segunda.
+    let q = pseudo(n_head * 2 * head_dim, 62);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct P {
+        n: u32,
+        head_dim: u32,
+    }
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::GateQuant,
+            &[
+                attn.clone(),
+                q.clone(),
+                vec![0f32; n / 32 * 8],
+                vec![0f32; n / 32],
+            ],
+            &push_bytes(&P {
+                n: n as u32,
+                head_dim: head_dim as u32,
+            }),
+            u32::try_from((n / 32).div_ceil(64)).unwrap(),
+        )
+        .expect("dispatch gate_quant");
+
+    // 1. O portão, contra a CPU.
+    let esperado: Vec<f32> = (0..n)
+        .map(|i| {
+            let h = i / head_dim;
+            let d = i % head_dim;
+            attn[i] * llama_model::delta_net::sigmoid(q[h * 2 * head_dim + head_dim + d])
+        })
+        .collect();
+    let dif = max_dif(&saida[0], &esperado);
+    eprintln!("gate_quant: dif do portão={dif:.3e}");
+    assert!(dif < 1e-6, "portão divergiu: {dif}");
+
+    // 2. `xq`/`xd`, contra o `quantize_x` sobre a mesma entrada — exatos.
+    let mut qx_push = Vec::with_capacity(12);
+    qx_push.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    let sozinho = fwd
+        .dbg_dn(
+            DnPipe::QuantizeX,
+            &[saida[0].clone(), vec![0f32; n / 32 * 8], vec![0f32; n / 32]],
+            &qx_push,
+            u32::try_from((n / 32).div_ceil(64)).unwrap(),
+        )
+        .expect("dispatch quantize_x");
+    // `xq` carrega int8 empacotados; comparar pelos bits evita que um padrão de NaN
+    // faça duas saídas idênticas parecerem diferentes.
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits(&saida[2]),
+        bits(&sozinho[1]),
+        "xq difere do quantize_x"
+    );
+    assert_eq!(
+        bits(&saida[3]),
+        bits(&sozinho[2]),
+        "xd difere do quantize_x"
+    );
+}
+
+/// `swiglu_quant` funde o SwiGLU com a quantização que vinha logo depois. O `silu(g)*u`
+/// contra a CPU está em `resident_fwd_swiglu_igual_cpu`; aqui o que se prende é a outra
+/// metade: `xq`/`xd` **exatos** contra o `quantize_x.comp` rodado sobre a saída que o
+/// próprio shader escreveu em `b_act`. É o que sustenta a fusão como "mesma matemática".
+#[test]
+fn swiglu_quant_quantiza_igual_ao_quantize_x() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n = 4864usize; // múltiplo de 32, como todo `n_ff`
+    let g = pseudo(n, 71);
+    let u = pseudo(n, 72);
+    let grupos = u32::try_from((n / 32).div_ceil(64)).unwrap();
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::SwigluQuant,
+            &[
+                g.clone(),
+                u.clone(),
+                vec![0f32; n],
+                vec![0f32; n / 32 * 8],
+                vec![0f32; n / 32],
+            ],
+            &u32::try_from(n).unwrap().to_le_bytes(),
+            grupos,
+        )
+        .expect("dispatch swiglu_quant");
+
+    let mut qx_push = Vec::with_capacity(12);
+    qx_push.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    let sozinho = fwd
+        .dbg_dn(
+            DnPipe::QuantizeX,
+            &[saida[2].clone(), vec![0f32; n / 32 * 8], vec![0f32; n / 32]],
+            &qx_push,
+            grupos,
+        )
+        .expect("dispatch quantize_x");
+
+    let bits2 = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits2(&saida[3]),
+        bits2(&sozinho[1]),
+        "xq difere do quantize_x"
+    );
+    assert_eq!(
+        bits2(&saida[4]),
+        bits2(&sozinho[2]),
+        "xd difere do quantize_x"
+    );
+}
+
+/// `rope_kv` gira K e escreve direto no slot do KV-cache, no lugar de girar `b_k` in-place
+/// e deixar a cópia para o `kv_append`. A referência é o **próprio `rope.comp`**, que é o
+/// que ele substitui: o conteúdo do slot tem de ficar igual ao que a cópia teria posto lá.
+///
+/// Três coisas só quebram aqui e em nenhum outro teste:
+///
+/// - **rotary parcial** (`rope_dim < head_dim`): o RoPE in-place não tocava nessas dimensões
+///   e a cópia as levava assim mesmo. Escrevendo direto, o shader tem de copiá-las — se ele
+///   cobrisse só `rope_dim/2` pares, o resto do K nunca chegaria ao cache;
+/// - **`kv_off`**: o único offset do plano que depende da posição;
+/// - **bloco de N tokens**: cada um gira pelo seu ângulo e vai para o seu slot.
+#[test]
+fn rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n_head_kv = 8usize;
+    let head_dim = 128usize;
+    let kv_dim = n_head_kv * head_dim;
+    let freq: Vec<f32> = (0..head_dim / 2)
+        .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
+        .collect();
+
+    // `head_dim` = rotary completa; `head_dim / 2` = parcial, com metade das dimensões só
+    // copiadas para o cache.
+    for rope_dim in [head_dim, head_dim / 2] {
+        for n_tok in [1usize, 2] {
+            let pos = 37usize; // posição do ÚLTIMO token do bloco
+            let slot_off = 5usize * kv_dim; // slot da camada + posições anteriores
+            let k = pseudo(kv_dim * n_tok, 81 + rope_dim + n_tok);
+            // Cache maior que o bloco, para pegar escrita fora do slot.
+            let cache = vec![0f32; slot_off + kv_dim * (n_tok + 2)];
+
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct P {
+                n_head: u32,
+                head_dim: u32,
+                rope_dim: u32,
+                pos: f32,
+                kv_off: u32,
+            }
+            let saida = fwd
+                .dbg_dn_xy(
+                    DnPipe::RopeKv,
+                    &[k.clone(), freq.clone(), cache.clone()],
+                    &push_bytes(&P {
+                        n_head: n_head_kv as u32,
+                        head_dim: head_dim as u32,
+                        rope_dim: rope_dim as u32,
+                        pos: pos as f32,
+                        kv_off: slot_off as u32,
+                    }),
+                    u32::try_from((n_head_kv * (head_dim / 2)).div_ceil(64)).unwrap(),
+                    u32::try_from(n_tok).unwrap(),
+                )
+                .expect("dispatch rope_kv");
+
+            // Referência: o `rope.comp` sobre a mesma entrada — o que o `kv_append` copiaria.
+            let mut ref_k = k.clone();
+            let girado = fwd
+                .dbg_rope_xy(
+                    &mut ref_k,
+                    n_head_kv,
+                    head_dim,
+                    rope_dim,
+                    &freq,
+                    pos,
+                    u32::try_from(n_tok).unwrap(),
+                )
+                .expect("dispatch rope");
+
+            let no_slot = &saida[2][slot_off..slot_off + kv_dim * n_tok];
+            let dif = max_dif(no_slot, &girado);
+            eprintln!("rope_kv (rope_dim={rope_dim}, n_tok={n_tok}): dif={dif:.3e}");
+            assert!(dif < 1e-6, "slot difere do rope+cópia: {dif}");
+
+            // Nada fora do slot pode ter sido escrito: um `kv_off` errado passaria no
+            // assert acima se por acaso o bloco caísse todo dentro da janela comparada.
+            assert!(
+                saida[2][..slot_off].iter().all(|&v| v == 0.0),
+                "escreveu antes do slot (rope_dim={rope_dim}, n_tok={n_tok})"
+            );
+            assert!(
+                saida[2][slot_off + kv_dim * n_tok..]
+                    .iter()
+                    .all(|&v| v == 0.0),
+                "escreveu depois do bloco (rope_dim={rope_dim}, n_tok={n_tok})"
+            );
+        }
+    }
+}

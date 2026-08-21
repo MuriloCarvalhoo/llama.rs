@@ -9,6 +9,13 @@
 **Meta:** base sem MTP em 31–33 tok/s. É o caminho "sem MTP" do pedido e o
 pré-requisito aritmético do "com MTP ≥50".
 
+> **Estado (execução sem o modelo em disco):** tarefas 1 a 3 implementadas e validadas
+> contra referência de CPU nos testes de shader, que rodam na GPU sem GGUF. **Nada foi
+> medido** — não havia `models/` nesta árvore. Tarefa 4 nem começou: ela depende da
+> medição do host. O que precisa de A/B ficou atrás de env var com o default no
+> comportamento antigo (`LLAMA_RS_MATVEC_LDS_PAD`, `LLAMA_RS_ROPE_KV`); as fusões puras
+> — mesma matemática, menos dispatches — entraram como padrão.
+
 **Onde está o tempo hoje** (`LLAMA_RS_PROFILE=1`, soma das 2 GPUs, pós-`dn_gates`):
 
 | op | ms/token | banda | teto realista |
@@ -32,11 +39,15 @@ O perfil imprime ms/op; a banda é calculada à mão. Automatizar para não erra
 para expor diferença entre as duas GPUs (a GPU do display pode estar com spill para GTT
 — 95 vs 714 GB/s, `docs/performance-tuning.md:77-81`).
 
-- [ ] Anotar em cada `PipeId` os bytes lidos por dispatch (peso + ativação; o plano sabe
-      as formas) e imprimir `GB/s` na tabela do perfil.
-- [ ] Imprimir as duas GPUs em tabelas separadas (hoje o perfil soma os shards).
+- [x] Anotar em cada `PipeId` os bytes lidos por dispatch (peso + ativação; o plano sabe
+      as formas) e imprimir `GB/s` na tabela do perfil. Feito derivando das faixas de
+      leitura de `PipeId::acessos`, sem contar duas vezes o mesmo binding; a atenção fica
+      como `—` porque liga o KV inteiro e lê só `total_len` posições.
+- [x] Imprimir as duas GPUs em tabelas separadas (hoje o perfil soma os shards). O
+      cabeçalho da tabela passou a trazer `GPU<n> <nome> … camadas a..b`, então cada
+      tabela se identifica sozinha.
 - [ ] Rodar o baseline e registrar: se uma GPU sustenta banda visivelmente menor na
-      mesma op, investigar GTT/clock antes de tocar em shader.
+      mesma op, investigar GTT/clock antes de tocar em shader. **Pendente de medição.**
 
 ## Tarefa 2 — matvec_q4k: fechar 506 → ≥600 GB/s
 
@@ -46,15 +57,25 @@ O q6k sustenta 573 com a mesma estrutura; o q4k tem os mesmos bytes por superblo
 em `uvec4` — a diferença de 13% tem causa encontrável. Experimentos em ordem de custo,
 cada um A/B pelo `TOTAL GPU` e revertido se não pagar:
 
-- [ ] **Contar requests por superbloco** no shader atual (papel e lápis, como foi feito
+- [x] **Contar requests por superbloco** no shader atual (papel e lápis, como foi feito
       no q5k): 144 B/superbloco Q4_K = 9 `uvec4` + escalas. Se as escalas (`d`/`dmin` +
       6 B de mins) saem em loads separados dos `qs`, empacotar a leitura para caber nos
       mesmos requests — foi exatamente essa conta que levou o q5k de 465 a 573.
-- [ ] **Truque de ocupância do upstream**: alocar LDS morta para limitar waves por SIMD
+      **Feito, e não há folga:** as escalas moram nos bytes 4..15 do mesmo `uvec4` do par
+      `d|dmin`, então não custam request nenhum. São 3 loads por lane e por superbloco
+      (`hdr`, `qs0`, `qs1`), e as 8 lanes cobrem os 9 `uvec4` do superbloco sem reler byte
+      nenhum — é o piso da estrutura. O Q5_K faz **5** loads por lane e é mais rápido, o
+      que descarta taxa de requests como causa dos 13%. Conta no topo de
+      `q4_k_matvec.comp`; nenhum repack a fazer.
+- [x] **Truque de ocupância do upstream**: alocar LDS morta para limitar waves por SIMD
       (o backend Vulkan do llama.cpp faz isso em GCN — `ggml-vulkan.cpp:3767-3777`,
       comentário "*too many subgroups... thrashing the cache*"). Testar 2 e 4
       subgroups/SIMD via um array `shared` não usado dimensionado por spec constant.
       Custo: ~10 linhas de shader, reversível por spec constant = 0.
+      **Implementado** como `LDS_PAD_KIB` (constant_id 3) em `q4_k_matvec.comp`, ligável
+      por `LLAMA_RS_MATVEC_LDS_PAD=K`, **default 0 = comportamento atual**. K=22 dá 2
+      waves/SIMD e K=13 dá 4 (tabela no shader). Só a pipeline do decode; a do bloco tem
+      outra geometria. **Pendente de medição** — nenhum K foi comparado ainda.
 - [ ] **Distribuir a cauda**: com `(256,2)` cada dispatch cobre n_linhas/8 workgroups;
       medir se o último rank de workgroups deixa SIMDs ociosos (visível no trace
       Perfetto, `docs/debugging.md`). Se sim, testar grid 2D com menos linhas por
@@ -78,18 +99,40 @@ contra a referência CPU (`crates/llama-model/src/delta_net.rs` e os testes de
 integração) — o risco conhecido é binding silencioso errado
 (`docs/mtp-implementacao.md:82-85`):
 
-- [ ] **`dn_norm` L2 de q e k num dispatch só** (hoje são 2 por token por camada linear —
+- [x] **`dn_norm` L2 de q e k num dispatch só** (hoje são 2 por token por camada linear —
       96 dispatches/token). O shader já tem `modo` por push constant; adicionar modo que
       processa os dois tensores com offsets.
-- [ ] **`gate_mul` + `quantize_x`** (camadas de atenção): o portão sigmoide escreve e o
+      **Feito** como shader próprio `dn_l2_qk.comp` (3 bindings: conv → qn, kn) em vez de
+      um modo: q e k saem em **buffers distintos**, e o `dn_norm` só tem um binding de
+      saída — acrescentar outro mudaria o número de bindings de todos os modos. 96 → 48
+      dispatches/token. Teste `l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia`.
+      **Pendente de medição.**
+- [x] **`gate_mul` + `quantize_x`** (camadas de atenção): o portão sigmoide escreve e o
       quantize relê o mesmo buffer. Um shader `gate_quant` que aplica o portão e
       quantiza na mesma passada; o precedente é o `norm_p2`, que já quantiza direto.
-- [ ] **`swiglu` + `quantize_x`** (todas as 65 camadas): mesmo padrão.
-- [ ] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
+      **Feito** — `gate_quant.comp`, uma lane por bloco de 32 como o `norm_p2`.
+      `gate_mul.comp` ficou sem uso e saiu junto. Teste
+      `gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x` (portão contra a CPU,
+      `xq`/`xd` exatos contra o `quantize_x`). **Pendente de medição.**
+- [x] **`swiglu` + `quantize_x`** (todas as 65 camadas): mesmo padrão.
+      **Feito** — `swiglu_quant.comp`; `swiglu.comp` e `dbg_swiglu` saíram junto. O teste
+      `resident_fwd_swiglu_igual_cpu` passou a rodar no shader fundido (silu(g)*u contra a
+      CPU) e `swiglu_quant_quantiza_igual_ao_quantize_x` prende `xq`/`xd` exatos.
+      **Pendente de medição.**
+- [x] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
       rope in-place + `kv_append` (cópia). Rope com binding de saída no cache elimina a
       cópia de K; V continua no append. Atenção ao offset por posição — é o motivo de o
       planejador tratar o cache como buffer único em `marcar_barreiras`.
-- [ ] Medir o conjunto; alvo ≤4,5 ms para "outras ops".
+      **Feito** como `rope_kv.comp` (3 bindings; `kv_off` no push, montado na gravação a
+      partir de `total_len` e de `groups_y`). Ele cobre `head_dim/2` pares por cabeça, não
+      `rope_dim/2`: com rotary parcial o que não gira ainda precisa chegar ao cache. O
+      `kv_append` ficou só com V, e com isso `rope`, `rope_kv` e o append caem no mesmo
+      grupo de barreiras — **uma barreira a menos por camada de atenção**.
+      Ligado por padrão; `LLAMA_RS_ROPE_KV=0` volta ao caminho antigo para o A/B.
+      Teste `rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia`: saída **bit a bit**
+      igual à do `rope.comp` em rotary completa e parcial, com 1 e 2 tokens.
+      **Pendente de medição.**
+- [ ] Medir o conjunto; alvo ≤4,5 ms para "outras ops". **Pendente de medição.**
 
 ## Tarefa 4 — Host: só se a medição mandar
 

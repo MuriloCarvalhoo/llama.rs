@@ -642,7 +642,11 @@ fn resident_gpu_buffers_estabilizam_apos_warmup() {
 
 #[test]
 fn resident_fwd_swiglu_igual_cpu() {
-    use llama_vulkan::{ResidentForward, VulkanContext};
+    // O SwiGLU não é mais um dispatch próprio: ele saiu fundido com a quantização em
+    // `swiglu_quant.comp` (um só dispatch por camada). O teste segue comparando
+    // silu(g)*u com a CPU, agora no shader que o plano de fato executa; a metade da
+    // quantização é conferida em `delta_net.rs`, contra o `quantize_x`.
+    use llama_vulkan::{DnPipe, ResidentForward, VulkanContext};
     let Ok(ctx) = VulkanContext::new() else {
         eprintln!("sem Vulkan — pulando");
         return;
@@ -653,7 +657,7 @@ fn resident_fwd_swiglu_igual_cpu() {
     }
     let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
 
-    let n = 4864usize;
+    let n = 4864usize; // múltiplo de 32, como todo `n_ff`
     let g: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
     let u: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * 0.3 + 0.1).collect();
     let cpu: Vec<f32> = g
@@ -662,8 +666,21 @@ fn resident_fwd_swiglu_igual_cpu() {
         .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
         .collect();
 
-    let gpu = fwd.dbg_swiglu(&g, &u).unwrap();
-    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::SwigluQuant,
+            &[
+                g.clone(),
+                u.clone(),
+                vec![0f32; n],
+                vec![0f32; n / 32 * 8],
+                vec![0f32; n / 32],
+            ],
+            &u32::try_from(n).unwrap().to_le_bytes(),
+            u32::try_from((n / 32).div_ceil(64)).unwrap(),
+        )
+        .expect("dispatch swiglu_quant");
+    for (i, (a, b)) in cpu.iter().zip(saida[2].iter()).enumerate() {
         assert!((a - b).abs() < 1e-4, "swiglu[{i}]: cpu={a} gpu={b}");
     }
 }

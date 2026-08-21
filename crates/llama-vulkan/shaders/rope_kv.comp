@@ -1,0 +1,64 @@
+#version 450
+
+// RoPE de K escrevendo **direto no slot do KV-cache**, em vez de girar `b_k` no lugar e
+// deixar uma cópia `b_k → kcache` para o `kv_append`. O V continua indo pela cópia: ele não
+// passa por RoPE nenhum.
+//
+// Diferenças para o `rope.comp`, que segue servindo a Q (in-place, sem cache):
+//
+// - a saída é um binding próprio (o KV-cache inteiro) mais `kv_off`, o índice em floats do
+//   primeiro token do bloco dentro do slot da camada. É o único offset do plano que depende
+//   da posição, e é por isso que `marcar_barreiras` trata o cache como um buffer só;
+// - o shader cobre `head_dim / 2` pares por cabeça, não `rope_dim / 2`: os pares acima de
+//   `rope_dim` não giram, mas **precisam ser copiados** para o cache do mesmo jeito. Girando
+//   in-place isso saía de graça, porque a cópia levava a cabeça inteira.
+//
+// As cabeças de K são contíguas (`kv_dim = n_head_kv * head_dim`) tanto na entrada quanto no
+// cache, então entrada e saída usam o mesmo passo.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer KBuf { float k[]; } kb;
+layout(set = 0, binding = 1) readonly buffer FBuf { float f[]; } fb;  // freq_table[rope_dim/2]
+layout(set = 0, binding = 2) writeonly buffer CBuf { float c[]; } cb; // kcache inteiro
+
+layout(push_constant) uniform PC {
+    uint n_head;    // n_head_kv
+    uint head_dim;
+    uint rope_dim;
+    float pos;      // posição do ÚLTIMO token do bloco, como no `rope.comp`
+    uint kv_off;    // em floats: (slot * ctx + pos0) * kv_dim
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_head = pc.head_dim / 2u;
+    uint total = pc.n_head * half_head;
+    if (idx >= total) { return; }
+
+    // Batch: a dimensão Y é o token do bloco e `pc.pos` é a posição do último deles — o
+    // mesmo significado do `rope.comp` e do `attention.comp`.
+    uint t = gl_WorkGroupID.y;
+    uint n_tok = gl_NumWorkGroups.y;
+    float pos_t = pc.pos - float(n_tok - 1u) + float(t);
+
+    uint h = idx / half_head;
+    uint i = idx - h * half_head;
+    uint linha = t * pc.n_head * pc.head_dim + h * pc.head_dim;
+
+    float a = kb.k[linha + 2u * i];
+    float b = kb.k[linha + 2u * i + 1u];
+    // Rotary parcial: acima de `rope_dim` a dimensão vai para o cache sem girar.
+    if (2u * i < pc.rope_dim) {
+        float theta = pos_t * fb.f[i];
+        float s = sin(theta);
+        float c = cos(theta);
+        float a0 = a;
+        a = a0 * c - b * s;
+        b = a0 * s + b * c;
+    }
+
+    uint destino = pc.kv_off + linha;
+    cb.c[destino + 2u * i] = a;
+    cb.c[destino + 2u * i + 1u] = b;
+}

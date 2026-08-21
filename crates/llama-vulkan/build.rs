@@ -12,18 +12,20 @@ fn main() {
         ("norm_fused.comp", "NORM_FUSED_SPV"),
         ("norm_p2.comp", "NORM_P2_SPV"),
         ("rope.comp", "ROPE_SPV"),
+        ("rope_kv.comp", "ROPE_KV_SPV"),
         ("attention.comp", "ATTENTION_SPV"),
         // Atenção com o KV fatiado entre workgroups (contexto longo) + a redução.
         ("attention_split.comp", "ATTENTION_SPLIT_SPV"),
         ("attn_reduce.comp", "ATTN_REDUCE_SPV"),
-        ("swiglu.comp", "SWIGLU_SPV"),
+        ("swiglu_quant.comp", "SWIGLU_QUANT_SPV"),
         ("add.comp", "ADD_SPV"),
         // Camadas de atenção linear (qwen35) — ver docs/qwen35-arquitetura.md.
         ("delta_net.comp", "DELTA_NET_SPV"),
         ("dn_conv.comp", "DN_CONV_SPV"),
         ("dn_gates.comp", "DN_GATES_SPV"),
         ("dn_norm.comp", "DN_NORM_SPV"),
-        ("gate_mul.comp", "GATE_MUL_SPV"),
+        ("dn_l2_qk.comp", "DN_L2_QK_SPV"),
+        ("gate_quant.comp", "GATE_QUANT_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
