@@ -36,6 +36,35 @@ pub(crate) fn batch_size() -> usize {
         .clamp(1, 8)
 }
 
+/// Geometria dos matvec do **bloco de prefill**, separada da do decode.
+///
+/// O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane: no
+/// decode (COLS=1) cabem 2 linhas por wave, mas com COLS=8 seriam 16 acumuladores mais as
+/// 8 ativações, e aí a pressão de registrador derruba as waves por SIMD — e o workgroup
+/// grande piora, porque todas as suas waves precisam caber juntas na mesma CU.
+///
+/// Medido no Qwen3.8-27B (ms do `matvec_q4k_b` por bloco de 8, `LLAMA_RS_PROFILE=1`):
+///
+/// | wg,linhas | 64,1 | 128,1 | 256,1 | 256,2 | 512,1 | 1024,1 |
+/// |---|---:|---:|---:|---:|---:|---:|
+/// | ms | **8,9** | 14,7 | 24,1 | 31,2 | 48,2 | 151,5 |
+///
+/// Daí o padrão `(64, 1)`: um workgroup **é** uma wave, então o escalonador coloca quantas
+/// couberem por VGPR, sem ter de alocar o grupo inteiro de uma vez. O decode segue com a
+/// sua geometria, que foi tunada para COLS=1. `LLAMA_RS_MATVEC_GEOM_B=wg,linhas` sobrescreve.
+pub(crate) fn matvec_geom_batch() -> (u32, u32) {
+    std::env::var("LLAMA_RS_MATVEC_GEOM_B")
+        .ok()
+        .and_then(|v| {
+            let (wg, rows) = v.split_once(',')?;
+            Some((wg.trim().parse().ok()?, rows.trim().parse().ok()?))
+        })
+        .filter(|&(wg, rows): &(u32, u32)| {
+            wg % 64 == 0 && (64..=1024).contains(&wg) && (1..=4).contains(&rows)
+        })
+        .unwrap_or((64, 1))
+}
+
 /// Slot de KV-cache de cada camada local e o total de slots.
 ///
 /// Só camada de atenção tem cache. As delta-net do qwen35 (três de cada quatro) guardam
@@ -576,6 +605,9 @@ pub(crate) struct Prof {
     /// Nanossegundos acumulados por índice de op do plano.
     pub accum: RefCell<Vec<u64>>,
     pub tokens: std::cell::Cell<usize>,
+    /// O mesmo para o plano do bloco de prefill, que tem outra lista de ops.
+    pub accum_batch: RefCell<Vec<u64>>,
+    pub blocos: std::cell::Cell<usize>,
     /// Zonas absolutas para a timeline (`--trace`). Vazio quando não se pede trace.
     pub spans: RefCell<Vec<GpuSpan>>,
     /// Limite de tokens gravados, para o arquivo não crescer sem fim.
@@ -871,7 +903,8 @@ impl<'ctx> ResidentForward<'ctx> {
         // Variantes de prefill: `COLS` é specialization constant, então cada largura de
         // batch é uma pipeline própria. O Q6_K expõe COLS no id 0 (geometria fixa no shader).
         let cols = batch_size() as u32;
-        let geom_b = [(0, mv_wg), (1, mv_rows), (2, cols)];
+        let (mvb_wg, mvb_rows) = matvec_geom_batch();
+        let geom_b = [(0, mvb_wg), (1, mvb_rows), (2, cols)];
         let matvec_b = ComputePipeline::with(
             d,
             crate::Q8_0_MATVEC_SPV,
@@ -1293,11 +1326,13 @@ impl<'ctx> ResidentForward<'ctx> {
             Vec::new()
         };
         // Perfilamento opcional: 1 timestamp antes do plano + 1 depois de cada op, então
-        // o pool é dimensionado pelo plano (o 14B tem ~1100 ops/token).
+        // o pool é dimensionado pelo **maior** dos dois planos — o do bloco de prefill tem
+        // mais ops que o do decode, porque a recorrência do delta-net vira um dispatch por
+        // token do bloco.
         let prof = if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
             let info = vk::QueryPoolCreateInfo {
                 query_type: vk::QueryType::TIMESTAMP,
-                query_count: u32::try_from(plan.len() + 1)
+                query_count: u32::try_from(plan.len().max(plan_batch.len()) + 1)
                     .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?,
                 ..Default::default()
             };
@@ -1314,6 +1349,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 period_ns: props.limits.timestamp_period,
                 accum: RefCell::new(Vec::new()),
                 tokens: std::cell::Cell::new(0),
+                accum_batch: RefCell::new(Vec::new()),
+                blocos: std::cell::Cell::new(0),
                 spans: RefCell::new(Vec::new()),
                 max_trace_tokens: std::env::var("LLAMA_RS_TRACE_TOKENS")
                     .ok()
@@ -2322,9 +2359,9 @@ impl<'ctx> ResidentForward<'ctx> {
         } else {
             (&st.plan, &st.barreiras)
         };
-        // O query pool é dimensionado pelo plano de decode, e os índices das ops do bloco
-        // não correspondem aos dele — o perfil segue medindo só o decode.
-        let prof = if n_tok > 1 { None } else { st.prof.as_ref() };
+        // Os dois planos são medidos: cada um tem o seu acumulador, porque as listas de
+        // ops não se correspondem (`collect_prof` escolhe pelo `n_tok`).
+        let prof = st.prof.as_ref();
 
         // Timestamp inicial (slot 0); cada op grava o seu em slot i+1.
         if let Some(pf) = prof {
@@ -2575,9 +2612,16 @@ impl<'ctx> ResidentForward<'ctx> {
             .to_vec()
         };
         // Linhas que um workgroup do Q5_K cobre — tem de casar com as spec constants da
-        // pipeline, senão sobram ou faltam workgroups.
+        // pipeline **deste plano**, senão sobram ou faltam workgroups. O bloco de prefill
+        // tem geometria própria (`matvec_geom_batch`), e usar a do decode aqui deixava o
+        // dispatch cobrindo uma fração das linhas: o kernel ficava mais rápido por não
+        // fazer o trabalho (erro de 85% nos logits, pego pelo teste do prefill).
         let rows_q5k = {
-            let (wg, rows) = matvec_geom();
+            let (wg, rows) = if n_tok > 1 {
+                matvec_geom_batch()
+            } else {
+                matvec_geom()
+            };
             (wg / 64 * rows) as usize
         };
         // Push do quantize: n_in + 2 pads (o range declarado no pipeline e de 12 bytes).
@@ -3119,9 +3163,10 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Lê os timestamps do token e acumula o tempo de GPU por op. No-op sem profiling.
-    fn collect_prof(&self, st: &ResidentState) -> Result<(), MatmulError> {
+    fn collect_prof(&self, st: &ResidentState, n_tok: usize) -> Result<(), MatmulError> {
         let Some(pf) = &st.prof else { return Ok(()) };
-        let n = st.plan.len() + 1;
+        let plano = if n_tok > 1 { &st.plan_batch } else { &st.plan };
+        let n = plano.len() + 1;
         let mut ticks = vec![0u64; n];
         // SAFETY: pool tem >= n slots, todos escritos neste command buffer já concluído.
         unsafe {
@@ -3132,7 +3177,11 @@ impl<'ctx> ResidentForward<'ctx> {
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )?;
         }
-        let mut accum = pf.accum.borrow_mut();
+        let mut accum = if n_tok > 1 {
+            pf.accum_batch.borrow_mut()
+        } else {
+            pf.accum.borrow_mut()
+        };
         if accum.len() < n - 1 {
             accum.resize(n - 1, 0);
         }
@@ -3142,12 +3191,17 @@ impl<'ctx> ResidentForward<'ctx> {
             let ns = (delta as f64 * f64::from(pf.period_ns)) as u64;
             accum[i] += ns;
         }
-        pf.tokens.set(pf.tokens.get() + 1);
+        drop(accum);
+        if n_tok > 1 {
+            pf.blocos.set(pf.blocos.get() + 1);
+        } else {
+            pf.tokens.set(pf.tokens.get() + 1);
+        }
 
         // Zonas absolutas para a timeline. O fence acabou de ser aguardado, então `agora`
         // é o instante do ÚLTIMO timestamp — dá para ancorar o token inteiro sem submit
         // extra nem VK_EXT_calibrated_timestamps, e sem drift acumulado entre tokens.
-        if pf.tokens.get() <= pf.max_trace_tokens {
+        if n_tok == 1 && pf.tokens.get() <= pf.max_trace_tokens {
             let now = std::time::Instant::now();
             let last = ticks[n - 1];
             let at = |tick: u64| -> std::time::Instant {
@@ -3157,7 +3211,7 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let mut spans = pf.spans.borrow_mut();
             for i in 0..n - 1 {
-                let name = match st.plan.get(i) {
+                let name = match plano.get(i) {
                     Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
                     Some(PlannedOp::Embed) => "embed",
                     Some(PlannedOp::KvAppend { .. }) => "kv_append",
@@ -3195,14 +3249,28 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(st) = self.state.as_ref() else {
             return;
         };
+        self.perfil_de(st, false);
+        self.perfil_de(st, true);
+    }
+
+    /// Uma tabela do perfil: `bloco` escolhe entre o plano do prefill e o do decode.
+    #[allow(clippy::cast_precision_loss)]
+    fn perfil_de(&self, st: &ResidentState, bloco: bool) {
         let Some(pf) = &st.prof else { return };
-        let tokens = pf.tokens.get().max(1);
-        let accum = pf.accum.borrow();
+        let (plano, accum, passos) = if bloco {
+            (&st.plan_batch, pf.accum_batch.borrow(), pf.blocos.get())
+        } else {
+            (&st.plan, pf.accum.borrow(), pf.tokens.get())
+        };
+        if passos == 0 || accum.is_empty() {
+            return;
+        }
+        let tokens = passos;
 
         let mut por_tipo: std::collections::BTreeMap<&'static str, (u64, usize)> =
             std::collections::BTreeMap::new();
         for (i, &ns) in accum.iter().enumerate() {
-            let label = match st.plan.get(i) {
+            let label = match plano.get(i) {
                 Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
                 Some(PlannedOp::Embed) => "embed",
                 Some(PlannedOp::KvAppend { .. }) => "kv_append",
@@ -3216,25 +3284,28 @@ impl<'ctx> ResidentForward<'ctx> {
 
         let total: u64 = accum.iter().sum();
         let ms = |ns: u64| ns as f64 / 1e6 / tokens as f64;
+        let unidade = if bloco { "blocos" } else { "tokens" };
+        let por = if bloco { "ms/bloco" } else { "ms/token" };
         eprintln!(
-            "\n=== PERFIL GPU ({tokens} tokens, {} ops/token) ===",
+            "\n=== PERFIL GPU — {} ({tokens} {unidade}, {} ops) ===",
+            if bloco { "prefill em batch" } else { "decode" },
             accum.len()
         );
-        eprintln!(
-            "{:<12} {:>10} {:>8} {:>10}",
-            "op", "ms/token", "%", "n/token"
-        );
+        eprintln!("{:<16} {:>10} {:>8} {:>8}", "op", por, "%", "n");
         let mut linhas: Vec<_> = por_tipo.iter().collect();
         linhas.sort_by_key(|x| std::cmp::Reverse(x.1.0));
         for (label, (ns, n)) in linhas {
             eprintln!(
-                "{label:<12} {:>10.3} {:>7.1}% {:>10}",
+                "{label:<16} {:>10.3} {:>7.1}% {:>8}",
                 ms(*ns),
                 100.0 * *ns as f64 / total.max(1) as f64,
                 n
             );
         }
-        eprintln!("{:<12} {:>10.3} {:>7.1}%", "TOTAL GPU", ms(total), 100.0);
+        eprintln!("{:<16} {:>10.3} {:>7.1}%", "TOTAL GPU", ms(total), 100.0);
+        if bloco {
+            return;
+        }
         let h = pf.host.borrow();
         eprintln!("\n--- host (ms/token) ---");
         eprintln!("{:<12} {:>10.3}", "gravacao", ms(h[0]));
@@ -3478,7 +3549,7 @@ impl<'ctx> ResidentForward<'ctx> {
         self.espera_fence(st)?;
         let t_sub = t1.elapsed();
         let t2 = std::time::Instant::now();
-        self.collect_prof(st)?;
+        self.collect_prof(st, tokens.len())?;
 
         let len = if st.cfg.shard.is_last() {
             st.cfg.vocab

@@ -1,0 +1,13 @@
+[package]
+name = "validacao-rust-praticas"
+version = "0.1.0"
+edition = "2024"
+
+# Tabela vazia: desacopla este crate do workspace do llama.rs de propósito.
+# Ele é uma ferramenta de medição, não parte do produto.
+[workspace]
+
+# Mesmo perfil do workspace raiz, para que os números reflitam o build real do projeto.
+[profile.release]
+lto = "thin"
+codegen-units = 1
