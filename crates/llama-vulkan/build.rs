@@ -13,6 +13,9 @@ fn main() {
         ("norm_p2.comp", "NORM_P2_SPV"),
         ("rope.comp", "ROPE_SPV"),
         ("attention.comp", "ATTENTION_SPV"),
+        // Atenção com o KV fatiado entre workgroups (contexto longo) + a redução.
+        ("attention_split.comp", "ATTENTION_SPLIT_SPV"),
+        ("attn_reduce.comp", "ATTN_REDUCE_SPV"),
         ("swiglu.comp", "SWIGLU_SPV"),
         ("add.comp", "ADD_SPV"),
         // Camadas de atenção linear (qwen35) — ver docs/qwen35-arquitetura.md.

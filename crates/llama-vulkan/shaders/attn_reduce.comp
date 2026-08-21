@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+
+// Parciais do `attention_split`: por (t, h, split) um [m, l, acc[head_dim]].
+layout(set = 0, binding = 0) readonly buffer PBuf { float p[]; } pbuf;
+layout(set = 0, binding = 1) writeonly buffer OBuf { float o[]; } ob;  // [n_tok*n_head*head_dim]
+
+layout(push_constant) uniform PC {
+    uint n_head; uint head_dim; uint n_split;
+} pc;
+
+// Combina as fatias do KV pela mesma álgebra do softmax online: o máximo global, os
+// pesos `exp(m_s - m_max)` e uma única divisão pela soma. É associativa em (m, l, acc),
+// então fatiar o KV não muda o resultado — só a ordem das somas (~1e-6).
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (h >= pc.n_head) { return; }
+
+    uint base = (t * pc.n_head + h) * pc.n_split * (pc.head_dim + 2u);
+    uint stride = pc.head_dim + 2u;
+
+    float m_max = -1.0e30;
+    for (uint s = 0u; s < pc.n_split; s++) {
+        m_max = max(m_max, pbuf.p[base + s * stride]);
+    }
+    float l_all = 0.0;
+    for (uint s = 0u; s < pc.n_split; s++) {
+        l_all += pbuf.p[base + s * stride + 1u] * exp(pbuf.p[base + s * stride] - m_max);
+    }
+    float inv = (l_all == 0.0) ? 0.0 : 1.0 / l_all;
+
+    for (uint d = gl_LocalInvocationID.x; d < pc.head_dim; d += gl_WorkGroupSize.x) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.n_split; s++) {
+            float peso = exp(pbuf.p[base + s * stride] - m_max);
+            acc += peso * pbuf.p[base + s * stride + 2u + d];
+        }
+        ob.o[(t * pc.n_head + h) * pc.head_dim + d] = acc * inv;
+    }
+}

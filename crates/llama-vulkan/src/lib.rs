@@ -18,7 +18,7 @@ pub use dual_gpu::DualGpuMatmul;
 pub use layer_split::LayerSplitForward;
 pub use model_gpu::GpuWeights;
 pub use resident::ResidentGpu;
-pub use resident_forward::{DnPipe, GpuSpan, ResidentForward, Shard};
+pub use resident_forward::{DnPipe, GpuSpan, ResidentForward, Shard, forcar_splits};
 
 pub(crate) const Q8_0_MATVEC_SPV: &[u8] = include_bytes!(concat!(env!("Q8_0_MATVEC_SPV")));
 pub(crate) const QUANTIZE_X_SPV: &[u8] = include_bytes!(concat!(env!("QUANTIZE_X_SPV")));
@@ -33,6 +33,8 @@ pub(crate) const NORM_P2_SPV: &[u8] = include_bytes!(concat!(env!("NORM_P2_SPV")
 pub(crate) const ROPE_SPV: &[u8] = include_bytes!(concat!(env!("ROPE_SPV")));
 #[allow(dead_code)]
 pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPV")));
+pub(crate) const ATTENTION_SPLIT_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPLIT_SPV")));
+pub(crate) const ATTN_REDUCE_SPV: &[u8] = include_bytes!(concat!(env!("ATTN_REDUCE_SPV")));
 #[allow(dead_code)]
 pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_SPV")));
 #[allow(dead_code)]

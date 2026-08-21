@@ -1,0 +1,125 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;   // [n_tok*n_head*q_stride]
+layout(set = 0, binding = 1) readonly buffer KBuf { float k[]; } kb;   // KV-cache K
+layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; } vb;   // KV-cache V
+// Parciais: por (t, h, split) um registro [m, l, acc[head_dim]].
+layout(set = 0, binding = 3) writeonly buffer PBuf { float p[]; } pbuf;
+
+layout(push_constant) uniform PC {
+    uint n_head; uint n_head_kv; uint head_dim;
+    uint total_len; uint kv_dim; uint kv_layer_off;
+    uint q_stride;
+} pc;
+
+const uint WG = 64u;      // lanes por wave (wave64 no MI50)
+const uint NWAVE = 8u;    // waves por workgroup — local_size_x / WG
+const uint MAX_DPL = 4u;  // dimensoes por lane -> head_dim ate 256
+
+// Mesma matemática do `attention.comp`, com uma diferença: o KV é fatiado entre os
+// workgroups da dimensão Z, e cada um publica o seu (m, l, acc) parcial em vez da saída.
+//
+// Por que: com 1 workgroup por head o laço sobre `total_len` é uma cadeia serial de
+// `total_len/NWAVE` passos, e cada passo espera um load do KV mais um `subgroupAdd`. Em
+// contexto curto isso não aparece; com 26k posições no cache o decode mede 18 GB/s
+// efetivos contra os ~500 GB/s dos matvec — é latência não escondida, não banda. Aqui as
+// 24 cabeças viram 24*n_split workgroups, e a cadeia de cada um encurta na mesma
+// proporção. O `flash_attn_split_k_reduce` do llama.cpp resolve o mesmo problema assim.
+shared float s_m[NWAVE];
+shared float s_l[NWAVE];
+shared float s_acc[NWAVE * 256u];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_head) { return; }
+
+    uint t = gl_WorkGroupID.y;
+    uint n_tok = gl_NumWorkGroups.y;
+    uint split = gl_WorkGroupID.z;
+    uint n_split = gl_NumWorkGroups.z;
+
+    // Máscara causal: o token t do bloco só vê 0..pos0+t.
+    uint total_len_t = pc.total_len - (n_tok - 1u) + t;
+    uint q_base = t * pc.n_head * pc.q_stride;
+
+    // Fatia deste workgroup, alinhada para todas as fatias terem o mesmo tamanho.
+    uint por_split = (total_len_t + n_split - 1u) / n_split;
+    uint ini = split * por_split;
+    uint fim = min(ini + por_split, total_len_t);
+
+    uint w = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint n_rep = pc.n_head / pc.n_head_kv;
+    uint kv_h = h / n_rep;
+    float scale = inversesqrt(float(pc.head_dim));
+    uint dpl = (pc.head_dim + WG - 1u) / WG;
+
+    float qd[MAX_DPL];
+    float acc[MAX_DPL];
+    for (uint i = 0u; i < MAX_DPL; i++) { qd[i] = 0.0; acc[i] = 0.0; }
+    for (uint i = 0u; i < dpl; i++) {
+        uint d = lane + i * WG;
+        qd[i] = (d < pc.head_dim) ? qb.q[q_base + h * pc.q_stride + d] : 0.0;
+    }
+
+    float m = -1.0e30;
+    float l = 0.0;
+    for (uint j = ini + w; j < fim; j += NWAVE) {
+        uint kvbase = pc.kv_layer_off + j * pc.kv_dim + kv_h * pc.head_dim;
+        float partial = 0.0;
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            partial += (d < pc.head_dim) ? qd[i] * kb.k[kvbase + d] : 0.0;
+        }
+        float s = subgroupAdd(partial) * scale;
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float p = exp(s - m_new);
+        l = l * corr + p;
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            float vd = (d < pc.head_dim) ? vb.v[kvbase + d] : 0.0;
+            acc[i] = acc[i] * corr + p * vd;
+        }
+        m = m_new;
+    }
+
+    if (lane == 0u) { s_m[w] = m; s_l[w] = l; }
+    for (uint i = 0u; i < dpl; i++) {
+        uint d = lane + i * WG;
+        if (d < pc.head_dim) { s_acc[w * pc.head_dim + d] = acc[i]; }
+    }
+    barrier();
+
+    // A wave 0 junta as NWAVE parciais internas e publica **uma** parcial do split.
+    // Fatia vazia (ini >= fim) sai com l = 0 e m = -1e30: peso zero na redução.
+    if (w == 0u) {
+        uint reg = ((t * pc.n_head + h) * n_split + split) * (pc.head_dim + 2u);
+        float m_all = -1.0e30;
+        for (uint kk = 0u; kk < NWAVE; kk++) { m_all = max(m_all, s_m[kk]); }
+        float peso[NWAVE];
+        float l_all = 0.0;
+        for (uint kk = 0u; kk < NWAVE; kk++) {
+            peso[kk] = exp(s_m[kk] - m_all);
+            l_all += s_l[kk] * peso[kk];
+        }
+        if (lane == 0u) {
+            pbuf.p[reg] = m_all;
+            pbuf.p[reg + 1u] = l_all;
+        }
+        for (uint i = 0u; i < dpl; i++) {
+            uint d = lane + i * WG;
+            if (d < pc.head_dim) {
+                float o = 0.0;
+                for (uint kk = 0u; kk < NWAVE; kk++) {
+                    o += peso[kk] * s_acc[kk * pc.head_dim + d];
+                }
+                // Sem dividir por l: a divisão acontece uma vez só, na redução.
+                pbuf.p[reg + 2u + d] = o;
+            }
+        }
+    }
+}

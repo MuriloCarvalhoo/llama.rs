@@ -768,6 +768,86 @@ fn resident_fwd_attention_igual_cpu() {
     }
 }
 
+/// A atenção com o KV fatiado entre workgroups tem de dar o **mesmo** resultado da
+/// versão de um workgroup por cabeça — é a mesma álgebra do softmax online, só que a
+/// combinação dos parciais passa a acontecer entre workgroups.
+///
+/// Os casos que importam: contexto longo (onde o split existe para ganhar), número de
+/// posições que não divide pelo número de splits, e mais splits do que posições — aí
+/// sobram fatias vazias, que não podem contaminar a soma.
+#[test]
+fn atencao_com_split_bate_com_a_de_um_workgroup() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    for (n_head, n_head_kv, head_dim, total_len, n_split) in [
+        (24, 4, 256, 3000, 16), // geometria do qwen35 com contexto longo
+        (24, 4, 256, 1001, 7),  // não divide igual
+        (14, 2, 64, 5, 8),      // mais splits do que posições: fatias vazias
+        (40, 8, 128, 300, 4),
+        // Geometria do Qwen2.5-0.5B, que é o modelo do teste no plano completo.
+        (14, 2, 64, 1200, 8),
+        (14, 2, 64, 1, 8),
+        (14, 2, 64, 2, 8),
+        (14, 2, 64, 8, 2),
+        (14, 2, 64, 8, 4),
+        (14, 2, 64, 40, 2),
+        (14, 2, 64, 3, 2),
+        (14, 2, 64, 5, 2),
+        (14, 2, 64, 9, 2),
+    ] {
+        attention_caso_split(&fwd, n_head, n_head_kv, head_dim, total_len, n_split);
+    }
+}
+
+fn attention_caso_split(
+    fwd: &llama_vulkan::ResidentForward<'_>,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    total_len: usize,
+    n_split: usize,
+) {
+    let kv_dim = n_head_kv * head_dim;
+    let q: Vec<f32> = (0..n_head * head_dim)
+        .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+        .collect();
+    let kc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+        .collect();
+    let vc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+        .collect();
+
+    let base = fwd
+        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1)
+        .unwrap();
+    let split = fwd
+        .dbg_attention_split(
+            &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1, n_split,
+        )
+        .unwrap();
+
+    assert_eq!(base.len(), split.len());
+    let pior = base
+        .iter()
+        .zip(&split)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        pior < 1e-5,
+        "split={n_split} total_len={total_len} head_dim={head_dim}: pior diferença {pior:.2e}"
+    );
+}
+
 fn attention_caso(
     fwd: &llama_vulkan::ResidentForward<'_>,
     n_head: usize,
@@ -1813,4 +1893,134 @@ fn argmax_u32(v: &[f32]) -> usize {
             if x > acc.1 { (i, x) } else { acc }
         })
         .0
+}
+
+/// O caminho fatiado dentro do **plano** (não só no harness isolado): com contexto longo
+/// o decode não pode ficar mais longe da referência de CPU do que o caminho de um
+/// workgroup por cabeça.
+///
+/// A comparação é contra a CPU, e não entre os dois caminhos, por um motivo medido: as
+/// duas somas do softmax são reassociadas de formas diferentes e diferem ~1e-7 logo
+/// depois da atenção — mas num 0.5B essa diferença **amplifica** ao longo das 24 camadas
+/// e chega a ~1e-2 nos logits (com 3 camadas, `LLAMA_RS_STOP_LAYER=3`, o erro entre eles
+/// é 1.3e-7). O erro de cada caminho contra a CPU é da mesma ordem, então o que
+/// distingue implementação certa de errada aqui é **não ficar pior que o baseline**.
+#[test]
+fn decode_com_kv_fatiado_nao_fica_pior_que_o_caminho_curto() {
+    use llama_vulkan::{ResidentForward, VulkanContext, forcar_splits};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let path = "../../models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("modelo ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let model = llama_model::Model::load(&f, &bytes).unwrap();
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config).unwrap();
+    let aux = model.gpu_aux_weights().unwrap();
+    let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux).unwrap();
+    let gpu: &dyn llama_model::GpuResidentDecode = &backend;
+    let tok = llama_tokenizer::Tokenizer::from_gguf(&f).unwrap();
+
+    let mut seq: Vec<u32> = Vec::new();
+    while seq.len() < 40 {
+        seq.extend(tok.encode(
+            "The quick brown fox jumps over the lazy dog. ",
+            seq.is_empty(),
+        ));
+    }
+    seq.truncate(40);
+
+    let rodar = |splits: u32| -> Vec<f32> {
+        forcar_splits(splits);
+        gpu.reset();
+        let mut logits = Vec::new();
+        for (pos, &t) in seq.iter().enumerate() {
+            logits = gpu.decode(t, pos).unwrap();
+        }
+        logits
+    };
+
+    let cpu = model.decode_one_cpu_logits(&seq).unwrap();
+    let escala = cpu.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let erro = |g: &[f32]| -> f32 {
+        g.iter()
+            .zip(&cpu)
+            .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs() / escala))
+    };
+
+    let e_curto = erro(&rodar(1));
+    let mut piores = Vec::new();
+    for n in [2u32, 4, 8, 16] {
+        let e = erro(&rodar(n));
+        eprintln!("{n} fatias: erro vs CPU {e:.2e} (caminho curto: {e_curto:.2e})");
+        piores.push((n, e));
+    }
+    forcar_splits(0);
+
+    for (n, e) in piores {
+        assert!(
+            e <= e_curto * 2.0 + 1e-3,
+            "{n} fatias ficou pior que o caminho curto: {e:.2e} contra {e_curto:.2e}"
+        );
+    }
+}
+
+/// O ganho que motiva o split: com o KV longo, fatiar tem de ser **muito** mais rápido.
+///
+/// O limite é folgado de propósito (2×) — o que se protege aqui é a característica, não
+/// um número: se um dia o kernel voltar a serializar o laço, o teste cai.
+#[test]
+fn atencao_fatiada_e_mais_rapida_com_kv_longo() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    // Geometria do Qwen3.8-27B com um contexto de agente.
+    let (n_head, n_head_kv, head_dim, total_len) = (24, 4, 256, 26472);
+    let kv_dim = n_head_kv * head_dim;
+    let q: Vec<f32> = (0..n_head * head_dim)
+        .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+        .collect();
+    let kc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+        .collect();
+    let vc: Vec<f32> = (0..total_len * kv_dim)
+        .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+        .collect();
+
+    let curto = fwd
+        .dbg_attention_bench(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1, 5)
+        .unwrap();
+    let fatiado = fwd
+        .dbg_attention_bench(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 16, 5)
+        .unwrap();
+
+    eprintln!(
+        "atenção com {total_len} posições: 1 workgroup/cabeça {:.1} ms | 16 fatias {:.1} ms",
+        curto * 1e3,
+        fatiado * 1e3
+    );
+    assert!(
+        fatiado * 2.0 < curto,
+        "fatiar não acelerou: {:.1} ms contra {:.1} ms",
+        fatiado * 1e3,
+        curto * 1e3
+    );
 }

@@ -36,6 +36,26 @@ pub(crate) fn batch_size() -> usize {
         .clamp(1, 8)
 }
 
+/// Slot de KV-cache de cada camada local e o total de slots.
+///
+/// Só camada de atenção tem cache. As delta-net do qwen35 (três de cada quatro) guardam
+/// um estado recorrente de tamanho fixo e não escrevem nada aqui — numerar o cache pelo
+/// índice da camada reservaria 4× a memória: 17 GB contra 4,4 GB num ctx de 32k.
+pub(crate) fn slots_kv(eh_atencao: impl IntoIterator<Item = bool>) -> (Vec<Option<usize>>, usize) {
+    let mut total = 0usize;
+    let slots = eh_atencao
+        .into_iter()
+        .map(|attn| {
+            attn.then(|| {
+                let slot = total;
+                total += 1;
+                slot
+            })
+        })
+        .collect();
+    (slots, total)
+}
+
 /// Geometria dos matvec K-quant: (lanes por workgroup, linhas de saída por wave).
 ///
 /// Vira specialization constant nos shaders, então o compilador desenrola os laços sobre as
@@ -300,6 +320,8 @@ pub(crate) enum PipeId {
     NormP2,
     Rope,
     Attention,
+    AttentionSplit,
+    AttnReduce,
     Swiglu,
     Add,
     DeltaNet,
@@ -325,6 +347,8 @@ impl PipeId {
             PipeId::NormP2 => "norm_p2",
             PipeId::Rope => "rope",
             PipeId::Attention => "attention",
+            PipeId::AttentionSplit => "attention_split",
+            PipeId::AttnReduce => "attn_reduce",
             PipeId::Swiglu => "swiglu",
             PipeId::Add => "add",
             PipeId::DeltaNet => "delta_net",
@@ -354,7 +378,8 @@ impl PipeId {
             | PipeId::MatvecQ5KB
             | PipeId::MatvecQ6KB
             | PipeId::MatvecQ4KB => (&[0, 1, 2, 4], &[3]),
-            PipeId::Attention => (&[0, 1, 2], &[3]),
+            PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
+            PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
             PipeId::Swiglu => (&[0, 1], &[2]),
             // x é inout (recebe o residual); sai a soma parcial por workgroup.
@@ -387,6 +412,9 @@ pub(crate) enum PushSpec {
     Rope { n_head: u32, stride: u32 },
     /// Attention: precisa de `total_len`. `kv_layer_off` fixo.
     Attention { kv_layer_off: u32 },
+    /// Redução dos parciais do split: precisa do número de fatias, escolhido na gravação
+    /// a partir de `total_len`.
+    AttnReduce,
 }
 
 /// Fecha um dispatch genérico do plano: pipeline, bindings, grupos e push constants.
@@ -424,8 +452,56 @@ pub(crate) enum PlannedOp {
     Embed,
     /// Append do K e do V da camada ao KV-cache a partir da posição do primeiro token do
     /// bloco. As posições do bloco são consecutivas, então é uma cópia só.
-    KvAppend { layer: usize },
+    KvAppend { slot: usize },
+    /// Atenção com dois caminhos prontos: um workgroup por cabeça (contexto curto) ou o
+    /// KV fatiado entre workgroups mais a redução dos parciais (contexto longo).
+    ///
+    /// A escolha depende de `total_len`, que só existe na gravação do command buffer —
+    /// por isso os dois ficam no plano e só um é gravado por token.
+    Atencao {
+        curto: Box<PlannedOp>,
+        split: Box<PlannedOp>,
+        reduce: Box<PlannedOp>,
+    },
 }
+
+/// Em quantas fatias dividir o KV. 1 mantém o caminho de um workgroup por cabeça.
+///
+/// Com o KV curto a cadeia serial do `attention.comp` já é curta e a redução não se
+/// paga; a partir de alguns milhares de posições ela domina o token (medido: 18 GB/s
+/// efetivos contra ~500 GB/s dos matvec) e fatiar recupera a ocupância.
+pub(crate) fn splits_do_kv(total_len: u32) -> u32 {
+    let forcado = SPLITS_FORCADOS.load(std::sync::atomic::Ordering::Relaxed);
+    if forcado > 0 {
+        return forcado.min(MAX_SPLITS as u32);
+    }
+    /// Posições por fatia. Abaixo disso o workgroup nasce sem trabalho suficiente para
+    /// pagar a escrita do parcial.
+    const POR_FATIA: u32 = 512;
+    (total_len / POR_FATIA).clamp(1, MAX_SPLITS as u32)
+}
+
+/// Sobrescreve o número de fatias (0 = automático). `LLAMA_RS_ATTN_SPLIT=N` no ambiente,
+/// ou [`forcar_splits`] em teste — é o que permite comparar os dois caminhos no mesmo
+/// processo e medir a diferença sem trocar de binário.
+static SPLITS_FORCADOS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn forcar_splits(n: u32) {
+    SPLITS_FORCADOS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lê `LLAMA_RS_ATTN_SPLIT` uma vez, na construção do backend.
+fn splits_do_ambiente() {
+    if let Some(n) = std::env::var("LLAMA_RS_ATTN_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        forcar_splits(n);
+    }
+}
+
+/// Teto de fatias do KV: o buffer de parciais é dimensionado por ele.
+pub(crate) const MAX_SPLITS: usize = 16;
 
 /// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
@@ -451,6 +527,8 @@ pub(crate) struct ResidentState {
     pub b_k: Buf,
     pub b_v: Buf,
     pub b_attn: Buf,
+    /// Parciais (m, l, acc) da atenção com o KV fatiado — ver `splits_do_kv`.
+    pub b_attn_split: Buf,
     pub b_proj: Buf,
     pub b_gate: Buf,
     pub b_up: Buf,
@@ -547,6 +625,10 @@ pub struct ResidentForward<'ctx> {
     pub(crate) norm_p2: ComputePipeline,
     pub(crate) rope: ComputePipeline,
     pub(crate) attention: ComputePipeline,
+    /// Atenção com o KV fatiado entre workgroups + a redução dos parciais. Só entram
+    /// com contexto longo, onde a cadeia serial do `attention` domina o token.
+    pub(crate) attention_split: ComputePipeline,
+    pub(crate) attn_reduce: ComputePipeline,
     pub(crate) swiglu: ComputePipeline,
     pub(crate) add: ComputePipeline,
     // Camadas de atenção linear (qwen35).
@@ -600,10 +682,24 @@ impl<'ctx> ResidentForward<'ctx> {
         &self,
         pipe: &ComputePipeline,
         set: vk::DescriptorSet,
+        bindings: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+        push: &[u8],
+        groups: u32,
+        groups_y: u32,
+    ) -> Result<(), MatmulError> {
+        self.dispatch_xyz(pipe, set, bindings, push, groups, groups_y, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_xyz(
+        &self,
+        pipe: &ComputePipeline,
+        set: vk::DescriptorSet,
         bindings: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)], // (buffer, offset, range)
         push: &[u8],
         groups: u32,
         groups_y: u32,
+        groups_z: u32,
     ) -> Result<(), MatmulError> {
         let d = &self.dev.device;
         let dev = &self.dev;
@@ -658,7 +754,7 @@ impl<'ctx> ResidentForward<'ctx> {
             if !push.is_empty() {
                 d.cmd_push_constants(cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
-            d.cmd_dispatch(cmd, groups, groups_y, 1);
+            d.cmd_dispatch(cmd, groups, groups_y, groups_z);
             d.end_command_buffer(cmd)?;
         }
         let submit = vk::SubmitInfo {
@@ -794,6 +890,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let norm_p2 = ComputePipeline::with(d, crate::NORM_P2_SPV, 6, 12, &[])?;
         let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 20, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
+        let attention_split = ComputePipeline::with(d, crate::ATTENTION_SPLIT_SPV, 4, 28, &[])?;
+        let attn_reduce = ComputePipeline::with(d, crate::ATTN_REDUCE_SPV, 2, 12, &[])?;
         let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
         // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
@@ -838,6 +936,8 @@ impl<'ctx> ResidentForward<'ctx> {
             norm_p2,
             rope,
             attention,
+            attention_split,
+            attn_reduce,
             swiglu,
             add,
             delta_net,
@@ -894,6 +994,7 @@ impl<'ctx> ResidentForward<'ctx> {
             let dev_ref = &me.dev;
             let d = &dev_ref.device;
 
+            splits_do_ambiente();
             let cfg = Cfg {
                 n_embd: config.n_embd,
                 n_layer: shard.n_layers(),
@@ -1044,7 +1145,12 @@ impl<'ctx> ResidentForward<'ctx> {
             let embd_stage =
                 Buf::host(ctx, phys, d, (config.n_embd * nbatch * 4) as vk::DeviceSize)?;
 
-            let kv_elems = (cfg.n_layer * cfg.ctx * kv_dim) as vk::DeviceSize;
+            // Só as camadas de atenção têm KV-cache: no qwen35 as outras três de cada
+            // quatro são delta-net, com estado recorrente de tamanho fixo. Reservar por
+            // camada global custaria 4× — ver `slots_kv`.
+            let (_, n_slots_kv) =
+                slots_kv(qw.iter().map(|l| !matches!(l.mixer, MixerQ::Delta { .. })));
+            let kv_elems = (n_slots_kv * cfg.ctx * kv_dim) as vk::DeviceSize;
             let kcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
             let vcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
 
@@ -1130,6 +1236,9 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_k: nf(kv_dim)?,
                 b_v: nf(kv_dim)?,
                 b_attn: nf(attn_dim)?,
+                // Parciais da atenção fatiada: por (token, cabeça, fatia) um registro
+                // [m, l, acc[head_dim]]. Dimensionado pelo teto de `splits_do_kv`.
+                b_attn_split: nf(config.n_head * MAX_SPLITS * (config.head_dim + 2))?,
                 b_proj: nf(config.n_embd)?,
                 b_gate: nf(config.n_ff)?,
                 b_up: nf(config.n_ff)?,
@@ -1322,6 +1431,199 @@ impl<'ctx> ResidentForward<'ctx> {
         vb.destroy(d);
         ob.destroy(d);
         Ok(out)
+    }
+
+    /// Diagnóstico: a atenção com o KV fatiado em `n_split` workgroups, seguida da
+    /// redução dos parciais. Mesma entrada e mesma saída do `dbg_attention`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_attention_split(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        total_len: usize,
+        n_tokens: usize,
+        n_split: usize,
+    ) -> Result<Vec<f32>, MatmulError> {
+        if head_dim > 256 || n_split == 0 {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        #[repr(C)]
+        struct P {
+            n_head: u32,
+            n_head_kv: u32,
+            head_dim: u32,
+            total_len: u32,
+            kv_dim: u32,
+            kv_layer_off: u32,
+            q_stride: u32,
+        }
+        #[repr(C)]
+        struct R {
+            n_head: u32,
+            head_dim: u32,
+            n_split: u32,
+        }
+        let d = &self.dev.device;
+        let kv_dim = n_head_kv * head_dim;
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let qb = Buf::device(self.ctx, self.phys(), d, nb(q.len()))?;
+        let kb = Buf::device(self.ctx, self.phys(), d, nb(k_cache.len()))?;
+        let vb = Buf::device(self.ctx, self.phys(), d, nb(v_cache.len()))?;
+        let parciais = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            nb(n_tokens * n_head * n_split * (head_dim + 2)),
+        )?;
+        let ob = Buf::device(self.ctx, self.phys(), d, nb(n_tokens * n_head * head_dim))?;
+        self.upload_f32(&qb, q)?;
+        self.upload_f32(&kb, k_cache)?;
+        self.upload_f32(&vb, v_cache)?;
+
+        let push = P {
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            total_len: total_len as u32,
+            kv_dim: kv_dim as u32,
+            kv_layer_off: 0,
+            q_stride: head_dim as u32,
+        };
+        // SAFETY: P é #[repr(C)] de 7 u32 contíguos; 28 bytes é o push range da pipeline.
+        let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
+        let set = self.alloc_set(&self.attention_split)?;
+        self.dispatch_xyz(
+            &self.attention_split,
+            set,
+            &[
+                (qb.buffer, 0, qb.size),
+                (kb.buffer, 0, kb.size),
+                (vb.buffer, 0, vb.size),
+                (parciais.buffer, 0, parciais.size),
+            ],
+            pb,
+            n_head as u32,
+            n_tokens as u32,
+            n_split as u32,
+        )?;
+
+        let red = R {
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            n_split: n_split as u32,
+        };
+        // SAFETY: R é #[repr(C)] de 3 u32; 12 bytes é o push range da pipeline.
+        let rb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&red).cast::<u8>(), 12) };
+        let set_r = self.alloc_set(&self.attn_reduce)?;
+        self.dispatch_xy(
+            &self.attn_reduce,
+            set_r,
+            &[(parciais.buffer, 0, parciais.size), (ob.buffer, 0, ob.size)],
+            rb,
+            n_head as u32,
+            n_tokens as u32,
+        )?;
+
+        let out = self.readback(&ob, n_tokens * n_head * head_dim)?;
+        qb.destroy(d);
+        kb.destroy(d);
+        vb.destroy(d);
+        parciais.destroy(d);
+        ob.destroy(d);
+        Ok(out)
+    }
+
+    /// Bench: sobe o KV **uma vez** e cronometra `reps` dispatches da atenção, com o KV
+    /// fatiado em `n_split` (1 = o caminho de um workgroup por cabeça).
+    ///
+    /// Existe porque medir pelo `dbg_attention*` mede o upload: com 26k posições o
+    /// KV-cache tem 108 MB e a cópia domina o relógio.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dbg_attention_bench(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        total_len: usize,
+        n_split: usize,
+        reps: usize,
+    ) -> Result<f64, MatmulError> {
+        #[repr(C)]
+        struct P {
+            n_head: u32,
+            n_head_kv: u32,
+            head_dim: u32,
+            total_len: u32,
+            kv_dim: u32,
+            kv_layer_off: u32,
+            q_stride: u32,
+        }
+        let d = &self.dev.device;
+        let kv_dim = n_head_kv * head_dim;
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let qb = Buf::device(self.ctx, self.phys(), d, nb(q.len()))?;
+        let kb = Buf::device(self.ctx, self.phys(), d, nb(k_cache.len()))?;
+        let vb = Buf::device(self.ctx, self.phys(), d, nb(v_cache.len()))?;
+        let parciais = Buf::device(
+            self.ctx,
+            self.phys(),
+            d,
+            nb(n_head * n_split.max(1) * (head_dim + 2)),
+        )?;
+        let ob = Buf::device(self.ctx, self.phys(), d, nb(n_head * head_dim))?;
+        self.upload_f32(&qb, q)?;
+        self.upload_f32(&kb, k_cache)?;
+        self.upload_f32(&vb, v_cache)?;
+
+        let push = P {
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            total_len: total_len as u32,
+            kv_dim: kv_dim as u32,
+            kv_layer_off: 0,
+            q_stride: head_dim as u32,
+        };
+        // SAFETY: P é #[repr(C)] de 7 u32; 28 bytes é o push range das duas pipelines.
+        let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
+        let usa_split = n_split > 1;
+        let pipe = if usa_split {
+            &self.attention_split
+        } else {
+            &self.attention
+        };
+        let saida = if usa_split { &parciais } else { &ob };
+        let set = self.alloc_set(pipe)?;
+        let binds = [
+            (qb.buffer, 0, qb.size),
+            (kb.buffer, 0, kb.size),
+            (vb.buffer, 0, vb.size),
+            (saida.buffer, 0, saida.size),
+        ];
+
+        // Aquecimento e medida.
+        let z = if usa_split { n_split as u32 } else { 1 };
+        self.dispatch_xyz(pipe, set, &binds, pb, n_head as u32, 1, z)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps.max(1) {
+            self.dispatch_xyz(pipe, set, &binds, pb, n_head as u32, 1, z)?;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let media = t0.elapsed().as_secs_f64() / reps.max(1) as f64;
+
+        qb.destroy(d);
+        kb.destroy(d);
+        vb.destroy(d);
+        parciais.destroy(d);
+        ob.destroy(d);
+        Ok(media)
     }
 
     /// Emite as ops de uma camada de atenção linear (qwen35), deixando o resultado em
@@ -1828,6 +2130,25 @@ impl<'ctx> ResidentForward<'ctx> {
                     vec![tudo(&st.b_k), tudo(&st.b_v)],
                     vec![tudo(&st.kcache), tudo(&st.vcache)],
                 ),
+                // A op declara as faixas dos **dois** caminhos, inclusive o buffer de
+                // parciais: ele é reusado por todas as camadas de atenção, e sem
+                // declará-lo o planejador deixa a fatia de uma camada sobrescrever o que
+                // a redução da anterior ainda não leu (erro medido: 3e-2 nos logits).
+                PlannedOp::Atencao {
+                    curto,
+                    split,
+                    reduce,
+                } => {
+                    let mut le = Vec::new();
+                    let mut esc = Vec::new();
+                    for parte in [curto.as_ref(), split.as_ref(), reduce.as_ref()] {
+                        if let PlannedOp::Dispatch { le: l, esc: e, .. } = parte {
+                            le.extend(l.iter().copied());
+                            esc.extend(e.iter().copied());
+                        }
+                    }
+                    (le, esc)
+                }
             };
             let raw = le.iter().any(|f| grupo_esc.iter().any(|g| sobrepoe(f, g)));
             let war_waw = esc.iter().any(|f| {
@@ -1843,6 +2164,113 @@ impl<'ctx> ResidentForward<'ctx> {
             grupo_esc.extend(esc);
         }
         out
+    }
+
+    /// Grava um `PlannedOp::Dispatch` no command buffer.
+    ///
+    /// `groups_z` é a terceira dimensão (fatias do KV na atenção longa; 1 no resto) e
+    /// `n_split` é o que a redução precisa saber para combinar os parciais.
+    #[allow(clippy::too_many_arguments)]
+    fn gravar_dispatch(
+        &self,
+        cmd: vk::CommandBuffer,
+        op: &PlannedOp,
+        c: &Cfg,
+        pos: usize,
+        total_len: u32,
+        groups_z: u32,
+        n_split: u32,
+    ) {
+        let PlannedOp::Dispatch {
+            pipe,
+            set,
+            groups,
+            groups_y,
+            push,
+            ..
+        } = op
+        else {
+            return;
+        };
+        let d = &self.dev.device;
+        let p = self.pipe_of(*pipe);
+        let bytes: Vec<u8> = match push {
+            PushSpec::Static(b) => b.clone(),
+            PushSpec::Rope { n_head, stride } => {
+                #[repr(C)]
+                struct P {
+                    n_head: u32,
+                    head_dim: u32,
+                    rope_dim: u32,
+                    pos: f32,
+                    stride: u32,
+                }
+                let pp = P {
+                    n_head: *n_head,
+                    head_dim: c.head_dim as u32,
+                    rope_dim: c.rope_dim as u32,
+                    pos: pos as f32,
+                    stride: *stride,
+                };
+                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }.to_vec()
+            }
+            PushSpec::Attention { kv_layer_off } => {
+                #[repr(C)]
+                struct P {
+                    n_head: u32,
+                    n_head_kv: u32,
+                    head_dim: u32,
+                    total_len: u32,
+                    kv_dim: u32,
+                    kv_layer_off: u32,
+                    q_stride: u32,
+                }
+                let pp = P {
+                    n_head: c.n_head as u32,
+                    n_head_kv: c.n_head_kv as u32,
+                    head_dim: c.head_dim as u32,
+                    total_len,
+                    kv_dim: c.kv_dim as u32,
+                    kv_layer_off: *kv_layer_off,
+                    // No qwen35 query e gate dividem a cabeça.
+                    q_stride: if c.delta_net.is_some() {
+                        (c.head_dim * 2) as u32
+                    } else {
+                        c.head_dim as u32
+                    },
+                };
+                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 28) }.to_vec()
+            }
+            PushSpec::AttnReduce => {
+                #[repr(C)]
+                struct R {
+                    n_head: u32,
+                    head_dim: u32,
+                    n_split: u32,
+                }
+                let rr = R {
+                    n_head: c.n_head as u32,
+                    head_dim: c.head_dim as u32,
+                    n_split,
+                };
+                // SAFETY: R é #[repr(C)] de 3 u32; 12 bytes é o push range da pipeline.
+                unsafe { std::slice::from_raw_parts(&rr as *const R as *const u8, 12) }.to_vec()
+            }
+        };
+        // SAFETY: cmd em gravação; pipeline/set válidos; bytes do tamanho do range.
+        unsafe {
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                p.layout,
+                0,
+                &[*set],
+                &[],
+            );
+            d.cmd_push_constants(cmd, p.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            d.cmd_dispatch(cmd, *groups, *groups_y, groups_z);
+        }
     }
 
     /// Barreira de memória global entre dispatches/cópias do mesmo command buffer.
@@ -1969,11 +2397,11 @@ impl<'ctx> ResidentForward<'ctx> {
                         d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
                     }
                 }
-                PlannedOp::KvAppend { layer } => {
+                PlannedOp::KvAppend { slot } => {
                     // As posições do bloco são consecutivas no cache e `b_k`/`b_v` estão
                     // token-major, então uma cópia cobre os N tokens.
                     let pos0 = pos + 1 - n_tok;
-                    let off = ((layer * c.ctx + pos0) * c.kv_dim * 4) as vk::DeviceSize;
+                    let off = ((slot * c.ctx + pos0) * c.kv_dim * 4) as vk::DeviceSize;
                     let sz = (c.kv_dim * n_tok * 4) as vk::DeviceSize;
                     let rk = vk::BufferCopy {
                         src_offset: 0,
@@ -1986,84 +2414,24 @@ impl<'ctx> ResidentForward<'ctx> {
                         d.cmd_copy_buffer(cmd, st.b_v.buffer, st.vcache.buffer, &[rk]);
                     }
                 }
-                PlannedOp::Dispatch {
-                    pipe,
-                    set,
-                    groups,
-                    groups_y,
-                    push,
-                    ..
+                PlannedOp::Dispatch { .. } => {
+                    self.gravar_dispatch(cmd, op, c, pos, total_len, 1, 1);
+                }
+                PlannedOp::Atencao {
+                    curto,
+                    split,
+                    reduce,
                 } => {
-                    let p = self.pipe_of(*pipe);
-                    let bytes: Vec<u8> = match push {
-                        PushSpec::Static(b) => b.clone(),
-                        PushSpec::Rope { n_head, stride } => {
-                            #[repr(C)]
-                            struct P {
-                                n_head: u32,
-                                head_dim: u32,
-                                rope_dim: u32,
-                                pos: f32,
-                                stride: u32,
-                            }
-                            let pp = P {
-                                n_head: *n_head,
-                                head_dim: c.head_dim as u32,
-                                rope_dim: c.rope_dim as u32,
-                                pos: pos as f32,
-                                stride: *stride,
-                            };
-                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }
-                                .to_vec()
-                        }
-                        PushSpec::Attention { kv_layer_off } => {
-                            #[repr(C)]
-                            struct P {
-                                n_head: u32,
-                                n_head_kv: u32,
-                                head_dim: u32,
-                                total_len: u32,
-                                kv_dim: u32,
-                                kv_layer_off: u32,
-                                q_stride: u32,
-                            }
-                            let pp = P {
-                                n_head: c.n_head as u32,
-                                n_head_kv: c.n_head_kv as u32,
-                                head_dim: c.head_dim as u32,
-                                total_len,
-                                kv_dim: c.kv_dim as u32,
-                                kv_layer_off: *kv_layer_off,
-                                // No qwen35 query e gate dividem a cabeça.
-                                q_stride: if c.delta_net.is_some() {
-                                    (c.head_dim * 2) as u32
-                                } else {
-                                    c.head_dim as u32
-                                },
-                            };
-                            unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 28) }
-                                .to_vec()
-                        }
-                    };
-                    // SAFETY: cmd em gravação; pipeline/set válidos; bytes do tamanho do range.
-                    unsafe {
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.pipeline);
-                        d.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            p.layout,
-                            0,
-                            &[*set],
-                            &[],
-                        );
-                        d.cmd_push_constants(
-                            cmd,
-                            p.layout,
-                            vk::ShaderStageFlags::COMPUTE,
-                            0,
-                            &bytes,
-                        );
-                        d.cmd_dispatch(cmd, *groups, *groups_y, 1);
+                    // Contexto curto: um workgroup por cabeça, como sempre foi. Longo: o
+                    // KV fatiado entre `n_split` workgroups e a redução dos parciais.
+                    let n_split = splits_do_kv(total_len);
+                    if n_split <= 1 {
+                        self.gravar_dispatch(cmd, curto, c, pos, total_len, 1, 1);
+                    } else {
+                        self.gravar_dispatch(cmd, split, c, pos, total_len, n_split, n_split);
+                        // A redução lê o que as fatias acabaram de escrever.
+                        self.full_barrier(cmd);
+                        self.gravar_dispatch(cmd, reduce, c, pos, total_len, 1, n_split);
                     }
                 }
             }
@@ -2124,6 +2492,8 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::NormP2 => &self.norm_p2,
             PipeId::Rope => &self.rope,
             PipeId::Attention => &self.attention,
+            PipeId::AttentionSplit => &self.attention_split,
+            PipeId::AttnReduce => &self.attn_reduce,
             PipeId::Swiglu => &self.swiglu,
             PipeId::Add => &self.add,
         }
@@ -2418,6 +2788,12 @@ impl<'ctx> ResidentForward<'ctx> {
         // Com `LLAMA_RS_STOP_LAYER=0` nenhuma camada roda, e aí não há residual do FFN a
         // somar: `b_ffn` guarda o que sobrou do token anterior.
         let rodou_camada = c.n_layer > 0 && parar_em != Some(0);
+        // Slot no KV-cache de cada camada: as delta-net não têm nenhum.
+        let (slot_kv, _) = slots_kv(
+            st.qw
+                .iter()
+                .map(|l| !matches!(l.mixer, MixerQ::Delta { .. })),
+        );
         for l in 0..c.n_layer {
             if parar_em.is_some_and(|n| l >= n) {
                 break;
@@ -2569,16 +2945,36 @@ impl<'ctx> ResidentForward<'ctx> {
                     )?,
                     nt,
                 ));
-                plan.push(PlannedOp::KvAppend { layer: l });
-                let layer_off = (l * c.ctx * c.kv_dim) as u32;
-                plan.push(Self::com_y(
+                let slot = slot_kv.get(l).copied().flatten().unwrap_or(0);
+                plan.push(PlannedOp::KvAppend { slot });
+                let layer_off = (slot * c.ctx * c.kv_dim) as u32;
+                // Os dois caminhos da atenção ficam prontos; a gravação escolhe pelo
+                // comprimento do KV (ver `splits_do_kv`).
+                let attn_bind = [
+                    (st.b_q.buffer, 0, nbt(q_out)),
+                    (st.kcache.buffer, 0, st.kcache.size),
+                    (st.vcache.buffer, 0, st.vcache.size),
+                    (st.b_attn.buffer, 0, nbt(attn_dim)),
+                ];
+                let curto = Self::com_y(
                     mk(
                         PipeId::Attention,
+                        &attn_bind,
+                        c.n_head as u32,
+                        PushSpec::Attention {
+                            kv_layer_off: layer_off,
+                        },
+                    )?,
+                    nt,
+                );
+                let split = Self::com_y(
+                    mk(
+                        PipeId::AttentionSplit,
                         &[
                             (st.b_q.buffer, 0, nbt(q_out)),
                             (st.kcache.buffer, 0, st.kcache.size),
                             (st.vcache.buffer, 0, st.vcache.size),
-                            (st.b_attn.buffer, 0, nbt(attn_dim)),
+                            (st.b_attn_split.buffer, 0, st.b_attn_split.size),
                         ],
                         c.n_head as u32,
                         PushSpec::Attention {
@@ -2586,7 +2982,24 @@ impl<'ctx> ResidentForward<'ctx> {
                         },
                     )?,
                     nt,
-                ));
+                );
+                let reduce = Self::com_y(
+                    mk(
+                        PipeId::AttnReduce,
+                        &[
+                            (st.b_attn_split.buffer, 0, st.b_attn_split.size),
+                            (st.b_attn.buffer, 0, nbt(attn_dim)),
+                        ],
+                        c.n_head as u32,
+                        PushSpec::AttnReduce,
+                    )?,
+                    nt,
+                );
+                plan.push(PlannedOp::Atencao {
+                    curto: Box::new(curto),
+                    split: Box::new(split),
+                    reduce: Box::new(reduce),
+                });
                 if !hib {
                     plan.push(mk(
                         PipeId::QuantizeX,
@@ -2748,6 +3161,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
                     Some(PlannedOp::Embed) => "embed",
                     Some(PlannedOp::KvAppend { .. }) => "kv_append",
+                    Some(PlannedOp::Atencao { .. }) => "attention",
                     None => continue,
                 };
                 spans.push(GpuSpan {
@@ -2792,6 +3206,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
                 Some(PlannedOp::Embed) => "embed",
                 Some(PlannedOp::KvAppend { .. }) => "kv_append",
+                Some(PlannedOp::Atencao { .. }) => "attention",
                 None => continue,
             };
             let e = por_tipo.entry(label).or_insert((0, 0));
@@ -2874,6 +3289,7 @@ impl<'ctx> ResidentForward<'ctx> {
                         PlannedOp::Dispatch { pipe, .. } => pipe.label(),
                         PlannedOp::Embed => "embed",
                         PlannedOp::KvAppend { .. } => "kv_append",
+                        PlannedOp::Atencao { .. } => "attention",
                     })
                     .collect()
             })
@@ -3236,5 +3652,34 @@ impl Drop for ResidentForward<'_> {
                 d.destroy_descriptor_set_layout(p.desc_set_layout, None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slots_kv;
+
+    /// No qwen35 três de cada quatro camadas são delta-net: elas guardam estado
+    /// recorrente de tamanho fixo e **não** usam KV-cache. Numerar o cache por camada
+    /// global reservaria 4× a memória necessária — 17 GB em vez de 4,4 GB num ctx de 32k.
+    #[test]
+    fn slots_kv_so_numera_as_camadas_de_atencao() {
+        let padrao = [false, false, false, true, false, false, false, true];
+
+        let (slots, total) = slots_kv(padrao);
+
+        assert_eq!(total, 2, "8 camadas do qwen35 têm 2 de atenção");
+        assert_eq!(slots.get(3), Some(&Some(0)));
+        assert_eq!(slots.get(7), Some(&Some(1)));
+        assert_eq!(slots.first(), Some(&None), "delta-net não ocupa slot");
+    }
+
+    /// Modelo denso (Qwen2/2.5): slot == camada, nada muda em relação ao layout antigo.
+    #[test]
+    fn slots_kv_no_modelo_denso_e_a_identidade() {
+        let (slots, total) = slots_kv([true, true, true]);
+
+        assert_eq!(total, 3);
+        assert_eq!(slots, vec![Some(0), Some(1), Some(2)]);
     }
 }
