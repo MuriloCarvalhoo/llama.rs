@@ -106,6 +106,29 @@ pub(crate) fn matvec_geom() -> (u32, u32) {
         .unwrap_or((256, 2))
 }
 
+/// KiB de LDS **morta** alocados por workgroup do matvec Q4_K do decode, para limitar a
+/// ocupância de propósito (specialization constant `LDS_PAD_KIB`).
+///
+/// Precedente: o backend Vulkan do llama.cpp faz o mesmo em GCN
+/// (`ggml-vulkan.cpp:3767-3777`, comentário "*too many subgroups ... thrashing the cache*").
+/// A conta de requests por superbloco no topo de `q4_k_matvec.comp` mostra que o kernel já
+/// lê o mínimo possível, então o que resta para explicar os 506 GB/s dele contra os 573 do
+/// Q6_K é waves demais disputando o L1.
+///
+/// `0` (padrão) mantém o kernel exatamente como está. Vale só para a pipeline do **decode**:
+/// o bloco de prefill tem outra geometria (`matvec_geom_batch`, 1 wave por workgroup) e a
+/// aritmética da tabela no shader não se aplica a ela.
+///
+/// **A medir**: nenhum valor foi comparado ainda neste hardware.
+pub(crate) fn matvec_lds_pad() -> u32 {
+    std::env::var("LLAMA_RS_MATVEC_LDS_PAD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        // Acima disso a criação da pipeline falharia por `maxComputeSharedMemorySize`.
+        .min(48)
+}
+
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
     pub buffer: vk::Buffer,
@@ -902,7 +925,9 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec_q5k = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 5, push_mv, &geom)?;
         let matvec_q6k = ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[])?;
         // Mesma geometria tunada do Q5_K: a estrutura de acesso é idêntica (só sem o `qh`).
-        let matvec_q4k = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom)?;
+        // Mais a LDS morta de `matvec_lds_pad` (0 = desligada), que só este shader declara.
+        let geom_q4k = [(0, mv_wg), (1, mv_rows), (3, matvec_lds_pad())];
+        let matvec_q4k = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_q4k)?;
         // Variantes de prefill: `COLS` é specialization constant, então cada largura de
         // batch é uma pipeline própria. O Q6_K expõe COLS no id 0 (geometria fixa no shader).
         let cols = batch_size() as u32;

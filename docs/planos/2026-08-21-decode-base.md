@@ -50,15 +50,25 @@ O q6k sustenta 573 com a mesma estrutura; o q4k tem os mesmos bytes por superblo
 em `uvec4` — a diferença de 13% tem causa encontrável. Experimentos em ordem de custo,
 cada um A/B pelo `TOTAL GPU` e revertido se não pagar:
 
-- [ ] **Contar requests por superbloco** no shader atual (papel e lápis, como foi feito
+- [x] **Contar requests por superbloco** no shader atual (papel e lápis, como foi feito
       no q5k): 144 B/superbloco Q4_K = 9 `uvec4` + escalas. Se as escalas (`d`/`dmin` +
       6 B de mins) saem em loads separados dos `qs`, empacotar a leitura para caber nos
       mesmos requests — foi exatamente essa conta que levou o q5k de 465 a 573.
-- [ ] **Truque de ocupância do upstream**: alocar LDS morta para limitar waves por SIMD
+      **Feito, e não há folga:** as escalas moram nos bytes 4..15 do mesmo `uvec4` do par
+      `d|dmin`, então não custam request nenhum. São 3 loads por lane e por superbloco
+      (`hdr`, `qs0`, `qs1`), e as 8 lanes cobrem os 9 `uvec4` do superbloco sem reler byte
+      nenhum — é o piso da estrutura. O Q5_K faz **5** loads por lane e é mais rápido, o
+      que descarta taxa de requests como causa dos 13%. Conta no topo de
+      `q4_k_matvec.comp`; nenhum repack a fazer.
+- [x] **Truque de ocupância do upstream**: alocar LDS morta para limitar waves por SIMD
       (o backend Vulkan do llama.cpp faz isso em GCN — `ggml-vulkan.cpp:3767-3777`,
       comentário "*too many subgroups... thrashing the cache*"). Testar 2 e 4
       subgroups/SIMD via um array `shared` não usado dimensionado por spec constant.
       Custo: ~10 linhas de shader, reversível por spec constant = 0.
+      **Implementado** como `LDS_PAD_KIB` (constant_id 3) em `q4_k_matvec.comp`, ligável
+      por `LLAMA_RS_MATVEC_LDS_PAD=K`, **default 0 = comportamento atual**. K=22 dá 2
+      waves/SIMD e K=13 dá 4 (tabela no shader). Só a pipeline do decode; a do bloco tem
+      outra geometria. **Pendente de medição** — nenhum K foi comparado ainda.
 - [ ] **Distribuir a cauda**: com `(256,2)` cada dispatch cobre n_linhas/8 workgroups;
       medir se o último rank de workgroups deixa SIMDs ociosos (visível no trace
       Perfetto, `docs/debugging.md`). Se sim, testar grid 2D com menos linhas por

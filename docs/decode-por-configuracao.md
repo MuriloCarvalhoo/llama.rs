@@ -52,6 +52,33 @@ Isso é o teto do ganho: `tok/s = base × (1 + aceitação) = base × 1,61`.
 implementação dele não faz batch eficiente num híbrido SSM — a cabeça do modelo prevê bem.
 Medido com greedy; com amostragem a temperatura alta a aceitação cai.
 
+### Requests por superbloco do Q4_K — a conta não explica os 13%
+
+Não é medição, é a conta de papel e lápis que fechou o Q5_K, refeita para o Q4_K (topo de
+`shaders/q4_k_matvec.comp`). Por lane e por superbloco:
+
+| kernel | loads de 16 B por lane | bytes/superbloco | GB/s medido |
+|---|---:|---:|---:|
+| Q4_K | **3** (`hdr`, `qs0`, `qs1`) | 144 | 506 |
+| Q5_K | **5** (`hdr`, 2× `qh`, 2× `qs`) | 176 | 573 |
+
+As escalas do Q4_K não custam request: moram nos bytes 4..15 do mesmo `uvec4` do par
+`d|dmin`, que já é lido. As 8 lanes de um superbloco cobrem os 9 `uvec4` sem reler byte
+nenhum — **não há folga para empacotar**. E o kernel que faz *mais* requests é o mais
+rápido, o que descarta a taxa de requests como causa da diferença. Sobra ocupância:
+o Q4_K, sem os registradores de `qh`, cabe com mais waves por SIMD.
+
+Daí o knob `LLAMA_RS_MATVEC_LDS_PAD=K` (LDS morta por workgroup, `LDS_PAD_KIB` no shader,
+default 0 = kernel inalterado). Com a geometria padrão (WG=256), K KiB limitam os
+workgroups por CU — e portanto as waves por SIMD — a `floor(64/K)`:
+
+| K | 9 | 11 | 13 | 16 | 22 | 33 |
+|---|--:|---:|---:|---:|---:|---:|
+| waves/SIMD | 7 | 5 | 4 | 4 | 2 | 1 |
+
+**Nada medido ainda.** O teste de shader confirma só que o resultado não muda com o pad
+ligado (erro relativo idêntico em K = 0, 13 e 33).
+
 ### Varredura de geometria do matvec — sem efeito
 
 `LLAMA_RS_MATVEC_GEOM=wg,linhas`, 3 execuções cada. Diferença de 1,2%, dentro do ruído:

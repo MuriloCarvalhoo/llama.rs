@@ -369,7 +369,14 @@ pub fn dispatch_q4_k_matvec(
         n_out,
         cols,
         wg / 64 * rows,
-        &[(0, wg), (1, rows), (2, cols_u32)],
+        // A LDS morta de `matvec_lds_pad` entra aqui pelo mesmo motivo que a geometria: é o
+        // caminho que os testes de shader usam, então o knob tem de valer para eles também.
+        &[
+            (0, wg),
+            (1, rows),
+            (2, cols_u32),
+            (3, crate::resident_forward::matvec_lds_pad()),
+        ],
     )
 }
 
