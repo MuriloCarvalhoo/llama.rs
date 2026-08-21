@@ -12,7 +12,6 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 pub struct Vocab {
     tokens: Vec<String>,
     scores: Vec<f32>,
-    #[allow(dead_code)]
     token_types: Vec<i32>,
     token_to_id: HashMap<String, u32>,
     pub(crate) bos_id: u32,
@@ -151,6 +150,28 @@ impl Vocab {
             unk_id,
             merges,
         ))
+    }
+
+    /// Tokens de controle (type 3) e user-defined (type 4), do mais longo para o
+    /// mais curto — a ordem que `encode_special` precisa para casar o maior primeiro.
+    ///
+    /// São os marcadores do chat template (`<|im_start|>`, `<tool_call>`, ...): o BPE
+    /// os quebraria em pedaços de texto comum, e aí o modelo nunca veria o formato em
+    /// que foi treinado.
+    pub(crate) fn especiais(&self) -> Vec<(&str, u32)> {
+        let mut v: Vec<(&str, u32)> = self
+            .token_types
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t == 3 || t == 4)
+            .filter_map(|(i, _)| {
+                let id = u32::try_from(i).ok()?;
+                Some((self.tokens.get(i)?.as_str(), id))
+            })
+            .filter(|(t, _)| !t.is_empty())
+            .collect();
+        v.sort_unstable_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+        v
     }
 
     pub(crate) fn text_to_token(&self, text: &str) -> Option<u32> {

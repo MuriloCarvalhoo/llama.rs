@@ -127,8 +127,11 @@ pub(crate) fn tokenize_bpe(
 
 // ── Decodificação ─────────────────────────────────────────────────────────────
 
-/// Decodifica texto GPT-2 encoded (com 'Ġ' etc.) de volta para UTF-8 original.
-pub(crate) fn decode_bpe(encoded: &str) -> String {
+/// Decodifica texto GPT-2 encoded (com 'Ġ' etc.) de volta para os bytes originais.
+///
+/// Pode terminar no meio de um caractere multi-byte — é o caso de um token que carrega
+/// só o primeiro byte de um 'ç'. Quem monta texto incremental precisa desses bytes.
+pub(crate) fn decode_bpe_bytes(encoded: &str) -> Vec<u8> {
     let u2b = unicode_to_byte();
     let mut bytes = Vec::with_capacity(encoded.len());
     for c in encoded.chars() {
@@ -141,7 +144,12 @@ pub(crate) fn decode_bpe(encoded: &str) -> String {
             bytes.extend_from_slice(s.as_bytes());
         }
     }
-    String::from_utf8_lossy(&bytes).into_owned()
+    bytes
+}
+
+/// Como `decode_bpe_bytes`, mas fechando os buracos com U+FFFD.
+pub(crate) fn decode_bpe(encoded: &str) -> String {
+    String::from_utf8_lossy(&decode_bpe_bytes(encoded)).into_owned()
 }
 
 // ── Testes ────────────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ regex.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+memmap2 = "0.9"
 
 [lints]
 workspace = true
