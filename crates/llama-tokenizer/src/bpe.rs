@@ -48,20 +48,53 @@ fn unicode_to_byte() -> &'static HashMap<char, u8> {
 
 // ── Pre-tokenizador ───────────────────────────────────────────────────────────
 
+/// Variante do pré-tokenizador, escolhida pela chave GGUF `tokenizer.ggml.pre`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Pretok {
+    /// Qwen2 / GPT-4 — o que sempre usamos, e o destino de todo `pre` que não seja qwen35.
+    #[default]
+    Qwen2,
+    /// Qwen3.5 (`pre = "qwen35"`): a marca combinante fica na run da letra.
+    Qwen35,
+}
+
+impl Pretok {
+    /// Mapeia o valor de `tokenizer.ggml.pre`. Só qwen35 diverge — os demais pres
+    /// (e a ausência da chave) ficam no Qwen2.
+    pub(crate) fn from_pre(pre: &str) -> Pretok {
+        match pre {
+            "qwen35" => Pretok::Qwen35,
+            _ => Pretok::Qwen2,
+        }
+    }
+}
+
 /// Regex do pre-tokenizador Qwen2 / GPT-4 (sem lookahead negativo).
 // O padrão é literal: se não compilar, é erro de digitação que o primeiro teste pega.
 #[allow(clippy::expect_used)]
-fn pretok_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
+fn pretok_re(pre: Pretok) -> &'static Regex {
+    static QWEN2: OnceLock<Regex> = OnceLock::new();
+    static QWEN35: OnceLock<Regex> = OnceLock::new();
+    match pre {
         // Derivado de: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
         //              ' '?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+
         // (?!\S) removido — irrelevante para prompts ASCII sem trailing whitespace.
-        Regex::new(
-            r"(?:'[sStTdDmM]|'re|'RE|'ve|'VE|'ll|'LL)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+",
-        )
-        .expect("regex BPE válida")
-    })
+        Pretok::Qwen2 => QWEN2.get_or_init(|| {
+            Regex::new(
+                r"(?:'[sStTdDmM]|'re|'RE|'ve|'VE|'ll|'LL)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+",
+            )
+            .expect("regex BPE válida")
+        }),
+        // Mesma alternação, com as duas divergências do qwen35 (llama-vocab.cpp:382-388):
+        // a run de letras vira [\p{L}\p{M}]+ e a de não-letras passa a excluir \p{M} —
+        // a marca combinante acompanha a letra, não a pontuação que veio antes.
+        Pretok::Qwen35 => QWEN35.get_or_init(|| {
+            Regex::new(
+                r"(?:'[sStTdDmM]|'re|'RE|'ve|'VE|'ll|'LL)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+",
+            )
+            .expect("regex BPE qwen35 válida")
+        }),
+    }
 }
 
 // ── Tokenização ───────────────────────────────────────────────────────────────
@@ -78,7 +111,7 @@ pub(crate) fn tokenize_bpe(
     let mut output = Vec::new();
     let mut char_buf = [0u8; 4];
 
-    for piece in pretok_re().find_iter(text) {
+    for piece in pretok_re(vocab.pre).find_iter(text) {
         let piece_str = piece.as_str();
 
         // Converte cada byte do piece para o char GPT-2 correspondente e busca o ID.
@@ -188,10 +221,63 @@ mod tests {
 
     #[test]
     fn pretokenize_simple_sentence() {
-        let pieces: Vec<&str> = pretok_re()
+        let pieces: Vec<&str> = pretok_re(Pretok::Qwen2)
             .find_iter("Once upon a time")
             .map(|m| m.as_str())
             .collect();
         assert_eq!(pieces, vec!["Once", " upon", " a", " time"]);
+    }
+
+    fn pedacos(pre: Pretok, texto: &str) -> Vec<&str> {
+        pretok_re(pre)
+            .find_iter(texto)
+            .map(|m| m.as_str())
+            .collect()
+    }
+
+    /// A divergência que motiva a chave `pre`: com a marca combinante separada
+    /// (NFD), o qwen35 mantém a palavra inteira numa run só; o qwen2 a parte em duas,
+    /// porque `\p{L}+` para na letra e a marca vira o prefixo do pedaço seguinte.
+    #[test]
+    fn qwen35_absorve_a_marca_combinante_na_run_de_letras() {
+        let texto = "e\u{301}xito"; // "êxito" em NFD: 'e' + acento agudo combinante
+
+        assert_eq!(pedacos(Pretok::Qwen35, texto), vec![texto]);
+        assert_eq!(pedacos(Pretok::Qwen2, texto), vec!["e", "\u{301}xito"]);
+    }
+
+    /// A outra metade da divergência: a classe de não-letras do qwen35 exclui `\p{M}`,
+    /// então a marca não entra na run de pontuação. Precisa de **dois** sinais — com um
+    /// só, o prefixo opcional `[^\r\n\p{L}\p{N}]?` o gruda na run de letras nas duas
+    /// variantes, e a diferença não aparece.
+    #[test]
+    fn qwen35_nao_deixa_a_marca_combinante_na_run_de_pontuacao() {
+        let texto = "!!\u{301}";
+
+        assert_eq!(pedacos(Pretok::Qwen35, texto), vec!["!!", "\u{301}"]);
+        assert_eq!(pedacos(Pretok::Qwen2, texto), vec![texto]);
+    }
+
+    /// Texto sem marca combinante tem de sair igual pelos dois pré-tokenizadores.
+    #[test]
+    fn as_duas_variantes_concordam_sem_marca_combinante() {
+        let texto = "Once upon a time, 42 vezes.\n";
+
+        assert_eq!(
+            pedacos(Pretok::Qwen35, texto),
+            pedacos(Pretok::Qwen2, texto)
+        );
+    }
+
+    #[test]
+    fn from_pre_so_reconhece_qwen35() {
+        assert_eq!(Pretok::from_pre("qwen35"), Pretok::Qwen35);
+        assert_eq!(Pretok::from_pre("qwen2"), Pretok::Qwen2);
+        assert_eq!(Pretok::from_pre(""), Pretok::Qwen2);
+        assert_eq!(
+            Pretok::default(),
+            Pretok::Qwen2,
+            "sem a chave, é o de sempre"
+        );
     }
 }
