@@ -14,6 +14,9 @@ pub enum Sampler {
     TopK { k: usize, temp: f32 },
     /// Mantém o menor conjunto de tokens com prob. acumulada >= `p` antes de amostrar.
     TopP { p: f32, temp: f32 },
+    /// Os dois filtros na ordem do llama.cpp: top-k, depois top-p, depois temperatura.
+    /// É o que uma requisição da API pede quando manda `top_k` **e** `top_p`.
+    TopKP { k: usize, p: f32, temp: f32 },
 }
 
 impl Sampler {
@@ -44,6 +47,26 @@ impl Sampler {
                     "local_idx must be in bounds — sample() returns index within reduced slice of length indices.len()"
                 );
                 indices.get(local_idx).copied().unwrap_or(0)
+            }
+            Sampler::TopKP { k, p, temp } => {
+                let candidatos = top_k_indices(logits, *k);
+                let reduzidos: Vec<f32> = candidatos
+                    .iter()
+                    .filter_map(|&i| logits.get(i).copied())
+                    .collect();
+                let probs = softmax(&reduzidos);
+                // `top_p_indices` devolve posições dentro de `reduzidos`, não do vocab.
+                let mantidos = top_p_indices(&probs, *p);
+                let finais: Vec<f32> = mantidos
+                    .iter()
+                    .filter_map(|&i| reduzidos.get(i).copied())
+                    .collect();
+                let local = Sampler::Temperature { temp: *temp }.sample(&finais, rng);
+                mantidos
+                    .get(local)
+                    .and_then(|&i| candidatos.get(i))
+                    .copied()
+                    .unwrap_or(0)
             }
             Sampler::TopP { p, temp } => {
                 let probs_full = softmax(logits);
@@ -306,5 +329,72 @@ mod tests {
             seen.iter().all(|&s| s),
             "all indices should be seen with p=1.0"
         );
+    }
+}
+
+#[cfg(test)]
+mod testes_top_kp {
+    use super::Sampler;
+    use rand::SeedableRng;
+
+    fn rng() -> rand::rngs::StdRng {
+        rand::rngs::StdRng::seed_from_u64(7)
+    }
+
+    /// Com temperatura zero o combinado tem de cair no argmax, como as outras variantes.
+    #[test]
+    fn temperatura_zero_e_greedy() {
+        let logits = [0.1, 5.0, 0.3, 2.0];
+        let s = Sampler::TopKP {
+            k: 3,
+            p: 0.9,
+            temp: 0.0,
+        };
+        assert_eq!(s.sample(&logits, &mut rng()), 1);
+    }
+
+    /// O k corta antes do p: com k=1 só o maior sobrevive, qualquer que seja o p.
+    #[test]
+    fn k_corta_antes_do_p() {
+        let logits = [1.0, 1.01, 1.02, 9.0];
+        let s = Sampler::TopKP {
+            k: 1,
+            p: 1.0,
+            temp: 2.0,
+        };
+        let mut r = rng();
+        for _ in 0..20 {
+            assert_eq!(s.sample(&logits, &mut r), 3);
+        }
+    }
+
+    /// E o p corta dentro do que o k deixou: um candidato dominante leva tudo.
+    #[test]
+    fn p_baixo_deixa_so_o_dominante() {
+        let logits = [0.0, 0.0, 20.0, 0.0];
+        let s = Sampler::TopKP {
+            k: 4,
+            p: 0.5,
+            temp: 1.0,
+        };
+        let mut r = rng();
+        for _ in 0..20 {
+            assert_eq!(s.sample(&logits, &mut r), 2);
+        }
+    }
+
+    /// Índice devolvido é o do vocabulário, não o da lista filtrada.
+    #[test]
+    fn indice_e_o_do_vocabulario() {
+        let mut logits = vec![0.0; 100];
+        if let Some(l) = logits.get_mut(97) {
+            *l = 10.0;
+        }
+        let s = Sampler::TopKP {
+            k: 5,
+            p: 0.5,
+            temp: 1.0,
+        };
+        assert_eq!(s.sample(&logits, &mut rng()), 97);
     }
 }
