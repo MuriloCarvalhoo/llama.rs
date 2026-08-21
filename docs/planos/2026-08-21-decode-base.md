@@ -32,11 +32,15 @@ O perfil imprime ms/op; a banda é calculada à mão. Automatizar para não erra
 para expor diferença entre as duas GPUs (a GPU do display pode estar com spill para GTT
 — 95 vs 714 GB/s, `docs/performance-tuning.md:77-81`).
 
-- [ ] Anotar em cada `PipeId` os bytes lidos por dispatch (peso + ativação; o plano sabe
-      as formas) e imprimir `GB/s` na tabela do perfil.
-- [ ] Imprimir as duas GPUs em tabelas separadas (hoje o perfil soma os shards).
+- [x] Anotar em cada `PipeId` os bytes lidos por dispatch (peso + ativação; o plano sabe
+      as formas) e imprimir `GB/s` na tabela do perfil. Feito derivando das faixas de
+      leitura de `PipeId::acessos`, sem contar duas vezes o mesmo binding; a atenção fica
+      como `—` porque liga o KV inteiro e lê só `total_len` posições.
+- [x] Imprimir as duas GPUs em tabelas separadas (hoje o perfil soma os shards). O
+      cabeçalho da tabela passou a trazer `GPU<n> <nome> … camadas a..b`, então cada
+      tabela se identifica sozinha.
 - [ ] Rodar o baseline e registrar: se uma GPU sustenta banda visivelmente menor na
-      mesma op, investigar GTT/clock antes de tocar em shader.
+      mesma op, investigar GTT/clock antes de tocar em shader. **Pendente de medição.**
 
 ## Tarefa 2 — matvec_q4k: fechar 506 → ≥600 GB/s
 

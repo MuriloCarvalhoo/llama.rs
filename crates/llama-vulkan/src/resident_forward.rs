@@ -476,6 +476,9 @@ pub(crate) enum PlannedOp {
         /// Só servem a `marcar_barreiras`, no build.
         le: Vec<Faixa>,
         esc: Vec<Faixa>,
+        /// Bytes lidos por dispatch, para a coluna `GB/s` do perfil. `0` = não anotado.
+        /// Derivado das faixas de leitura — ver o cálculo em `build_plan`.
+        bytes: u64,
     },
     /// Embedding lookup: copia a linha de cada token do bloco de `token_embd` para `b_x`.
     Embed,
@@ -2547,6 +2550,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 push,
                 le,
                 esc,
+                bytes,
                 ..
             } => PlannedOp::Dispatch {
                 pipe,
@@ -2556,6 +2560,9 @@ impl<'ctx> ResidentForward<'ctx> {
                 push,
                 le,
                 esc,
+                // Os bindings destes dispatches já cobrem o bloco inteiro (`nbt`), então a
+                // dimensão Y não multiplica os bytes lidos.
+                bytes,
             },
             outra => outra,
         }
@@ -2680,14 +2687,35 @@ impl<'ctx> ResidentForward<'ctx> {
             let faixas = |idx: &[usize]| -> Vec<Faixa> {
                 idx.iter().filter_map(|&i| binds.get(i).copied()).collect()
             };
+            let le = faixas(le_idx);
+            // Bytes lidos por dispatch, para a coluna `GB/s` do perfil: a soma das faixas de
+            // leitura, descontando o mesmo binding ligado duas vezes (o matvec repete `xd`
+            // nos bindings 2 e 4). É aproximação **por cima** — a faixa é o binding inteiro,
+            // não o que o shader de fato toca —, e por isso a atenção fica de fora: ela liga
+            // o KV-cache inteiro e lê só `total_len` posições, número que só existe na
+            // gravação do command buffer. Nos matvec, que são 77% do token, o peso domina a
+            // soma e o erro da ativação fica abaixo de 0,1%.
+            let bytes = match pipe {
+                PipeId::Attention | PipeId::AttentionSplit | PipeId::AttnReduce => 0,
+                _ => {
+                    let mut vistas: Vec<Faixa> = Vec::with_capacity(le.len());
+                    for f in &le {
+                        if !vistas.contains(f) {
+                            vistas.push(*f);
+                        }
+                    }
+                    vistas.iter().map(|f| f.2).sum()
+                }
+            };
             Ok(PlannedOp::Dispatch {
                 pipe,
                 set,
                 groups,
                 groups_y: 1,
                 push,
-                le: faixas(le_idx),
+                le,
                 esc: faixas(esc_idx),
+                bytes,
             })
         };
 
@@ -3267,42 +3295,77 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         let tokens = passos;
 
-        let mut por_tipo: std::collections::BTreeMap<&'static str, (u64, usize)> =
+        // Por rótulo de op: (ns acumulados, dispatches, bytes lidos por passo).
+        let mut por_tipo: std::collections::BTreeMap<&'static str, (u64, usize, u64)> =
             std::collections::BTreeMap::new();
         for (i, &ns) in accum.iter().enumerate() {
-            let label = match plano.get(i) {
-                Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
-                Some(PlannedOp::Embed) => "embed",
-                Some(PlannedOp::KvAppend { .. }) => "kv_append",
-                Some(PlannedOp::Atencao { .. }) => "attention",
+            let (label, bytes) = match plano.get(i) {
+                Some(PlannedOp::Dispatch { pipe, bytes, .. }) => (pipe.label(), *bytes),
+                // As cópias e a atenção não trazem contagem de bytes — ver `bytes` em
+                // `build_plan`.
+                Some(PlannedOp::Embed) => ("embed", 0),
+                Some(PlannedOp::KvAppend { .. }) => ("kv_append", 0),
+                Some(PlannedOp::Atencao { .. }) => ("attention", 0),
                 None => continue,
             };
-            let e = por_tipo.entry(label).or_insert((0, 0));
+            let e = por_tipo.entry(label).or_insert((0, 0, 0));
             e.0 += ns;
             e.1 += 1;
+            e.2 += bytes;
         }
 
         let total: u64 = accum.iter().sum();
+        let total_bytes: u64 = por_tipo.values().map(|v| v.2).sum();
         let ms = |ns: u64| ns as f64 / 1e6 / tokens as f64;
+        // 1 byte/ns == 1 GB/s: os bytes são por passo e `ns` é a soma de `tokens` passos.
+        let gbs = |bytes: u64, ns: u64| bytes as f64 * tokens as f64 / ns.max(1) as f64;
         let unidade = if bloco { "blocos" } else { "tokens" };
         let por = if bloco { "ms/bloco" } else { "ms/token" };
+        let sh = st.cfg.shard;
         eprintln!(
-            "\n=== PERFIL GPU — {} ({tokens} {unidade}, {} ops) ===",
+            "\n=== PERFIL GPU{} {} — {} ({tokens} {unidade}, {} ops, camadas {}..{}) ===",
+            sh.device,
+            self.device_name(),
             if bloco { "prefill em batch" } else { "decode" },
-            accum.len()
+            accum.len(),
+            sh.first_layer,
+            sh.end_layer
         );
-        eprintln!("{:<16} {:>10} {:>8} {:>8}", "op", por, "%", "n");
+        eprintln!(
+            "{:<16} {:>10} {:>8} {:>8} {:>9}",
+            "op", por, "%", "n", "GB/s"
+        );
         let mut linhas: Vec<_> = por_tipo.iter().collect();
         linhas.sort_by_key(|x| std::cmp::Reverse(x.1.0));
-        for (label, (ns, n)) in linhas {
+        let mut algum_sem_bytes = false;
+        for (label, (ns, n, bytes)) in linhas {
+            let banda = if *bytes == 0 {
+                algum_sem_bytes = true;
+                "        —".to_owned()
+            } else {
+                format!("{:>9.0}", gbs(*bytes, *ns))
+            };
             eprintln!(
-                "{label:<16} {:>10.3} {:>7.1}% {:>8}",
+                "{label:<16} {:>10.3} {:>7.1}% {:>8} {banda}",
                 ms(*ns),
                 100.0 * *ns as f64 / total.max(1) as f64,
                 n
             );
         }
-        eprintln!("{:<16} {:>10.3} {:>7.1}%", "TOTAL GPU", ms(total), 100.0);
+        eprintln!(
+            "{:<16} {:>10.3} {:>7.1}% {:>8} {:>9.0}",
+            "TOTAL GPU",
+            ms(total),
+            100.0,
+            "",
+            gbs(total_bytes, total)
+        );
+        if algum_sem_bytes {
+            eprintln!(
+                "(— = bytes por dispatch não anotados; a atenção lê o KV pelo comprimento, \
+                 conhecido só na gravação — o agregado exclui esses bytes e inclui o tempo)"
+            );
+        }
         if bloco {
             return;
         }
