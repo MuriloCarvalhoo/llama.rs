@@ -208,6 +208,26 @@ mod tests {
         assert_eq!(v.text_to_token("zzz"), None);
     }
 
+    /// `byte_to_token` tenta `<0xXX>` primeiro e só então o byte como char solto —
+    /// o segundo caminho é o que o SPM usa em vocab sem os tokens de byte.
+    #[test]
+    fn byte_to_token_cai_no_char_unico_sem_a_forma_hex() {
+        let tokens = vec!["<unk>", "<0x41>", "b"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let v = Vocab::new(tokens, vec![0.0; 3], vec![2, 6, 1], 0, 0, 0, vec![]);
+
+        assert_eq!(v.byte_to_token(0x41), Some(1), "0x41 tem a forma <0x41>");
+        assert_eq!(v.byte_to_token(b'b'), Some(2), "0x62 cai no char solto 'b'");
+        assert_eq!(v.byte_to_token(b'z'), None, "sem hex e sem char solto");
+        assert_eq!(
+            v.byte_to_token(0xFF),
+            None,
+            "0xFF sozinho não é UTF-8 válido: nem tenta o char"
+        );
+    }
+
     #[test]
     fn byte_to_token_uppercase_hex() {
         let v = tiny();

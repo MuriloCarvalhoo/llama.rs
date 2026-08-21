@@ -239,6 +239,42 @@ mod tests {
         assert_eq!(tokenize_spm(&v, "abc"), vec![8]);
     }
 
+    /// A ordem do `Bigram` é o que decide qual merge sai primeiro da heap: maior
+    /// score ganha e, no empate, o `left` menor. `PartialEq` delega ao `cmp`.
+    #[test]
+    fn ordem_do_bigram_prefere_score_e_desempata_por_left() {
+        let a = Bigram {
+            left: 0,
+            right: 1,
+            score: -1.0,
+            size: 2,
+        };
+        let b = Bigram {
+            left: 0,
+            right: 1,
+            score: -0.5,
+            size: 2,
+        };
+        assert!(b > a, "score maior vence");
+
+        let esq = Bigram {
+            left: 1,
+            right: 2,
+            score: -1.0,
+            size: 2,
+        };
+        assert!(a > esq, "no empate de score, o `left` menor vence");
+
+        let igual = Bigram {
+            left: 0,
+            right: 9,
+            score: -1.0,
+            size: 7,
+        };
+        assert!(a == igual, "eq olha score e left, não right nem size");
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+    }
+
     #[test]
     fn byte_fallback_for_unknown_char() {
         let v = tiny();

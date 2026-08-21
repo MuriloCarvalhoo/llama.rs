@@ -328,6 +328,59 @@ mod synthetic_tests {
         assert!(!dn.eh_linear(3)); // camada 3 (il+1 == 4) é atenção completa
     }
 
+    /// Sem `general.architecture` o prefixo das chaves cai no default `llama`,
+    /// que é justamente o que os `llama.*` do `dense_base` usam.
+    #[test]
+    fn arquitetura_ausente_assume_llama() {
+        let f = MiniGguf::new()
+            .u32("llama.embedding_length", 8)
+            .u32("llama.attention.head_count", 2)
+            .u32("llama.attention.head_count_kv", 2)
+            .u32("llama.feed_forward_length", 16)
+            .u32("llama.context_length", 128)
+            .u32("llama.block_count", 2)
+            .f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .str_array("tokenizer.ggml.tokens", &["<unk>", "<s>", "</s>"])
+            .u32("tokenizer.ggml.bos_token_id", 1)
+            .u32("tokenizer.ggml.eos_token_id", 2)
+            .build();
+        let c = LlamaConfig::from_gguf(&f).expect("deve parsear com arch default");
+        assert_eq!(c.n_embd, 8);
+        assert_eq!(c.head_dim, 4, "head_dim derivado de n_embd/n_head");
+    }
+
+    /// `head_dim` sai de `n_embd / n_head` quando não há `attention.key_length`.
+    /// Se a divisão não for exata não há o que derivar, e isso tem de ser erro.
+    #[test]
+    fn n_head_que_nao_divide_n_embd_sem_key_length_e_erro() {
+        let f = dense_base()
+            .u32("llama.embedding_length", 9)
+            .u32("llama.attention.head_count", 2)
+            .build();
+        assert!(matches!(
+            LlamaConfig::from_gguf(&f),
+            Err(ModelError::Config(_))
+        ));
+    }
+
+    /// `full_attention_interval` vira divisor em `eh_linear`; zero acabaria em
+    /// divisão por zero, então o parse precisa barrar.
+    #[test]
+    fn full_attention_interval_zero_e_erro() {
+        let f = dense_base()
+            .u32("llama.ssm.conv_kernel", 4)
+            .u32("llama.ssm.inner_size", 8)
+            .u32("llama.ssm.state_size", 2)
+            .u32("llama.ssm.time_step_rank", 2)
+            .u32("llama.ssm.group_count", 1)
+            .u32("llama.full_attention_interval", 0)
+            .build();
+        assert!(matches!(
+            LlamaConfig::from_gguf(&f),
+            Err(ModelError::Config(_))
+        ));
+    }
+
     #[test]
     fn n_head_zero_e_erro() {
         let f = dense_base().u32("llama.attention.head_count", 0).build();
