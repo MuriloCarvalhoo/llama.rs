@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use gguf::GgufFile;
 
+use crate::bpe::Pretok;
 use crate::error::TokenizerError;
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -20,6 +21,8 @@ pub struct Vocab {
     pub(crate) unk_id: u32,
     /// Pares de merge para BPE (índice = rank). Vazio em vocabs SPM.
     pub(crate) merges: Vec<(u32, u32)>,
+    /// Variante do pré-tokenizador BPE, de `tokenizer.ggml.pre`. Só `from_gguf` a muda.
+    pub(crate) pre: Pretok,
 }
 
 impl Vocab {
@@ -52,6 +55,7 @@ impl Vocab {
             eos_id,
             unk_id,
             merges,
+            pre: Pretok::default(),
         }
     }
 
@@ -141,15 +145,15 @@ impl Vocab {
             Vec::new()
         };
 
-        Ok(Vocab::new(
-            tokens,
-            scores,
-            token_types,
-            bos_id,
-            eos_id,
-            unk_id,
-            merges,
-        ))
+        // tokenizer.ggml.pre é opcional: sem a chave, fica o pré-tokenizador de sempre.
+        let pre = match f.metadata.get("tokenizer.ggml.pre") {
+            Some(v) => Pretok::from_pre(v.as_str("tokenizer.ggml.pre")?),
+            None => Pretok::default(),
+        };
+
+        let mut vocab = Vocab::new(tokens, scores, token_types, bos_id, eos_id, unk_id, merges);
+        vocab.pre = pre;
+        Ok(vocab)
     }
 
     /// Tokens de controle (type 3) e user-defined (type 4), do mais longo para o
