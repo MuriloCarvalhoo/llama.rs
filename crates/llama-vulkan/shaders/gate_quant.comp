@@ -1,0 +1,63 @@
+#version 450
+
+// `gate_mul` + `quantize_x` na mesma passada: aplica o portão sigmoide na saída da atenção
+// do qwen35 e já entrega a ativação quantizada em int8 por bloco de 32.
+//
+// Eram dois dispatches por camada de atenção: o portão escrevia `b_attn` inteiro e o
+// quantize relia o mesmo buffer logo em seguida, com uma barreira no meio. Aqui o valor com
+// portão nunca sai do registrador entre uma coisa e outra.
+//
+// A distribuição é a do `norm_p2.comp`, que já quantiza direto: **uma lane por bloco de 32**,
+// que é o bloco de quantização do Q8_0 e o sub-bloco dos K-quants — daí as escalas casarem
+// sem conversão nenhuma no matvec.
+//
+// `dst` continua sendo escrito com o valor pós-portão: quem lê `b_attn` para diagnóstico vê
+// o mesmo que via com os dois dispatches.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer DBuf { float d[]; } db;           // inout [n]
+layout(set = 0, binding = 1) readonly buffer GBuf { float g[]; } gb;  // [n_head][2*head_dim]
+layout(set = 0, binding = 2) writeonly buffer XqBuf { int xq[]; } xqb;
+layout(set = 0, binding = 3) writeonly buffer XdBuf { float xd[]; } xdb;
+
+layout(push_constant) uniform PC {
+    uint n;         // head_dim * n_head * n_tok
+    uint head_dim;
+} pc;
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    uint n_blocks = pc.n / 32u;
+    if (blk >= n_blocks) { return; }
+
+    uint base = blk * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        uint idx = base + i;
+        // Cabeça h ocupa [h*2*head_dim, (h+1)*2*head_dim) em `g`: query na primeira metade,
+        // portão na segunda. `idx` já é token-major, então `h` avança sozinho entre tokens.
+        uint h = idx / pc.head_dim;
+        uint d = idx - h * pc.head_dim;
+        float g = gb.g[h * 2u * pc.head_dim + pc.head_dim + d];
+        float v = db.d[idx] * (1.0 / (1.0 + exp(-g)));
+        db.d[idx] = v;
+        amax = max(amax, abs(v));
+    }
+
+    float d_x = amax / 127.0;
+    float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+    xdb.xd[blk] = d_x;
+
+    // Relê `dst` em vez de guardar os 32 valores: a própria lane acabou de escrevê-los, então
+    // saem do L1, e 32 floats vivos custariam 32 VGPRs — o mesmo raciocínio do `norm_p2`.
+    for (uint g = 0u; g < 8u; g++) {
+        int packed = 0;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = int(round(db.d[base + g * 4u + j] * inv));
+            q = clamp(q, -127, 127);
+            packed |= (q & 0xff) << (8u * j);
+        }
+        xqb.xq[blk * 8u + g] = packed;
+    }
+}

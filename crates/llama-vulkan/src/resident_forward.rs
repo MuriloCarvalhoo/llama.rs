@@ -382,7 +382,8 @@ pub(crate) enum PipeId {
     DnNorm,
     /// L2 de q e k num dispatch só — o modo 0 do `dn_norm`, fundido.
     DnL2Qk,
-    GateMul,
+    /// Portão sigmoide + quantização em int8 na mesma passada — `gate_quant.comp`.
+    GateQuant,
 }
 
 impl PipeId {
@@ -410,7 +411,7 @@ impl PipeId {
             PipeId::DnGates => "dn_gates",
             PipeId::DnNorm => "dn_norm",
             PipeId::DnL2Qk => "dn_l2_qk",
-            PipeId::GateMul => "gate_mul",
+            PipeId::GateQuant => "gate_quant",
         }
     }
 
@@ -441,7 +442,7 @@ impl PipeId {
             PipeId::NormFused => (&[0, 1], &[0, 2]),
             PipeId::NormP2 => (&[0, 1, 2], &[3, 4, 5]),
             // x é inout: o RoPE gira em cima do próprio buffer, o Add acumula nele.
-            PipeId::Rope | PipeId::Add | PipeId::GateMul => (&[0, 1], &[0]),
+            PipeId::Rope | PipeId::Add => (&[0, 1], &[0]),
             // o estado recorrente (binding 0) é lido e reescrito no mesmo dispatch.
             PipeId::DeltaNet => (&[0, 1, 2, 3, 4], &[0, 5]),
             PipeId::DnConv => (&[0, 1, 2], &[0, 3]),
@@ -449,6 +450,8 @@ impl PipeId {
             PipeId::DnNorm => (&[0, 1, 2], &[3]),
             // conv (q|k contíguos) → qn, kn.
             PipeId::DnL2Qk => (&[0], &[1, 2]),
+            // dst é inout (recebe o portão) e sai também quantizado em xq/xd.
+            PipeId::GateQuant => (&[0, 1], &[0, 2, 3]),
         }
     }
 }
@@ -655,6 +658,8 @@ pub enum DnPipe {
     Norm,
     /// L2 de q e k fundida — `dn_l2_qk.comp`.
     L2Qk,
+    /// Portão sigmoide + quantização fundidos — `gate_quant.comp`.
+    GateQuant,
     /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
     QuantizeX,
     /// Idem — os dois passos da norma fundida, para testar o batch pela dimensão Y.
@@ -702,7 +707,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_gates: ComputePipeline,
     pub(crate) dn_norm: ComputePipeline,
     pub(crate) dn_l2_qk: ComputePipeline,
-    pub(crate) gate_mul: ComputePipeline,
+    pub(crate) gate_quant: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState>,
 }
@@ -971,7 +976,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 20, &[])?;
         // (conv, qn, kn) + dim, n_heads, eps.
         let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 12, &[])?;
-        let gate_mul = ComputePipeline::with(d, crate::GATE_MUL_SPV, 2, 12, &[])?;
+        // (dst inout, gate, xq, xd) + n, head_dim.
+        let gate_quant = ComputePipeline::with(d, crate::GATE_QUANT_SPV, 4, 8, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1016,7 +1022,7 @@ impl<'ctx> ResidentForward<'ctx> {
             dn_gates,
             dn_norm,
             dn_l2_qk,
-            gate_mul,
+            gate_quant,
             desc_pool,
             state: None,
         })
@@ -1951,6 +1957,7 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::Gates => &self.dn_gates,
             DnPipe::Norm => &self.dn_norm,
             DnPipe::L2Qk => &self.dn_l2_qk,
+            DnPipe::GateQuant => &self.gate_quant,
             DnPipe::QuantizeX => &self.quantize_x,
             DnPipe::NormFused => &self.norm_fused,
             DnPipe::NormP2 => &self.norm_p2,
@@ -2572,7 +2579,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::DnGates => &self.dn_gates,
             PipeId::DnNorm => &self.dn_norm,
             PipeId::DnL2Qk => &self.dn_l2_qk,
-            PipeId::GateMul => &self.gate_mul,
+            PipeId::GateQuant => &self.gate_quant,
             PipeId::QuantizeX => &self.quantize_x,
             PipeId::NormFused => &self.norm_fused,
             PipeId::NormP2 => &self.norm_p2,
@@ -2623,7 +2630,7 @@ impl<'ctx> ResidentForward<'ctx> {
     /// - **`COLS`** nos matvec — o peso sai da VRAM uma vez para as N ativações;
     /// - **`gl_WorkGroupID.y`** em `attention`, `rope`, `norm_fused` e `norm_p2`;
     /// - **`n × N` elementos** no que já é token-major (`quantize_x`, `swiglu`, `add`,
-    ///   `gate_mul`) — nada muda no shader.
+    ///   `gate_quant`) — nada muda no shader.
     ///
     /// O que sobra são as ops com estado (`dn_conv`, `delta_net`) e as que indexam peso
     /// pela cabeça (`dn_gates`): essas viram N dispatches com os bindings deslocados,
@@ -3132,33 +3139,27 @@ impl<'ctx> ResidentForward<'ctx> {
                 }
                 if hib {
                     // Portão do qwen35: a saída da atenção passa por sigmoid(gate), com o
-                    // gate vindo da segunda metade da própria projeção de Q.
-                    let mut pg = Vec::with_capacity(12);
+                    // gate vindo da segunda metade da própria projeção de Q — e sai daqui já
+                    // quantizada para o matvec de saída, numa passada só (`gate_quant`).
+                    // O portão escrevia `b_attn` inteiro e o `quantize_x` relia o mesmo
+                    // buffer logo em seguida, com barreira no meio.
+                    let mut pg = Vec::with_capacity(8);
                     pg.extend_from_slice(
                         &u32::try_from(attn_dim * n_tok).unwrap_or(0).to_le_bytes(),
                     );
                     pg.extend_from_slice(&u32::try_from(c.head_dim).unwrap_or(0).to_le_bytes());
-                    pg.extend_from_slice(&0u32.to_le_bytes());
-                    // `gate_mul` já é token-major: com `n = attn_dim × n_tok` o `h` do
+                    // `gate_quant` já é token-major: com `n = attn_dim × n_tok` o `h` do
                     // shader avança sozinho para `t * n_head + hh`, que é o layout de `b_q`.
                     plan.push(mk(
-                        PipeId::GateMul,
+                        PipeId::GateQuant,
                         &[
                             (st.b_attn.buffer, 0, nbt(attn_dim)),
                             (st.b_q.buffer, 0, nbt(q_out)),
-                        ],
-                        Self::groups_for(attn_dim * n_tok),
-                        PushSpec::Static(pg),
-                    )?);
-                    plan.push(mk(
-                        PipeId::QuantizeX,
-                        &[
-                            (st.b_attn.buffer, 0, nbt(attn_dim)),
                             (st.b_xq.buffer, 0, st.b_xq.size),
                             (st.b_xd.buffer, 0, st.b_xd.size),
                         ],
                         qx_groups(attn_dim * n_tok),
-                        PushSpec::Static(qx_push(attn_dim * n_tok)),
+                        PushSpec::Static(pg),
                     )?);
                 }
                 plan.push(mv(w_o, &st.b_proj, attn_dim, c.n_embd)?);

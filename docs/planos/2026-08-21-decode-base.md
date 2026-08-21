@@ -100,9 +100,13 @@ integração) — o risco conhecido é binding silencioso errado
       saída — acrescentar outro mudaria o número de bindings de todos os modos. 96 → 48
       dispatches/token. Teste `l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia`.
       **Pendente de medição.**
-- [ ] **`gate_mul` + `quantize_x`** (camadas de atenção): o portão sigmoide escreve e o
+- [x] **`gate_mul` + `quantize_x`** (camadas de atenção): o portão sigmoide escreve e o
       quantize relê o mesmo buffer. Um shader `gate_quant` que aplica o portão e
       quantiza na mesma passada; o precedente é o `norm_p2`, que já quantiza direto.
+      **Feito** — `gate_quant.comp`, uma lane por bloco de 32 como o `norm_p2`.
+      `gate_mul.comp` ficou sem uso e saiu junto. Teste
+      `gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x` (portão contra a CPU,
+      `xq`/`xd` exatos contra o `quantize_x`). **Pendente de medição.**
 - [ ] **`swiglu` + `quantize_x`** (todas as 65 camadas): mesmo padrão.
 - [ ] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
       rope in-place + `kv_append` (cópia). Rope com binding de saída no cache elimina a

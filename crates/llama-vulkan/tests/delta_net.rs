@@ -439,3 +439,90 @@ fn l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia() {
         "q e k saíram iguais — o roteamento entre os dois destinos está errado"
     );
 }
+
+/// `gate_quant` funde o portão sigmoide do qwen35 com a quantização em int8 que vinha logo
+/// depois. São duas verificações independentes, porque as duas metades podem errar sozinhas:
+///
+/// 1. o portão contra a referência de CPU (`sigmoid` de `llama_model::delta_net`) — o índice
+///    do gate é o que mais tem como errar, porque ele mora na **segunda** metade de cada
+///    cabeça de `b_q`, entrelaçado com a query;
+/// 2. `xq`/`xd` contra o `quantize_x.comp` rodado sobre a saída que o próprio shader
+///    produziu — igualdade **exata**, já que a entrada do quantizador é a mesma nos dois
+///    caminhos. É o que prende a fusão como "mesma matemática".
+#[test]
+fn gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    // Geometria do Qwen3.8: head_dim 256, 24 cabeças. `n` é múltiplo de 32 (o bloco de
+    // quantização), como o plano garante.
+    let head_dim = 256usize;
+    let n_head = 24usize;
+    let n = head_dim * n_head;
+    let attn = pseudo(n, 61);
+    // `b_q`: por cabeça, query na primeira metade e portão na segunda.
+    let q = pseudo(n_head * 2 * head_dim, 62);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct P {
+        n: u32,
+        head_dim: u32,
+    }
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::GateQuant,
+            &[
+                attn.clone(),
+                q.clone(),
+                vec![0f32; n / 32 * 8],
+                vec![0f32; n / 32],
+            ],
+            &push_bytes(&P {
+                n: n as u32,
+                head_dim: head_dim as u32,
+            }),
+            u32::try_from((n / 32).div_ceil(64)).unwrap(),
+        )
+        .expect("dispatch gate_quant");
+
+    // 1. O portão, contra a CPU.
+    let esperado: Vec<f32> = (0..n)
+        .map(|i| {
+            let h = i / head_dim;
+            let d = i % head_dim;
+            attn[i] * llama_model::delta_net::sigmoid(q[h * 2 * head_dim + head_dim + d])
+        })
+        .collect();
+    let dif = max_dif(&saida[0], &esperado);
+    eprintln!("gate_quant: dif do portão={dif:.3e}");
+    assert!(dif < 1e-6, "portão divergiu: {dif}");
+
+    // 2. `xq`/`xd`, contra o `quantize_x` sobre a mesma entrada — exatos.
+    let mut qx_push = Vec::with_capacity(12);
+    qx_push.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    let sozinho = fwd
+        .dbg_dn(
+            DnPipe::QuantizeX,
+            &[saida[0].clone(), vec![0f32; n / 32 * 8], vec![0f32; n / 32]],
+            &qx_push,
+            u32::try_from((n / 32).div_ceil(64)).unwrap(),
+        )
+        .expect("dispatch quantize_x");
+    // `xq` carrega int8 empacotados; comparar pelos bits evita que um padrão de NaN
+    // faça duas saídas idênticas parecerem diferentes.
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits(&saida[2]),
+        bits(&sozinho[1]),
+        "xq difere do quantize_x"
+    );
+    assert_eq!(
+        bits(&saida[3]),
+        bits(&sozinho[2]),
+        "xd difere do quantize_x"
+    );
+}
