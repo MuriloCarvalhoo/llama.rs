@@ -54,8 +54,9 @@ fn read_numa_node_cpus(node: usize) -> Vec<usize> {
 fn pin_thread_to_cpus(cpus: &[usize]) {
     let mut mask = [0u64; 16];
     for &cpu in cpus {
-        if cpu < 1024 {
-            mask[cpu / 64] |= 1u64 << (cpu % 64);
+        // get_mut carrega a mesma garantia que o `cpu < 1024` fazia: 16 palavras de 64 bits.
+        if let Some(palavra) = mask.get_mut(cpu / 64) {
+            *palavra |= 1u64 << (cpu % 64);
         }
     }
     unsafe {

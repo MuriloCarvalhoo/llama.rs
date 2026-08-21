@@ -752,8 +752,8 @@ pub(crate) fn matmul_q8_0_actq(
     // ceil(n_out / n_threads) rounded up to nearest 8 for the 8-row inner kernel.
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = {
-        let raw = (n_out + n_threads - 1) / n_threads;
-        ((raw.max(8) + 7) / 8) * 8
+        let raw = n_out.div_ceil(n_threads);
+        raw.max(8).div_ceil(8) * 8
     };
 
     for t in 0..n_tok {
@@ -809,9 +809,12 @@ pub(crate) fn matmul_q8_0_actq(
                             chunk[k + 3] = r3;
                             k += 4;
                         }
-                        for rem in k..chunk.len() {
-                            let j = base_j + rem;
-                            chunk[rem] = q8_0_q8_0_dot_scalar(
+                        // split_at_mut, e não .skip(k): Skip<Enumerate<IterMut>> custou
+                        // ~4% de tok/s no decode — medido, ver docs/rust-memoria-e-desempenho.md.
+                        let (_, resto) = chunk.split_at_mut(k);
+                        for (rem, destino) in resto.iter_mut().enumerate() {
+                            let j = base_j + k + rem;
+                            *destino = q8_0_q8_0_dot_scalar(
                                 &w[j * row_bytes..(j + 1) * row_bytes],
                                 x_row,
                                 n_blocks,
@@ -842,9 +845,12 @@ pub(crate) fn matmul_q8_0_actq(
                             chunk[k + 3] = r3;
                             k += 4;
                         }
-                        for rem in k..chunk.len() {
-                            let j = base_j + rem;
-                            chunk[rem] = q8_0_q8_0_dot_scalar(
+                        // split_at_mut, e não .skip(k): Skip<Enumerate<IterMut>> custou
+                        // ~4% de tok/s no decode — medido, ver docs/rust-memoria-e-desempenho.md.
+                        let (_, resto) = chunk.split_at_mut(k);
+                        for (rem, destino) in resto.iter_mut().enumerate() {
+                            let j = base_j + k + rem;
+                            *destino = q8_0_q8_0_dot_scalar(
                                 &w[j * row_bytes..(j + 1) * row_bytes],
                                 x_row,
                                 n_blocks,
@@ -903,8 +909,8 @@ pub(crate) fn matmul_q8_0_actq_packed(
     // Static work division: one contiguous range per thread (same as llamafile).
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = {
-        let raw = (n_out_packed.max(1) + n_threads - 1) / n_threads;
-        ((raw.max(8) + 7) / 8) * 8
+        let raw = n_out_packed.max(1).div_ceil(n_threads);
+        raw.max(8).div_ceil(8) * 8
     };
     let n_groups = n_out_packed / 8;
 
@@ -915,7 +921,7 @@ pub(crate) fn matmul_q8_0_actq_packed(
 
         // Repacked groups of 8 rows — spin pool (overhead ~1-3 µs vs ~26 µs rayon)
         if use_f16c && n_groups > 0 {
-            let n_chunks = (n_out_packed + chunk_size - 1) / chunk_size;
+            let n_chunks = n_out_packed.div_ceil(chunk_size);
             let batch = crate::spin_pool::MatmulBatch {
                 packed_w: packed_w.as_ptr(),
                 x_row: x_row.as_ptr(),
@@ -1169,10 +1175,10 @@ mod tests {
         w.extend_from_slice(&f16_le(1.0));
         w.push(1u8);
         w.push(2u8);
-        w.extend(std::iter::repeat(0u8).take(30));
+        w.extend(std::iter::repeat_n(0u8, 30));
         w.extend_from_slice(&f16_le(2.0));
         w.push(1u8);
-        w.extend(std::iter::repeat(0u8).take(31));
+        w.extend(std::iter::repeat_n(0u8, 31));
 
         let x: Vec<f32> = (1..=32).map(|i| i as f32).collect();
         let out = matmul_q8_0(&w, &x, 32, 2, 1);
@@ -1190,7 +1196,7 @@ mod tests {
         let mut w = Vec::with_capacity(34);
         w.extend_from_slice(&f16_le(1.0));
         w.push(1u8);
-        w.extend(std::iter::repeat(0u8).take(31));
+        w.extend(std::iter::repeat_n(0u8, 31));
 
         let mut x = vec![0.0f32; 64];
         x[0] = 3.0; // token 0, dim 0
@@ -1213,10 +1219,10 @@ mod tests {
         w.extend_from_slice(&f16_le(1.0));
         w.push(1u8);
         w.push(2u8);
-        w.extend(std::iter::repeat(0u8).take(30));
+        w.extend(std::iter::repeat_n(0u8, 30));
         w.extend_from_slice(&f16_le(2.0));
         w.push(1u8);
-        w.extend(std::iter::repeat(0u8).take(31));
+        w.extend(std::iter::repeat_n(0u8, 31));
 
         let x: Vec<f32> = (1..=32).map(|i| i as f32).collect();
         let expected = matmul_q8_0(&w, &x, 32, 2, 1);

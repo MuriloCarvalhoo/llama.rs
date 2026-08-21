@@ -55,19 +55,24 @@ pub fn conv1d_step(state: &mut [f32], entrada: &[f32], w: &[f32], d_conv: usize)
     debug_assert_eq!(w.len(), canais * d_conv);
 
     let mut saida = vec![0f32; canais];
-    for c in 0..canais {
-        let janela = &mut state[c * passos_estado..(c + 1) * passos_estado];
-        let kernel = &w[c * d_conv..(c + 1) * d_conv];
+    // Percorrer por chunks casa os três slices canal a canal sem indexar nenhum deles.
+    for (((janela, kernel), &ent), dest) in state
+        .chunks_exact_mut(passos_estado)
+        .zip(w.chunks_exact(d_conv))
+        .zip(entrada)
+        .zip(saida.iter_mut())
+    {
         // Os `d_conv - 1` valores antigos, depois o token atual.
-        let mut acc = 0f32;
-        for (t, &v) in janela.iter().enumerate() {
-            acc += v * kernel[t];
+        let mut acc: f32 = janela.iter().zip(kernel).map(|(&v, &k)| v * k).sum();
+        if let Some(&ultimo) = kernel.last() {
+            acc += ent * ultimo;
         }
-        acc += entrada[c] * kernel[d_conv - 1];
-        saida[c] = acc;
+        *dest = acc;
         // Desliza a janela: descarta o mais antigo, guarda o atual.
         janela.rotate_left(1);
-        janela[passos_estado - 1] = entrada[c];
+        if let Some(fim) = janela.last_mut() {
+            *fim = ent;
+        }
     }
     saida
 }
@@ -105,16 +110,13 @@ pub fn delta_net_step(
 
     // 2. delta[j] = (v[j] - <S[:,j], k>) * beta — o erro de predição do delta rule.
     let mut delta = vec![0f32; d];
-    for j in 0..d {
-        let linha = &state[j * d..(j + 1) * d];
+    for ((linha, dj), &vj) in state.chunks_exact(d).zip(delta.iter_mut()).zip(v) {
         let pred: f32 = linha.iter().zip(k).map(|(s, kk)| s * kk).sum();
-        delta[j] = (v[j] - pred) * beta;
+        *dj = (vj - pred) * beta;
     }
 
     // 3. Atualização de posto 1: S += k ⊗ delta.
-    for j in 0..d {
-        let dj = delta[j];
-        let linha = &mut state[j * d..(j + 1) * d];
+    for (linha, &dj) in state.chunks_exact_mut(d).zip(&delta) {
         for (s, kk) in linha.iter_mut().zip(k) {
             *s += dj * kk;
         }
@@ -122,10 +124,9 @@ pub fn delta_net_step(
 
     // 4. Leitura: out[j] = <S[:,j], q> / sqrt(d).
     let escala = 1.0 / (d as f32).sqrt();
-    for j in 0..d {
-        let linha = &state[j * d..(j + 1) * d];
+    for (linha, o) in state.chunks_exact(d).zip(out.iter_mut()) {
         let soma: f32 = linha.iter().zip(q).map(|(s, qq)| s * qq).sum();
-        out[j] = soma * escala;
+        *o = soma * escala;
     }
 }
 
@@ -145,11 +146,11 @@ mod tests {
     fn l2_norm_deixa_a_linha_com_norma_um() {
         let mut x = vec![3.0, 4.0, 0.0, 0.0, 5.0, 12.0, 0.0, 0.0];
         l2_norm_rows(&mut x, 4, 0.0);
-        let n0: f32 = x[..4].iter().map(|v| v * v).sum::<f32>().sqrt();
-        let n1: f32 = x[4..].iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((n0 - 1.0).abs() < 1e-6, "n0={n0}");
-        assert!((n1 - 1.0).abs() < 1e-6, "n1={n1}");
-        assert!((x[0] - 0.6).abs() < 1e-6);
+        for (i, linha) in x.as_chunks::<4>().0.iter().enumerate() {
+            let n: f32 = linha.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((n - 1.0).abs() < 1e-6, "linha {i}: n={n}");
+        }
+        assert!((x.first().copied().unwrap_or(0.0) - 0.6).abs() < 1e-6);
     }
 
     /// A convolução causal com estado, aplicada token a token, tem que dar o mesmo que
@@ -178,17 +179,18 @@ mod tests {
         }
 
         // Direto: para cada t, soma sobre a janela causal, com zeros antes do início.
-        for t in 0..n_tok {
-            for c in 0..canais {
-                let kernel = &w[c * d_conv..(c + 1) * d_conv];
+        for (t, obtidos) in passo_a_passo.iter().enumerate() {
+            for (c, kernel) in w.chunks_exact(d_conv).enumerate() {
                 let mut esperado = 0f32;
                 for (i, kv) in kernel.iter().enumerate() {
                     let pos = t.cast_signed() + i.cast_signed() - (d_conv.cast_signed() - 1);
-                    if pos >= 0 {
-                        esperado += seq[pos.cast_unsigned()][c] * kv;
+                    if pos >= 0
+                        && let Some(v) = seq.get(pos.cast_unsigned()).and_then(|l| l.get(c))
+                    {
+                        esperado += v * kv;
                     }
                 }
-                let obtido = passo_a_passo[t][c];
+                let obtido = obtidos.get(c).copied().unwrap_or(f32::NAN);
                 assert!(
                     (obtido - esperado).abs() < 1e-5,
                     "t={t} c={c}: {obtido} != {esperado}"
@@ -208,12 +210,12 @@ mod tests {
         let mut out = vec![0f32; d];
         delta_net_step(&mut state, &k, &k, &v, 0.0, 1.0, &mut out);
         let escala = (d as f32).sqrt();
-        for j in 0..d {
+        for (j, (o, vj)) in out.iter().zip(&v).enumerate() {
             assert!(
-                (out[j] * escala - v[j]).abs() < 1e-6,
+                (o * escala - vj).abs() < 1e-6,
                 "j={j}: {} != {}",
-                out[j] * escala,
-                v[j]
+                o * escala,
+                vj
             );
         }
     }
@@ -235,21 +237,18 @@ mod tests {
         let g = 0.5f32.ln();
         delta_net_step(&mut state, &k2, &k2, &v2, g, 1.0, &mut out);
         let escala = (d as f32).sqrt();
-        for j in 0..d {
-            assert!(
-                (out[j] * escala - v2[j]).abs() < 1e-6,
-                "leitura de k2 em j={j}"
-            );
+        for (j, (o, v2j)) in out.iter().zip(&v2).enumerate() {
+            assert!((o * escala - v2j).abs() < 1e-6, "leitura de k2 em j={j}");
         }
 
         // Lendo com k1: o valor antigo sobrevive, reduzido pelo decaimento.
         delta_net_step(&mut state, &k1, &k1, &vec![0.0; d], 0.0, 0.0, &mut out);
-        for j in 0..d {
-            let esperado = v1[j] * 0.5;
+        for (j, (o, v1j)) in out.iter().zip(&v1).enumerate() {
+            let esperado = v1j * 0.5;
             assert!(
-                (out[j] * escala - esperado).abs() < 1e-5,
+                (o * escala - esperado).abs() < 1e-5,
                 "j={j}: {} != {esperado}",
-                out[j] * escala
+                o * escala
             );
         }
     }

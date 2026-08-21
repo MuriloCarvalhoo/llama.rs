@@ -172,14 +172,31 @@ impl<'ctx> LayerSplitForward<'ctx> {
 
 impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, llama_model::ModelError> {
+        self.decode_batch(&[token], pos)
+    }
+
+    /// O batch atravessa os shards igual ao decode — a diferença é que a stream residual
+    /// que passa entre as GPUs carrega os N tokens do bloco, não um só.
+    fn decode_batch(
+        &self,
+        tokens: &[u32],
+        pos0: usize,
+    ) -> Result<Vec<f32>, llama_model::ModelError> {
         let mut carry: Option<Vec<f32>> = None;
         for shard in &self.shards {
             let out = shard
-                .decode_shard(token, pos, carry.as_deref())
+                .decode_shard_batch(tokens, pos0, carry.as_deref())
                 .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
             carry = Some(out);
         }
         carry.ok_or_else(|| llama_model::ModelError::Gpu("nenhum shard".into()))
+    }
+
+    /// Todos os shards são construídos com o mesmo `batch_size()`.
+    fn batch_size(&self) -> usize {
+        self.shards
+            .first()
+            .map_or(1, llama_model::GpuResidentDecode::batch_size)
     }
 
     fn reset(&self) {

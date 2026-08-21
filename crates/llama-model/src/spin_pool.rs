@@ -88,8 +88,9 @@ fn pin_to_cpus(cpus: &[usize]) {
     }
     let mut mask = [0u64; 16];
     for &cpu in cpus {
-        if cpu < 1024 {
-            mask[cpu / 64] |= 1u64 << (cpu % 64);
+        // get_mut carrega a mesma garantia que o `cpu < 1024` fazia: 16 palavras de 64 bits.
+        if let Some(palavra) = mask.get_mut(cpu / 64) {
+            *palavra |= 1u64 << (cpu % 64);
         }
     }
     unsafe {
@@ -143,30 +144,24 @@ fn process_chunk(batch: &MatmulBatch, ci: usize) {
     let end_j = (base_j + batch.chunk_size).min(batch.n_out_packed);
     let chunk = unsafe { std::slice::from_raw_parts_mut(batch.out.add(base_j), end_j - base_j) };
     let n_full8 = (chunk.len() / 8) * 8;
-    let mut k = 0usize;
-    while k < n_full8 {
-        let g = (base_j + k) / 8;
+    // split_at_mut + chunks_exact_mut no lugar de indexar: o compilador perde os
+    // bounds checks do laço em vez de ganhar um por store.
+    let (cheio, resto) = chunk.split_at_mut(n_full8);
+    for (gi, saida) in cheio.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let g = (base_j + gi * 8) / 8;
         let group_off = g * batch.n_blocks * PB;
-        let [r0, r1, r2, r3, r4, r5, r6, r7] = unsafe {
+        let linhas = unsafe {
             q8_0_q8_0_dot_8rows_repacked_f16c_pub(
                 batch.packed_w.add(group_off),
                 batch.x_row,
                 batch.n_blocks,
             )
         };
-        chunk[k] = r0;
-        chunk[k + 1] = r1;
-        chunk[k + 2] = r2;
-        chunk[k + 3] = r3;
-        chunk[k + 4] = r4;
-        chunk[k + 5] = r5;
-        chunk[k + 6] = r6;
-        chunk[k + 7] = r7;
-        k += 8;
+        *saida = linhas;
     }
-    for rem in k..chunk.len() {
-        let j = base_j + rem;
-        chunk[rem] = unsafe {
+    for (rem, destino) in resto.iter_mut().enumerate() {
+        let j = base_j + n_full8 + rem;
+        *destino = unsafe {
             q8_0_q8_0_dot_scalar_pub(
                 batch.w_tail.add(j * batch.row_bytes),
                 batch.x_row,

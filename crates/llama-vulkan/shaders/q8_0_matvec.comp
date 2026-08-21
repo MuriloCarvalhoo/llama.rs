@@ -5,6 +5,9 @@
 // Specialization constants (preenchidas no pipeline creation).
 layout(constant_id = 0) const uint WG = 64u;       // local_size_x (wave64)
 layout(constant_id = 1) const uint NUM_ROWS = 1u;  // linhas de saida por workgroup
+// Colunas (tokens) acumuladas contra o mesmo peso ja lido. COLS=1 e o decode; COLS>1 e o
+// prefill em batch, onde cada peso sai da memoria uma vez para COLS ativacoes.
+layout(constant_id = 2) const uint COLS = 1u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -47,22 +50,31 @@ void main() {
         // iteracoes inuteis. `row` independe de lane, logo o break e uniforme no subgroup.
         if (row >= pc.n_out) { break; }
         uint roff = row * row_stride;
-        float acc = 0.0;
+        float acc[COLS];
+        for (uint c = 0u; c < COLS; c++) { acc[c] = 0.0; }
         for (uint b = lane; b < n_blocks; b += WG) {
             uint boff = roff + b * 9u;
             // uint[boff] = scale f16 nos 16 bits baixos (pad nos altos, ignorado).
             float d_w = unpackHalf2x16(weight_buf.w[boff]).x;
-            // Soma dos 32 produtos i8(peso) * i8(x) via dot empacotado (4 MAC/instr).
-            int isum = 0;
-            for (uint g = 0u; g < 8u; g++) {
-                int wp = int(weight_buf.w[boff + 1u + g]);
-                isum = dotPacked4x8AccSatEXT(wp, xq_buf.xq[b * 8u + g], isum);
+            // O peso do bloco fica em registrador e serve as COLS colunas abaixo — e o
+            // que faz o prefill em batch ler a matriz uma vez em vez de COLS vezes.
+            int wp[8];
+            for (uint g = 0u; g < 8u; g++) { wp[g] = int(weight_buf.w[boff + 1u + g]); }
+            for (uint c = 0u; c < COLS; c++) {
+                uint cb = c * n_blocks + b;
+                // Soma dos 32 produtos i8(peso) * i8(x) via dot empacotado (4 MAC/instr).
+                int isum = 0;
+                for (uint g = 0u; g < 8u; g++) {
+                    isum = dotPacked4x8AccSatEXT(wp[g], xq_buf.xq[cb * 8u + g], isum);
+                }
+                acc[c] += d_w * xd_buf.xd[cb] * float(isum);
             }
-            acc += d_w * xd_buf.xd[b] * float(isum);
         }
-        acc = subgroupAdd(acc);
-        if (gl_SubgroupInvocationID == 0u) {
-            out_buf.y[row] = pc.tem_bias != 0u ? acc + bias_buf.b[row] : acc;
+        for (uint c = 0u; c < COLS; c++) {
+            float s = subgroupAdd(acc[c]);
+            if (gl_SubgroupInvocationID == 0u) {
+                out_buf.y[c * pc.n_out + row] = pc.tem_bias != 0u ? s + bias_buf.b[row] : s;
+            }
         }
     }
 }

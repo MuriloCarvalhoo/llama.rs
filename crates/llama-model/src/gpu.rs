@@ -120,7 +120,7 @@ impl<'a> GpuRawWeights<'a> {
                     )));
                 }
             };
-            if n_in % elems_per_block != 0 {
+            if !n_in.is_multiple_of(elems_per_block) {
                 return Err(ModelError::Gpu(format!(
                     "tensor {name}: n_in={n_in} não é múltiplo de {elems_per_block} ({:?})",
                     info.ggml_type
@@ -288,6 +288,20 @@ pub trait GpuResidentDecode {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, ModelError>;
     /// Zera o comprimento do KV-cache interno (início de nova sequência).
     fn reset(&self);
+    /// Tokens por bloco que `decode_batch` aceita. `1` significa sem prefill em batch.
+    fn batch_size(&self) -> usize {
+        1
+    }
+    /// Processa `tokens` nas posições `pos0..pos0 + tokens.len()` de uma vez, retornando
+    /// os logits **do último** — os anteriores já ficaram no KV-cache, e é só isso que o
+    /// prefill precisa. `tokens.len()` tem de ser exatamente `batch_size()`.
+    fn decode_batch(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, ModelError> {
+        let mut logits = Vec::new();
+        for (i, &t) in tokens.iter().enumerate() {
+            logits = self.decode(t, pos0 + i)?;
+        }
+        Ok(logits)
+    }
 }
 
 impl<'a> GpuAuxWeights<'a> {
@@ -436,13 +450,25 @@ pub fn gerar_streaming_residente(
     }
     gpu.reset();
 
+    // Prefill: blocos de `batch_size()` tokens, e o que sobrar token a token. Em batch
+    // cada peso do modelo sai da VRAM uma vez para N tokens em vez de uma por token — o
+    // decode é limitado por banda, então é aí que está o custo de um prompt longo.
     let mut logits = Vec::new();
-    for (pos, &t) in prompt_ids.iter().enumerate() {
+    let nb = gpu.batch_size();
+    let mut pos = 0usize;
+    while nb > 1 && prompt_ids.len() - pos >= nb {
+        let Some(bloco) = prompt_ids.get(pos..pos + nb) else {
+            break;
+        };
+        logits = gpu.decode_batch(bloco, pos)?;
+        pos += nb;
+    }
+    for &t in prompt_ids.get(pos..).unwrap_or(&[]) {
         logits = gpu.decode(t, pos)?;
+        pos += 1;
     }
     let first_idx = sampler.sample(&logits, rng);
     let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
-    let mut pos = prompt_ids.len();
 
     let mut count = 0usize;
     while count < n_tokens {
@@ -540,7 +566,11 @@ impl Model<'_> {
             let (attn_norm, ffn_norm) = self.layer_norms_f32(l)?;
             let attn_norm = attn_norm.to_vec();
             let ffn_norm = ffn_norm.to_vec();
-            let lw = &self.weights.layers[l];
+            let lw = self
+                .weights
+                .layers
+                .get(l)
+                .ok_or_else(|| ModelError::Gpu(format!("camada {l} ausente nos pesos")))?;
             let bias =
                 |b: &Option<crate::weights::RawTensor>| -> Result<Option<Vec<f32>>, ModelError> {
                     match b {
@@ -716,7 +746,7 @@ impl Model<'_> {
 
         let output_norm = self.output_norm_f32()?;
         let final_x = rmsnorm_and_scale(&x, output_norm, c.n_embd, c.rms_eps);
-        let last = &final_x[..c.n_embd];
+        let last = final_x.get(..c.n_embd).unwrap_or(&final_x);
         let logits = gpu.matvec_q8_0(w.output.bytes, last, c.n_embd, c.vocab)?;
         Ok(logits)
     }

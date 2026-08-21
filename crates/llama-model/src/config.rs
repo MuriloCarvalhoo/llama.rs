@@ -31,7 +31,7 @@ impl DeltaNetConfig {
     /// `true` se a camada `il` é de atenção linear (recorrente).
     #[must_use]
     pub fn eh_linear(&self, il: usize) -> bool {
-        (il + 1) % self.full_attn_interval != 0
+        !(il + 1).is_multiple_of(self.full_attn_interval)
     }
 
     /// Dimensão de cada cabeça de valor.

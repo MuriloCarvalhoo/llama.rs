@@ -121,7 +121,7 @@ fn buffers_da_camada_0() {
     use llama_model::GpuResidentDecode;
     backend.reset();
     backend.decode(46, 0).unwrap();
-        // O matvec do ssm_out, refeito na CPU a partir do `normed` que a própria GPU
+    // O matvec do ssm_out, refeito na CPU a partir do `normed` que a própria GPU
     // produziu: se `proj` não sair disto, o erro está entre os dois.
     if let (Some(normed), Some(proj)) = (
         backend.dbg_dn_buf(0, "normed"),
@@ -207,9 +207,7 @@ fn matvec_ssm_out_bate_com_a_cpu() {
     let n_in = dn.head_v_dim() * dn.n_v_heads; // 6144
     let n_out = cfg.n_embd; // 5120
     // Ativação com a mesma ordem de grandeza da real (~1e-3).
-    let x: Vec<f32> = (0..n_in)
-        .map(|i| ((i % 37) as f32 - 18.0) * 1e-4)
-        .collect();
+    let x: Vec<f32> = (0..n_in).map(|i| ((i % 37) as f32 - 18.0) * 1e-4).collect();
 
     let gpu = llama_vulkan::matmul::dispatch_q6_k_matvec(
         &ctx,
@@ -296,4 +294,82 @@ fn quantize_x_nos_tamanhos_do_qwen35() {
         eprintln!("quantize_x n={n}: pior erro relativo nas escalas {pior:.3e}");
         assert!(pior < 1e-5, "escalas erradas com n={n}: {pior}");
     }
+}
+
+/// O prefill em batch tem que dar os mesmos logits que o token a token **nesta
+/// arquitetura**, que é onde ele é mais frágil: 48 das 65 camadas carregam estado
+/// recorrente, e no bloco elas rodam como N dispatches em ordem em vez de um por token.
+/// Um estado aplicado fora de ordem — ou uma janela de convolução compartilhada entre os
+/// tokens do bloco — aparece aqui.
+#[test]
+fn prefill_em_batch_bate_com_token_a_token_no_qwen35() {
+    let Some(bytes) = mapear() else {
+        eprintln!("Qwen3.8 ausente — pulando");
+        return;
+    };
+    let Ok(ctx) = llama_vulkan::VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().len() < 2 {
+        eprintln!("menos de 2 GPUs — pulando");
+        return;
+    }
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let mut cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
+    cfg.ctx = 64;
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+    let aux = llama_model::GpuAuxWeights::from_gguf(&f, &bytes, &cfg).unwrap();
+    let backend = llama_vulkan::LayerSplitForward::new(&ctx, &cfg, &raw, &aux).unwrap();
+    use llama_model::GpuResidentDecode;
+
+    let nb = backend.batch_size();
+    if nb < 2 {
+        eprintln!("LLAMA_RS_BATCH=1 — nada a comparar");
+        return;
+    }
+    // Tamanho não múltiplo do batch: exercita a emenda entre o bloco e o resto.
+    let seq: Vec<u32> = (0..2 * nb + 3).map(|i| 46 + (i as u32) * 137).collect();
+
+    backend.reset();
+    let mut referencia = Vec::new();
+    for (pos, &t) in seq.iter().enumerate() {
+        referencia = backend.decode(t, pos).unwrap();
+    }
+
+    backend.reset();
+    let mut logits = Vec::new();
+    let mut pos = 0usize;
+    while seq.len() - pos >= nb {
+        logits = backend.decode_batch(&seq[pos..pos + nb], pos).unwrap();
+        pos += nb;
+    }
+    for &t in &seq[pos..] {
+        logits = backend.decode(t, pos).unwrap();
+        pos += 1;
+    }
+
+    assert_eq!(referencia.len(), logits.len());
+    let max_abs = referencia
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-6);
+    let max_rel = referencia
+        .iter()
+        .zip(&logits)
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs() / max_abs));
+    let arg = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| {
+                if x > acc.1 { (i, x) } else { acc }
+            })
+            .0
+    };
+    eprintln!(
+        "qwen35 prefill: {} tokens em blocos de {nb} (+{} avulsos), erro relativo máximo {max_rel:.2e}",
+        seq.len(),
+        seq.len() % nb
+    );
+    assert!(max_rel < 1e-3, "erro relativo {max_rel} deve ser < 1e-3");
+    assert_eq!(arg(&referencia), arg(&logits), "mesmo token escolhido");
 }

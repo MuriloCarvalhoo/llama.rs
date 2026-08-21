@@ -26,7 +26,7 @@ fn bytes_por_linha(ty: gguf::GgmlType, n_in: usize) -> Option<usize> {
         gguf::GgmlType::Q6_K => (256, 210),
         _ => return None,
     };
-    (n_in % elems == 0).then(|| n_in / elems * bytes)
+    n_in.is_multiple_of(elems).then(|| n_in / elems * bytes)
 }
 
 /// `y[r] = <linha r de w, x>`, desquantizando **uma linha por vez**.
@@ -147,6 +147,9 @@ impl MtpHead {
     ///
     /// # Errors
     /// Se algum peso tiver forma incompatível com a config.
+    // Os pesos já vêm agrupados em `MtpRaw`/`MtpAux`/`QTensor`; o que sobra são slices
+    // distintos do passo. Empacotá-los daria uma struct de uso único.
+    #[allow(clippy::too_many_arguments)]
     pub fn propor(
         &mut self,
         cfg: &LlamaConfig,

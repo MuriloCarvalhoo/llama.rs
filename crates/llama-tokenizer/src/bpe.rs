@@ -22,8 +22,9 @@ fn byte_table() -> &'static [char; 256] {
     TABLE.get_or_init(|| {
         let mut t = ['\0'; 256];
         let mut hi = 256u32;
-        for b in 0u8..=255 {
-            t[b as usize] = match b {
+        // zip com o range de u8 no lugar de indexar: os 256 slots casam um a um.
+        for (b, slot) in (0u8..=255).zip(t.iter_mut()) {
+            *slot = match b {
                 33..=126 | 161..=172 | 174..=255 => char::from(b),
                 _ => {
                     let c = char::from_u32(hi).unwrap_or('\u{FFFD}');
@@ -84,7 +85,7 @@ pub(crate) fn tokenize_bpe(
         let mut ids: Vec<u32> = piece_str
             .bytes()
             .filter_map(|b| {
-                let c = bt[b as usize];
+                let c = *bt.get(usize::from(b))?;
                 let s = c.encode_utf8(&mut char_buf);
                 vocab.text_to_token(s)
             })
@@ -92,25 +93,26 @@ pub(crate) fn tokenize_bpe(
 
         // Loop de merge: encontra o par de menor rank e funde.
         let mut merge_buf = String::with_capacity(32);
-        loop {
-            let Some((pos, _)) = ids
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, w)| merge_ranks.get(&(w[0], w[1])).map(|&r| (i, r)))
-                .min_by_key(|&(_, r)| r)
-            else {
-                break;
-            };
-
+        while let Some((pos, _)) = ids
+            .windows(2)
+            .enumerate()
+            .filter_map(|(i, w)| {
+                let (a, b) = (*w.first()?, *w.get(1)?);
+                merge_ranks.get(&(a, b)).map(|&r| (i, r))
+            })
+            .min_by_key(|&(_, r)| r)
+        {
             merge_buf.clear();
-            if let Some(a) = vocab.token_text(ids[pos]) {
+            if let Some(a) = ids.get(pos).and_then(|&id| vocab.token_text(id)) {
                 merge_buf.push_str(a);
             }
-            if let Some(b) = vocab.token_text(ids[pos + 1]) {
+            if let Some(b) = ids.get(pos + 1).and_then(|&id| vocab.token_text(id)) {
                 merge_buf.push_str(b);
             }
             if let Some(merged_id) = vocab.text_to_token(&merge_buf) {
-                ids[pos] = merged_id;
+                if let Some(slot) = ids.get_mut(pos) {
+                    *slot = merged_id;
+                }
                 ids.remove(pos + 1);
             } else {
                 break;
@@ -165,8 +167,7 @@ mod tests {
     fn unicode_to_byte_roundtrip() {
         let u2b = unicode_to_byte();
         let bt = byte_table();
-        for b in 0u8..=255 {
-            let c = bt[b as usize];
+        for (b, &c) in (0u8..=255).zip(bt.iter()) {
             assert_eq!(u2b[&c], b, "roundtrip falhou para byte {b}");
         }
     }

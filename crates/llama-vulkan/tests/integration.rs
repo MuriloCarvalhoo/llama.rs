@@ -164,7 +164,7 @@ fn matmul_gpu_matches_cpu_reference() {
     // row 1: scale=2.0f16, qs[0]=1, resto 0 -> y[1] = 2.0 * 1 * x[0] = 10.0
     let n_in = 32usize;
     let n_out = 4usize;
-    let row_bytes = 1 * 34; // 1 bloco
+    let row_bytes = 34; // 1 bloco
     let mut w_bytes = vec![0u8; n_out * row_bytes];
 
     // Escala f16 em little-endian: 1.0 = 0x3C00
@@ -364,7 +364,7 @@ fn cpu_ref_q8_0_int8act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f
     }
 
     let mut y = vec![0f32; n_out];
-    for row in 0..n_out {
+    for (row, y_row) in y.iter_mut().enumerate() {
         let mut acc = 0f32;
         for b in 0..n_blocks {
             let off = row * row_bytes + b * 34;
@@ -375,7 +375,7 @@ fn cpu_ref_q8_0_int8act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f
             }
             acc += d_w * xd[b] * isum as f32;
         }
-        y[row] = acc;
+        *y_row = acc;
     }
     y
 }
@@ -384,7 +384,7 @@ fn cpu_ref_q8_0_f32act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f3
     let n_blocks = n_in / 32;
     let row_bytes = n_blocks * 34;
     let mut y = vec![0f32; n_out];
-    for row in 0..n_out {
+    for (row, y_row) in y.iter_mut().enumerate() {
         let mut acc = 0f32;
         for b in 0..n_blocks {
             let off = row * row_bytes + b * 34;
@@ -396,7 +396,7 @@ fn cpu_ref_q8_0_f32act(w: &[u8], x: &[f32], n_in: usize, n_out: usize) -> Vec<f3
             }
             acc += scale * dot;
         }
-        y[row] = acc;
+        *y_row = acc;
     }
     y
 }
@@ -794,10 +794,10 @@ fn attention_caso(
         let kv_h = h / n_rep;
         let qoff = h * head_dim;
         let mut scores = vec![0f32; total_len];
-        for j in 0..total_len {
+        for (j, score) in scores.iter_mut().enumerate() {
             let koff = j * kv_dim + kv_h * head_dim;
             let dot: f32 = (0..head_dim).map(|dd| q[qoff + dd] * kc[koff + dd]).sum();
-            scores[j] = dot * scale;
+            *score = dot * scale;
         }
         let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
@@ -808,10 +808,10 @@ fn attention_caso(
         for s in scores.iter_mut() {
             *s /= sum;
         }
-        for j in 0..total_len {
+        for (j, score) in scores.iter().enumerate() {
             let voff = j * kv_dim + kv_h * head_dim;
             for dd in 0..head_dim {
-                cpu[qoff + dd] += scores[j] * vc[voff + dd];
+                cpu[qoff + dd] += score * vc[voff + dd];
             }
         }
     }
@@ -1308,6 +1308,7 @@ impl QuantK {
         w
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         self,
         ctx: &llama_vulkan::VulkanContext,
@@ -1713,4 +1714,103 @@ fn rope_em_batch_usa_a_posicao_de_cada_token() {
         }
         eprintln!("rope batch pos0={pos0} n_tok={n_tok}: cada token no seu ângulo");
     }
+}
+
+// ─── Prefill em batch: o bloco tem que dar os mesmos logits que token a token ────
+
+/// O prefill em batch é uma reorganização do mesmo cálculo: os N tokens do bloco veem as
+/// mesmas posições e o mesmo KV-cache que veriam um a um. Se algum shader batchado errar o
+/// offset do token, a divergência aparece aqui — nos logits do fim do prompt.
+///
+/// O prompt tem tamanho **não múltiplo** do batch de propósito: o resto cai no caminho
+/// token a token, e é a emenda entre os dois que costuma quebrar (`pos` do RoPE, `pos0`
+/// do append no KV-cache).
+#[test]
+fn prefill_em_batch_bate_com_token_a_token() {
+    use llama_model::GpuResidentDecode;
+    use llama_tokenizer::Tokenizer;
+    use llama_vulkan::{ResidentForward, VulkanContext};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        eprintln!("sem Vulkan — pulando");
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        eprintln!("sem AMD — pulando");
+        return;
+    }
+    let path = "../../models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("modelo ausente — pulando");
+        return;
+    };
+    let f = gguf::GgufFile::parse(&bytes).unwrap();
+    let model = llama_model::Model::load(&f, &bytes).unwrap();
+    let tok = Tokenizer::from_gguf(&f).unwrap();
+    let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &model.config).unwrap();
+    let aux = model.gpu_aux_weights().unwrap();
+    let backend = ResidentForward::new(&ctx, &model.config, &raw, &aux).unwrap();
+
+    let nb = backend.batch_size();
+    if nb < 2 {
+        eprintln!("LLAMA_RS_BATCH=1 — nada a comparar");
+        return;
+    }
+    let mut seq: Vec<u32> = Vec::new();
+    while seq.len() < 2 * nb + 3 {
+        seq.extend(tok.encode(
+            "The quick brown fox jumps over the lazy dog.",
+            seq.is_empty(),
+        ));
+    }
+    seq.truncate(2 * nb + 3);
+
+    backend.reset();
+    let mut ref_logits = Vec::new();
+    for (pos, &t) in seq.iter().enumerate() {
+        ref_logits = backend.decode(t, pos).unwrap();
+    }
+
+    backend.reset();
+    let mut logits = Vec::new();
+    let mut pos = 0usize;
+    while seq.len() - pos >= nb {
+        logits = backend.decode_batch(&seq[pos..pos + nb], pos).unwrap();
+        pos += nb;
+    }
+    assert!(pos > 0, "o prompt tinha que cobrir ao menos um bloco");
+    for &t in &seq[pos..] {
+        logits = backend.decode(t, pos).unwrap();
+        pos += 1;
+    }
+
+    assert_eq!(ref_logits.len(), logits.len());
+    let max_abs = ref_logits
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-6);
+    let max_rel = ref_logits
+        .iter()
+        .zip(&logits)
+        .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs() / max_abs));
+    eprintln!(
+        "prefill: {} tokens em blocos de {nb} (+{} avulsos), erro relativo máximo {max_rel:.2e}",
+        seq.len(),
+        seq.len() % nb
+    );
+    assert!(max_rel < 1e-3, "erro relativo {max_rel} deve ser < 1e-3");
+    assert_eq!(
+        argmax_u32(&ref_logits),
+        argmax_u32(&logits),
+        "o token escolhido tem que ser o mesmo"
+    );
+}
+
+fn argmax_u32(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| {
+            if x > acc.1 { (i, x) } else { acc }
+        })
+        .0
 }

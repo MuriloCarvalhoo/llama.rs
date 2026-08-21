@@ -304,6 +304,9 @@ pub(crate) fn dispatch_inner(args: DispatchArgs<'_>) -> Result<Vec<f32>, MatmulE
 /// mais complicado, e o ganho dele foi medido em ~0% neste kernel.
 ///
 /// `cols`: ver `dispatch_q4_k_matvec`.
+// Contexto Vulkan (3) + pesos/ativacoes (2) + dimensoes (3): agrupa-los numa struct
+// so daria um wrapper de uso unico. Mesmo criterio do `plano_delta`.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_q5_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -339,6 +342,9 @@ pub fn dispatch_q5_k_matvec(
 /// `cols` é quantas ativações de `n_in` estão concatenadas em `x_f32`: 1 reproduz o matvec
 /// do decode, N processa N tokens contra uma única leitura de cada peso (`docs/prefill-em-batch.md`).
 /// A saída sai coluna a coluna: `y[c * n_out + linha]`.
+// Contexto Vulkan (3) + pesos/ativacoes (2) + dimensoes (3): agrupa-los numa struct
+// so daria um wrapper de uso unico. Mesmo criterio do `plano_delta`.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_q4_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -373,6 +379,9 @@ pub fn dispatch_q4_k_matvec(
 ///
 /// `cols`: ver `dispatch_q4_k_matvec`. Aqui a geometria é fixa no shader, então `COLS` é o
 /// `constant_id` 0 — e não o 2, como nos outros dois K-quant.
+// Contexto Vulkan (3) + pesos/ativacoes (2) + dimensoes (3): agrupa-los numa struct
+// so daria um wrapper de uso unico. Mesmo criterio do `plano_delta`.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_q6_k_matvec(
     ctx: &VulkanContext,
     phys: &VulkanPhysicalDevice,
@@ -429,7 +438,7 @@ fn dispatch_k_matvec(
     use crate::pipeline::{ComputePipeline, PushConstants};
     use crate::tensor::{alloc_and_bind, create_buf, one_shot_copy};
 
-    if n_in % 256 != 0 {
+    if !n_in.is_multiple_of(256) {
         return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
     }
     let d = &dev.device;

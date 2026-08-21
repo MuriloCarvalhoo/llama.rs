@@ -2,7 +2,14 @@
 //! `llama-eval-callback` do llama.cpp.
 //!
 //! Exemplo de diagnóstico: abortar na primeira falha é o comportamento desejado.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! `indexing_slicing` entra na lista pelo mesmo motivo: um índice fora do dump é
+//! sinal de que o modelo mudou de forma, e parar ali é o que se quer.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 #[allow(unsafe_code)]
 fn main() {

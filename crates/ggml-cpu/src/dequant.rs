@@ -29,7 +29,9 @@ fn dequant_f32(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
         });
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -43,7 +45,9 @@ fn dequant_f16(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
         });
     }
     Ok(bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let bits = u16::from_le_bytes([c[0], c[1]]);
             half::f16::from_bits(bits).to_f32()
@@ -62,7 +66,7 @@ fn dequant_q8_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     let n_blocks = bytes.len() / BLOCK;
     let mut out = Vec::with_capacity(n_blocks * 32);
-    for b in bytes.chunks_exact(BLOCK) {
+    for b in bytes.as_chunks::<BLOCK>().0 {
         let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
         for &q in &b[2..34] {
             out.push(q.cast_signed() as f32 * d);
@@ -81,7 +85,7 @@ fn dequant_q4_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     }
     let n_blocks = bytes.len() / BLOCK;
     let mut out = vec![0.0f32; n_blocks * 32];
-    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
         let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
         let base = bi * 32;
         for j in 0..16 {
@@ -117,7 +121,7 @@ fn dequant_q4_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     let n_blocks = bytes.len() / BLOCK;
     let mut out = vec![0.0f32; n_blocks * 256];
 
-    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
         let d_val = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
         let min_val = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
         let scales = &b[4..16];
@@ -162,7 +166,7 @@ fn dequant_q5_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     let n_blocks = bytes.len() / BLOCK;
     let mut out = vec![0.0f32; n_blocks * 256];
 
-    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
         let d_val = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
         let min_val = half::f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
         let scales = &b[4..16];
@@ -210,7 +214,7 @@ fn dequant_q6_k(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
     let n_blocks = bytes.len() / BLOCK;
     let mut out = vec![0.0f32; n_blocks * 256];
 
-    for (bi, b) in bytes.chunks_exact(BLOCK).enumerate() {
+    for (bi, b) in bytes.as_chunks::<BLOCK>().0.iter().enumerate() {
         let ql_full = &b[0..128];
         let qh_full = &b[128..192];
         let sc_full = &b[192..208]; // [i8; 16] stored as u8

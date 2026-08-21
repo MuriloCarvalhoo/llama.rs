@@ -107,15 +107,22 @@ impl Model<'_> {
             if done.iter().all(|&d| d) {
                 break;
             }
-            for i in 0..n {
-                if done[i] || current[i] == self.config.eos_id {
-                    done[i] = true;
+            // Os quatro vetores andam em paralelo por sequência; casá-los num zip
+            // dispensa indexar cada um deles.
+            for (((feito, atual), gerados), cache) in done
+                .iter_mut()
+                .zip(current.iter_mut())
+                .zip(generated.iter_mut())
+                .zip(caches.iter_mut())
+            {
+                if *feito || *atual == self.config.eos_id {
+                    *feito = true;
                     continue;
                 }
-                generated[i].push(current[i]);
-                let logits = self.forward(&[current[i]], &mut caches[i])?;
+                gerados.push(*atual);
+                let logits = self.forward(&[*atual], cache)?;
                 let idx = sampler.sample(&logits, rng);
-                current[i] = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
+                *atual = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
             }
         }
 
@@ -255,8 +262,11 @@ mod generate_tests {
             .generate_batch(&tok, &prompts, n_tokens, &Sampler::Greedy, &mut rng_batch)
             .unwrap();
 
-        assert_eq!(results[0], out_a, "batch[0] deve bater com individual");
-        assert_eq!(results[1], out_b, "batch[1] deve bater com individual");
+        assert_eq!(
+            results.as_slice(),
+            [out_a, out_b].as_slice(),
+            "batch deve bater com as geracoes individuais"
+        );
     }
 
     #[test]

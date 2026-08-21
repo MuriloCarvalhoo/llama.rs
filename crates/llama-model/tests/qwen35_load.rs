@@ -71,7 +71,7 @@ fn pesos_das_duas_variantes_de_camada() {
     let value_dim = dn.head_v_dim() * dn.n_v_heads; // 6144
 
     // Camada 0: atenção linear.
-    match &w.layers[0].mixer {
+    match &w.layers.first().expect("camada 0").mixer {
         llama_model::MixerRaw::Delta {
             attn_qkv,
             attn_gate,
@@ -94,7 +94,7 @@ fn pesos_das_duas_variantes_de_camada() {
     }
 
     // Camada 3: atenção completa, com Q saindo dobrado (query|gate).
-    match &w.layers[3].mixer {
+    match &w.layers.get(3).expect("camada 3").mixer {
         llama_model::MixerRaw::Attn { attn_q, .. } => {
             let n_blocos = cfg.n_embd / 256;
             let esperado_q = cfg.head_dim * cfg.n_head * 2 * n_blocos * 176; // Q5_K
@@ -124,7 +124,7 @@ fn pesos_auxiliares_das_camadas_lineares() {
     assert_eq!(aux.freq_table.len(), cfg.rope_dim / 2);
 
     // Camada 0 (linear): tem os tensores SSM e não tem QK-norm.
-    let l0 = &aux.layers[0];
+    let l0 = aux.layers.first().expect("camada 0");
     assert!(l0.q_norm.is_none() && l0.k_norm.is_none());
     let d = l0.delta.as_ref().expect("camada 0 é linear");
     let conv_dim = dn.d_state * dn.n_k_heads * 2 + dn.head_v_dim() * dn.n_v_heads;
@@ -139,11 +139,11 @@ fn pesos_auxiliares_das_camadas_lineares() {
     assert!(
         d.a.iter().all(|&v| v < 0.0),
         "ssm_a devia ser negativo: {:?}",
-        &d.a[..4]
+        d.a.get(..4).unwrap_or(&d.a)
     );
 
     // Camada 3 (atenção): tem QK-norm e não tem tensores SSM.
-    let l3 = &aux.layers[3];
+    let l3 = aux.layers.get(3).expect("camada 3");
     assert!(l3.delta.is_none());
     assert_eq!(l3.q_norm.as_ref().unwrap().len(), cfg.head_dim);
     assert_eq!(l3.k_norm.as_ref().unwrap().len(), cfg.head_dim);

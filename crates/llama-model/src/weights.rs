@@ -49,7 +49,7 @@ impl<'a> RawTensor<'a> {
         n_in: usize,
         n_out: usize,
     ) -> Self {
-        let repack_dims = if ty == gguf::GgmlType::Q8_0 && n_in % 32 == 0 {
+        let repack_dims = if ty == gguf::GgmlType::Q8_0 && n_in.is_multiple_of(32) {
             // n_out não múltiplo de 8: repack só as linhas completas; o resto vai pelo tail.
             let n_out_packed = (n_out / 8) * 8;
             (n_out_packed > 0).then_some((n_in, n_out_packed))
@@ -113,11 +113,11 @@ impl<'a> RawTensor<'a> {
         n_out: usize,
         n_tok: usize,
     ) -> Result<Vec<f32>, ModelError> {
-        if self.ty == gguf::GgmlType::Q8_0 && n_in % 32 == 0 {
+        if self.ty == gguf::GgmlType::Q8_0 && n_in.is_multiple_of(32) {
             let x_q8 = quantize_q8_0_split(x, n_in, n_tok);
             Ok(self.matmul_actq_dispatch(&x_q8, n_in, n_out, n_tok))
         } else if self.ty == gguf::GgmlType::Q8_0 {
-            Ok(matmul_q8_0(&self.bytes, x, n_in, n_out, n_tok))
+            Ok(matmul_q8_0(self.bytes, x, n_in, n_out, n_tok))
         } else {
             Ok(matmul(self.dequant_to_f32()?, x, n_in, n_out, n_tok))
         }
@@ -136,10 +136,10 @@ impl<'a> RawTensor<'a> {
         n_out: usize,
         n_tok: usize,
     ) -> Result<Vec<f32>, ModelError> {
-        if self.ty == gguf::GgmlType::Q8_0 && n_in % 32 == 0 {
+        if self.ty == gguf::GgmlType::Q8_0 && n_in.is_multiple_of(32) {
             Ok(self.matmul_actq_dispatch(x_q8, n_in, n_out, n_tok))
         } else if self.ty == gguf::GgmlType::Q8_0 {
-            Ok(matmul_q8_0(&self.bytes, x_f32, n_in, n_out, n_tok))
+            Ok(matmul_q8_0(self.bytes, x_f32, n_in, n_out, n_tok))
         } else {
             Ok(matmul(self.dequant_to_f32()?, x_f32, n_in, n_out, n_tok))
         }
