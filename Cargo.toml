@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli", "crates/llama-vulkan"]
+members = ["oracle", "crates/gguf", "crates/llama-tokenizer", "crates/llama-chat", "crates/llama-model", "crates/ggml-cpu", "crates/llama-sampling", "crates/llama-cli", "crates/llama-vulkan"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ serde_json = "1"
 proptest = "1"
 gguf = { path = "crates/gguf" }
 llama-tokenizer = { path = "crates/llama-tokenizer" }
+llama-chat = { path = "crates/llama-chat" }
 half = "2"
 ggml-cpu = { path = "crates/ggml-cpu" }
 rand = "0.10"

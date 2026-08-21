@@ -1,0 +1,342 @@
+{
+  "modelo": "Qwen3.8-27B-Q4_K_M.gguf",
+  "casos": [
+    {
+      "nome": "system_e_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Você é um assistente."
+        },
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nVocê é um assistente.<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "sem_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "dois_systems_iniciais",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Regra 1"
+        },
+        {
+          "role": "system",
+          "content": "Regra 2"
+        },
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nRegra 1\nRegra 2<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "com_tools",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Você é um agente de código."
+        },
+        {
+          "role": "user",
+          "content": "Leia o main.rs"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Lê um arquivo do disco",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "caminho"
+                },
+                "limit": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Lê um arquivo do disco\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"caminho\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nVocê é um agente de código.<|im_end|>\n<|im_start|>user\nLeia o main.rs<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "tools_sem_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Leia o main.rs"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Lê um arquivo do disco",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "caminho"
+                },
+                "limit": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Lê um arquivo do disco\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"caminho\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nLeia o main.rs<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "multi_turno_com_reasoning",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Quanto é 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "somando dois e dois"
+        },
+        {
+          "role": "user",
+          "content": "E 3+3?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQuanto é 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nsomando dois e dois\n</think>\n\n4<|im_end|>\n<|im_start|>user\nE 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "tool_call_e_resposta",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Leia o main.rs"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "preciso ler o arquivo",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": {
+                  "path": "src/main.rs",
+                  "limit": 10
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "fn main() {}"
+        },
+        {
+          "role": "user",
+          "content": "Resuma"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Lê um arquivo do disco",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "caminho"
+                },
+                "limit": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Lê um arquivo do disco\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"caminho\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nLeia o main.rs<|im_end|>\n<|im_start|>assistant\n<think>\npreciso ler o arquivo\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=limit>\n10\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfn main() {}\n</tool_response><|im_end|>\n<|im_start|>user\nResuma<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "duas_tool_calls_e_duas_respostas",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Leia os dois arquivos"
+        },
+        {
+          "role": "assistant",
+          "content": "vou ler os dois",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": {
+                  "path": "a.rs"
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": {
+                  "path": "b.rs"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "conteudo de a"
+        },
+        {
+          "role": "tool",
+          "content": "conteudo de b"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Lê um arquivo do disco",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "caminho"
+                },
+                "limit": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Lê um arquivo do disco\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"caminho\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nLeia os dois arquivos<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nvou ler os dois\n\n<tool_call>\n<function=read>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=path>\nb.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nconteudo de a\n</tool_response>\n<tool_response>\nconteudo de b\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "thinking_desligado",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Seja breve."
+        },
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "enable_thinking": false,
+      "esperado": "<|im_start|>system\nSeja breve.<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "nome": "reasoning_effort_low",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "reasoning_effort": "low",
+      "esperado": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "reasoning_effort_medium",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": true,
+      "reasoning_effort": "medium",
+      "esperado": "<|im_start|>user\nOi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "conteudo_em_partes",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "parte 1"
+            },
+            {
+              "type": "text",
+              "text": "parte 2"
+            }
+          ]
+        }
+      ],
+      "add_generation_prompt": true,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nparte 1parte 2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "nome": "sem_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Oi"
+        }
+      ],
+      "add_generation_prompt": false,
+      "esperado": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nOi<|im_end|>\n"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+[package]
+name = "llama-chat"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# preserve_order: a ordem das chaves do schema de tool é a que o modelo viu no treino.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[lints]
+workspace = true
