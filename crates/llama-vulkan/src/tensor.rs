@@ -2,7 +2,60 @@
 
 use crate::device::{VulkanContext, VulkanDevice, VulkanPhysicalDevice};
 use ash::vk;
+use rayon::prelude::*;
 use thiserror::Error;
+
+/// Blocos por fatia do repack paralelo. Fatia curta demais paga mais coordenação do rayon
+/// do que trabalho; longa demais deixa uma thread terminando sozinha. 4096 blocos são
+/// ~144 KB de saída no Q8_0 — cabe folgado no L2 de cada núcleo.
+const BLOCOS_POR_FATIA: usize = 4096;
+
+/// Aplica `f` bloco a bloco, de blocos de `src_bl` bytes para blocos de `dst_bl` bytes.
+///
+/// O repack dos quantizados é uma transformação **posicional pura**: o bloco `i` da saída
+/// depende só do bloco `i` da entrada. Por isso o laço se divide em fatias independentes e
+/// cada thread escreve numa faixa disjunta do destino — que na carga é o staging buffer,
+/// escrito uma única vez e em ordem crescente (memória write-combining não perdoa
+/// releitura nem escrita salteada).
+fn por_bloco(
+    src: &[u8],
+    dst: &mut [u8],
+    src_bl: usize,
+    dst_bl: usize,
+    f: impl Fn(&[u8], &mut [u8]) + Sync,
+) {
+    debug_assert_eq!(src.len() / src_bl, dst.len() / dst_bl, "blocos não batem");
+    dst.par_chunks_mut(BLOCOS_POR_FATIA * dst_bl)
+        .zip(src.par_chunks(BLOCOS_POR_FATIA * src_bl))
+        .for_each(|(dfatia, sfatia)| {
+            for (d, s) in dfatia
+                .chunks_exact_mut(dst_bl)
+                .zip(sfatia.chunks_exact(src_bl))
+            {
+                f(s, d);
+            }
+        });
+}
+
+/// Repack Q8_0: blocos de 34 B (escala f16 + 32 qs i8) viram 36 B
+/// (`escala[2] | pad[2] | qs[32]`), para o shader ler o buffer como `uint` alinhado —
+/// 9 uints por bloco. Os valores não mudam, só a posição.
+pub(crate) fn repack_q8_0_into(src: &[u8], dst: &mut [u8]) {
+    por_bloco(src, dst, 34, 36, |s, d| {
+        d[..2].copy_from_slice(&s[..2]);
+        // O pad é escrito de propósito: o destino pode ser um staging reusado.
+        d[2..4].fill(0);
+        d[4..36].copy_from_slice(&s[2..34]);
+    });
+}
+
+/// Pad do Q6_K: superblocos de 210 B alinhados em 212, pelo mesmo motivo do Q8_0.
+pub(crate) fn pad_q6_k_into(src: &[u8], dst: &mut [u8]) {
+    por_bloco(src, dst, 210, 212, |s, d| {
+        d[..210].copy_from_slice(s);
+        d[210..212].fill(0);
+    });
+}
 
 #[derive(Debug, Error)]
 pub enum TensorError {
@@ -47,12 +100,8 @@ impl GpuTensor {
             gguf::GgmlType::Q6_K => {
                 let padded = {
                     let _fase = llama_model::perfil_carga::Fase::nova("repack+staging");
-                    let n_sb = bytes.len() / 210;
-                    let mut padded = vec![0u8; n_sb * 212];
-                    for i in 0..n_sb {
-                        padded[i * 212..i * 212 + 210]
-                            .copy_from_slice(&bytes[i * 210..(i + 1) * 210]);
-                    }
+                    let mut padded = vec![0u8; bytes.len() / 210 * 212];
+                    pad_q6_k_into(bytes, &mut padded);
                     padded
                 };
                 Self::upload_raw(ctx, phys, dev, &padded, n_in, n_out)
@@ -136,14 +185,9 @@ impl GpuTensor {
             n_out * n_blocks * 34,
         );
         let repacked = {
+            let _fase = llama_model::perfil_carga::Fase::nova("repack+staging");
             let mut out = vec![0u8; n_out * n_blocks * 36];
-            for i in 0..(n_out * n_blocks) {
-                let src = i * 34;
-                let dst = i * 36;
-                out[dst..dst + 2].copy_from_slice(&bytes[src..src + 2]); // scale f16
-                // out[dst+2..dst+4] = pad (ja zerado)
-                out[dst + 4..dst + 36].copy_from_slice(&bytes[src + 2..src + 34]); // 32 qs
-            }
+            repack_q8_0_into(bytes, &mut out);
             out
         };
         let size = repacked.len() as vk::DeviceSize;
@@ -419,4 +463,79 @@ pub(crate) fn quantize_x_host(x: &[f32]) -> (Vec<u32>, Vec<f32>) {
         }
     }
     (xq, xd)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes determinísticos, para as duas versões verem exatamente a mesma entrada.
+    fn bytes_pseudo(n: usize) -> Vec<u8> {
+        let mut x: u32 = 987_654_321;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Referência serial do repack Q8_0, escrita do jeito mais óbvio possível.
+    fn repack_serial(src: &[u8]) -> Vec<u8> {
+        let n = src.len() / 34;
+        let mut out = vec![0u8; n * 36];
+        for i in 0..n {
+            out[i * 36..i * 36 + 2].copy_from_slice(&src[i * 34..i * 34 + 2]);
+            out[i * 36 + 4..i * 36 + 36].copy_from_slice(&src[i * 34 + 2..(i + 1) * 34]);
+        }
+        out
+    }
+
+    /// Referência serial do pad Q6_K.
+    fn pad_serial(src: &[u8]) -> Vec<u8> {
+        let n = src.len() / 210;
+        let mut out = vec![0u8; n * 212];
+        for i in 0..n {
+            out[i * 212..i * 212 + 210].copy_from_slice(&src[i * 210..(i + 1) * 210]);
+        }
+        out
+    }
+
+    /// Mais de uma fatia do rayon **e** um resto incompleto: é onde um repack paralelo
+    /// erra, se for errar. O destino começa sujo porque na carga ele é um staging reusado.
+    #[test]
+    fn repack_q8_0_paralelo_da_os_mesmos_bytes_do_serial() {
+        for n in [1, 37, BLOCOS_POR_FATIA, BLOCOS_POR_FATIA * 2 + 37] {
+            let src = bytes_pseudo(n * 34);
+            let mut dst = vec![0xAAu8; n * 36];
+            repack_q8_0_into(&src, &mut dst);
+            assert_eq!(dst, repack_serial(&src), "n={n} blocos");
+        }
+    }
+
+    #[test]
+    fn pad_q6_k_paralelo_da_os_mesmos_bytes_do_serial() {
+        for n in [1, 5, BLOCOS_POR_FATIA + 3] {
+            let src = bytes_pseudo(n * 210);
+            let mut dst = vec![0x5Bu8; n * 212];
+            pad_q6_k_into(&src, &mut dst);
+            assert_eq!(dst, pad_serial(&src), "n={n} superblocos");
+        }
+    }
+
+    /// O pad tem de ser escrito, não herdado: o mesmo staging serve a vários tensores.
+    #[test]
+    fn o_pad_e_zerado_mesmo_com_destino_sujo() {
+        let src = bytes_pseudo(3 * 34);
+        let mut dst = vec![0xFFu8; 3 * 36];
+        repack_q8_0_into(&src, &mut dst);
+        for i in 0..3 {
+            assert_eq!(&dst[i * 36 + 2..i * 36 + 4], &[0, 0], "pad do bloco {i}");
+        }
+        let src = bytes_pseudo(2 * 210);
+        let mut dst = vec![0xFFu8; 2 * 212];
+        pad_q6_k_into(&src, &mut dst);
+        for i in 0..2 {
+            assert_eq!(&dst[i * 212 + 210..(i + 1) * 212], &[0, 0], "pad do sb {i}");
+        }
+    }
 }

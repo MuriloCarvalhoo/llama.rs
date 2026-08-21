@@ -14,12 +14,20 @@ use crate::args::Args;
 /// Mapeia o `.gguf` em memória em vez de copiá-lo para a RAM. Um `fs::read` do
 /// 14B Q8_0 aloca 15 GB de RAM anônima antes mesmo dos pesos serem extraídos;
 /// com mmap as páginas ficam no page cache e são recuperáveis sob pressão.
+///
+/// `populate` (`MAP_POPULATE`) faz o prefault das page tables na hora do mapa, e
+/// `Advice::Sequential` dá ao kernel a janela de readahead do padrão desta carga: ler
+/// tudo uma vez, em ordem, para subir à VRAM. Sem os dois, o page-in acontece como
+/// tempestade de page fault **no meio** do memcpy para o staging, serializado com ele.
 fn map_model(path: &std::path::Path) -> Result<memmap2::Mmap, std::io::Error> {
     let file = std::fs::File::open(path)?;
     // SAFETY: mapeamento read-only de um arquivo tratado como imutável durante a
     // execução. Modificação externa do .gguf enquanto mapeado seria UB — mesma
     // premissa que o llama.cpp adota para o seu mmap de modelo.
-    unsafe { memmap2::Mmap::map(&file) }
+    let mm = unsafe { memmap2::MmapOptions::new().populate().map(&file) }?;
+    // Conselho ao kernel, não contrato: se o SO recusar, a carga só fica mais lenta.
+    let _ = mm.advise(memmap2::Advice::Sequential);
+    Ok(mm)
 }
 
 /// Config do modelo com o contexto limitado por `--ctx` (nunca acima do que o GGUF declara).
