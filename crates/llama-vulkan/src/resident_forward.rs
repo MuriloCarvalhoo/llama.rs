@@ -1056,8 +1056,6 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let mut qw = Vec::with_capacity(cfg.n_layer);
             for lw in &raw.layers[shard.first_layer..shard.end_layer] {
-                // Só o caminho denso por enquanto: as camadas de atenção linear do
-                // qwen35 ainda não têm plano de decode (ver docs/qwen35-arquitetura.md).
                 let mixer = match &lw.mixer {
                     llama_model::MixerRaw::Attn {
                         attn_q,
