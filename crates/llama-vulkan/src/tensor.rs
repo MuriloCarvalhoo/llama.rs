@@ -826,85 +826,84 @@ mod tests {
         }
     }
 
-
-/// Lê de volta `n` bytes de um buffer device-local. Só o teste faz isso: o staging da
-/// carga é write-combining e nunca é lido.
-fn ler_vram(
-    dev: &VulkanDevice,
-    buf: vk::Buffer,
-    n: usize,
-    ctx: &VulkanContext,
-    phys: &VulkanPhysicalDevice,
-) -> Vec<u8> {
-    let d = &dev.device;
-    let size = n as vk::DeviceSize;
-    let host = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-    let mem = alloc_and_bind_cached(ctx, phys, d, host).unwrap();
-    one_shot_copy(d, dev.queue, dev.cmd_pool, buf, host, size).unwrap();
-    // SAFETY: memória host-visible cacheada, do tamanho pedido, sem uso concorrente.
-    let out = unsafe {
-        let ptr = d
-            .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())
-            .unwrap();
-        let v = std::slice::from_raw_parts(ptr.cast::<u8>(), n).to_vec();
-        d.unmap_memory(mem);
-        d.destroy_buffer(host, None);
-        d.free_memory(mem, None);
-        v
-    };
-    out
-}
-
-/// O que a GPU recebe tem de ser byte a byte o repack de referência, inclusive quando
-/// o lote vira no meio e quando um tensor é maior que o staging inteiro.
-///
-/// Roda com dados sintéticos: não precisa de modelo, só de uma GPU.
-#[test]
-fn uploader_em_lotes_entrega_os_mesmos_bytes() {
-    let Ok(ctx) = VulkanContext::new() else {
-        eprintln!("Vulkan indisponível — pulando");
-        return;
-    };
-    let phys = ctx.amd_compute_devices();
-    let Some(p0) = phys.first() else {
-        eprintln!("nenhuma GPU AMD — pulando");
-        return;
-    };
-    let dev = VulkanDevice::create(&ctx, p0).unwrap();
-
-    // Staging minúsculo de propósito: com 64 KiB os tensores abaixo forçam várias
-    // viradas de lote e um fatiamento, que é o que se quer exercitar.
-    const STAGING: vk::DeviceSize = 64 * 1024;
-    let mut upl = Uploader::com_staging(&ctx, p0, &dev, 8 * 1024 * 1024, "teste", STAGING).unwrap();
-
-    // (tipo, blocos por linha, linhas): o terceiro Q8_0 sozinho passa dos 64 KiB.
-    let casos: [(gguf::GgmlType, usize, usize); 5] = [
-        (gguf::GgmlType::Q8_0, 2, 300),
-        (gguf::GgmlType::Q6_K, 1, 100),
-        (gguf::GgmlType::Q8_0, 4, 900),
-        (gguf::GgmlType::Q5_K, 1, 120),
-        (gguf::GgmlType::Q8_0, 1, 7),
-    ];
-    let mut subidos = Vec::new();
-    for (ty, blocos, linhas) in casos {
-        let (src_bl, dst_bl) = layout_de(ty).unwrap();
-        let src = bytes_pseudo(blocos * linhas * src_bl);
-        let mut esperado = vec![0u8; blocos * linhas * dst_bl];
-        transformar(ty, &src, &mut esperado);
-        let n_in = blocos * usize::try_from(ty.block_size()).unwrap();
-        let t = upl.tensor(ty, &src, n_in, linhas).unwrap();
-        assert_eq!(t.size_bytes as usize, esperado.len());
-        subidos.push((t, esperado));
+    /// Lê de volta `n` bytes de um buffer device-local. Só o teste faz isso: o staging da
+    /// carga é write-combining e nunca é lido.
+    fn ler_vram(
+        dev: &VulkanDevice,
+        buf: vk::Buffer,
+        n: usize,
+        ctx: &VulkanContext,
+        phys: &VulkanPhysicalDevice,
+    ) -> Vec<u8> {
+        let d = &dev.device;
+        let size = n as vk::DeviceSize;
+        let host = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+        let mem = alloc_and_bind_cached(ctx, phys, d, host).unwrap();
+        one_shot_copy(d, dev.queue, dev.cmd_pool, buf, host, size).unwrap();
+        // SAFETY: memória host-visible cacheada, do tamanho pedido, sem uso concorrente.
+        unsafe {
+            let ptr = d
+                .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())
+                .unwrap();
+            let v = std::slice::from_raw_parts(ptr.cast::<u8>(), n).to_vec();
+            d.unmap_memory(mem);
+            d.destroy_buffer(host, None);
+            d.free_memory(mem, None);
+            v
+        }
     }
-    let mut mem = upl.finalizar().unwrap();
 
-    for (i, (t, esperado)) in subidos.into_iter().enumerate() {
-        let lido = ler_vram(&dev, t.buffer, esperado.len(), &ctx, p0);
-        assert_eq!(lido, esperado, "tensor {i}");
-        t.destroy(&dev.device);
+    /// O que a GPU recebe tem de ser byte a byte o repack de referência, inclusive quando
+    /// o lote vira no meio e quando um tensor é maior que o staging inteiro.
+    ///
+    /// Roda com dados sintéticos: não precisa de modelo, só de uma GPU.
+    #[test]
+    fn uploader_em_lotes_entrega_os_mesmos_bytes() {
+        let Ok(ctx) = VulkanContext::new() else {
+            eprintln!("Vulkan indisponível — pulando");
+            return;
+        };
+        let phys = ctx.amd_compute_devices();
+        let Some(p0) = phys.first() else {
+            eprintln!("nenhuma GPU AMD — pulando");
+            return;
+        };
+        let dev = VulkanDevice::create(&ctx, p0).unwrap();
+
+        // Staging minúsculo de propósito: com 64 KiB os tensores abaixo forçam várias
+        // viradas de lote e um fatiamento, que é o que se quer exercitar.
+        const STAGING: vk::DeviceSize = 64 * 1024;
+        let mut upl =
+            Uploader::com_staging(&ctx, p0, &dev, 8 * 1024 * 1024, "teste", STAGING).unwrap();
+
+        // (tipo, blocos por linha, linhas): o terceiro Q8_0 sozinho passa dos 64 KiB.
+        let casos: [(gguf::GgmlType, usize, usize); 5] = [
+            (gguf::GgmlType::Q8_0, 2, 300),
+            (gguf::GgmlType::Q6_K, 1, 100),
+            (gguf::GgmlType::Q8_0, 4, 900),
+            (gguf::GgmlType::Q5_K, 1, 120),
+            (gguf::GgmlType::Q8_0, 1, 7),
+        ];
+        let mut subidos = Vec::new();
+        for (ty, blocos, linhas) in casos {
+            let (src_bl, dst_bl) = layout_de(ty).unwrap();
+            let src = bytes_pseudo(blocos * linhas * src_bl);
+            let mut esperado = vec![0u8; blocos * linhas * dst_bl];
+            transformar(ty, &src, &mut esperado);
+            let n_in = blocos * usize::try_from(ty.block_size()).unwrap();
+            let t = upl.tensor(ty, &src, n_in, linhas).unwrap();
+            assert_eq!(t.size_bytes as usize, esperado.len());
+            subidos.push((t, esperado));
+        }
+        let mut mem = upl.finalizar().unwrap();
+
+        for (i, (t, esperado)) in subidos.into_iter().enumerate() {
+            let lido = ler_vram(&dev, t.buffer, esperado.len(), &ctx, p0);
+            assert_eq!(lido, esperado, "tensor {i}");
+            t.destroy(&dev.device);
+        }
+        mem.cleanup(&dev.device);
     }
-    mem.cleanup(&dev.device);
-}
 
     /// O pad tem de ser escrito, não herdado: o mesmo staging serve a vários tensores.
     #[test]
