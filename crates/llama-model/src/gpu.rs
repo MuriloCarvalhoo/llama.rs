@@ -47,6 +47,31 @@ pub struct GpuLayerRaw<'a> {
 }
 
 impl<'a> GpuLayerRaw<'a> {
+    /// Bytes quantizados da camada, como estão no GGUF. Serve ao backend para dimensionar
+    /// a alocação de VRAM antes de subir peso nenhum.
+    #[must_use]
+    pub fn bytes_totais(&self) -> usize {
+        let mixer = match &self.mixer {
+            MixerRaw::Attn {
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+            } => {
+                attn_q.bytes.len()
+                    + attn_k.bytes.len()
+                    + attn_v.bytes.len()
+                    + attn_output.bytes.len()
+            }
+            MixerRaw::Delta {
+                attn_qkv,
+                attn_gate,
+                ssm_out,
+            } => attn_qkv.bytes.len() + attn_gate.bytes.len() + ssm_out.bytes.len(),
+        };
+        mixer + self.ffn_gate.bytes.len() + self.ffn_up.bytes.len() + self.ffn_down.bytes.len()
+    }
+
     /// Atalho para as camadas densas, onde o mixer é sempre atenção.
     ///
     /// # Panics
@@ -101,6 +126,7 @@ impl<'a> GpuRawWeights<'a> {
     /// para os quais existe shader de matvec. Valida a granularidade que cada um exige:
     /// 32 elementos por bloco no Q8_0, 256 por superbloco nos K-quants.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+        let _fase = crate::perfil_carga::Fase::nova("pesos crus (mmap)");
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
 
         let read = |name: &str, n_in: usize, n_out: usize| -> Result<QTensor<'a>, ModelError> {
@@ -222,13 +248,80 @@ impl<'a> GpuRawWeights<'a> {
     }
 }
 
+/// Tabela de embedding mantida **quantizada**, do jeito que está no GGUF.
+///
+/// Dequantizá-la inteira custa `vocab × n_embd × 4` bytes — 5,1 GB no vocabulário de
+/// 248 320 do Qwen3.8 — para que o passo de embedding leia **uma** linha por token (o
+/// prefill lê `n_batch`). Aqui ficam os bytes emprestados do mmap, sem cópia, e a linha é
+/// dequantizada no momento do uso: `n_embd` valores, microssegundos.
+#[derive(Clone, Copy)]
+pub struct TokenEmbd<'a> {
+    ty: GgmlType,
+    bytes: &'a [u8],
+    n_embd: usize,
+    /// Bytes de uma linha de `n_embd` elementos neste tipo.
+    row_bytes: usize,
+}
+
+impl<'a> TokenEmbd<'a> {
+    /// # Errors
+    /// Se `n_embd` não fechar um número inteiro de blocos do tipo, ou se os bytes não
+    /// cobrirem uma linha inteira.
+    pub fn nova(ty: GgmlType, bytes: &'a [u8], n_embd: usize) -> Result<Self, ModelError> {
+        let elems = usize::try_from(ty.block_size()).map_err(|_| ModelError::Overflow)?;
+        let bloco = usize::try_from(ty.type_size()).map_err(|_| ModelError::Overflow)?;
+        if elems == 0 || !n_embd.is_multiple_of(elems) {
+            return Err(ModelError::Gpu(format!(
+                "token_embd {ty:?}: n_embd={n_embd} não é múltiplo de {elems}"
+            )));
+        }
+        let row_bytes = n_embd / elems * bloco;
+        if bytes.len() < row_bytes {
+            return Err(ModelError::Gpu(format!(
+                "token_embd: {} bytes, menos que uma linha ({row_bytes})",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            ty,
+            bytes,
+            n_embd,
+            row_bytes,
+        })
+    }
+
+    /// Dequantiza a linha de `token`.
+    ///
+    /// # Errors
+    /// Se o token estiver fora da tabela ou o tipo não tiver dequant na CPU.
+    pub fn linha(&self, token: u32) -> Result<Vec<f32>, ModelError> {
+        let ini = token as usize * self.row_bytes;
+        let linha = self
+            .bytes
+            .get(ini..ini + self.row_bytes)
+            .ok_or_else(|| ModelError::Gpu(format!("token {token} fora da tabela")))?;
+        ggml_cpu::dequant_to_f32(linha, self.ty).map_err(ModelError::from)
+    }
+
+    /// As linhas de `tokens`, concatenadas — o bloco de prefill precisa de todas.
+    ///
+    /// # Errors
+    /// Como [`Self::linha`].
+    pub fn linhas(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let mut out = Vec::with_capacity(tokens.len() * self.n_embd);
+        for &t in tokens {
+            out.extend_from_slice(&self.linha(t)?);
+        }
+        Ok(out)
+    }
+}
+
 /// Pesos auxiliares f32 que o decode GPU-resident precisa (norm/bias/freq/embd).
 ///
-/// `token_embd` é emprestado quando vem do `Model` (são gigabytes: 5.1 GB no vocabulário
-/// de 248320 do Qwen3.8) e possuído quando lido direto do GGUF; o resto é sempre copiado,
-/// porque é pequeno.
+/// `token_embd` fica quantizado e emprestado do GGUF (ver [`TokenEmbd`]); o resto é sempre
+/// copiado, porque é pequeno.
 pub struct GpuAuxWeights<'a> {
-    pub token_embd: std::borrow::Cow<'a, [f32]>, // [vocab * n_embd]
+    pub token_embd: TokenEmbd<'a>,
     pub layers: Vec<AuxLayer>,
     pub output_norm: Vec<f32>, // [n_embd]
     pub freq_table: Vec<f32>,  // [rope_dim/2]
@@ -310,6 +403,7 @@ impl<'a> GpuAuxWeights<'a> {
     /// O caminho por `Model::gpu_aux_weights` exige a estrutura densa (`attn_q` em toda
     /// camada), que o `qwen35` não tem. Aqui cada camada é lida conforme a sua variante.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+        let _fase = crate::perfil_carga::Fase::nova("aux f32 (dequant)");
         let f32s = |name: &str, esperado: usize| -> Result<Vec<f32>, ModelError> {
             let info = f
                 .tensors
@@ -418,8 +512,19 @@ impl<'a> GpuAuxWeights<'a> {
             None
         };
 
+        // A tabela de embedding fica quantizada: dequantizá-la inteira custaria 5,1 GB de
+        // RAM no vocabulário do Qwen3.8 para que cada token leia uma linha. Ver `TokenEmbd`.
+        let te = f
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .ok_or_else(|| ModelError::Gpu("tensor token_embd.weight ausente".into()))?;
+        let te_bytes = f
+            .tensor_data(bytes, te)
+            .map_err(|e| ModelError::Gpu(e.to_string()))?;
+
         Ok(Self {
-            token_embd: std::borrow::Cow::Owned(f32s("token_embd.weight", cfg.vocab * cfg.n_embd)?),
+            token_embd: TokenEmbd::nova(te.ggml_type, te_bytes, cfg.n_embd)?,
             layers,
             output_norm: f32s("output_norm.weight", cfg.n_embd)?,
             freq_table,
@@ -444,6 +549,9 @@ pub fn gerar_streaming_residente(
     gpu: &dyn GpuResidentDecode,
     on_token: &mut impl FnMut(&str),
 ) -> Result<(), ModelError> {
+    // Aqui a carga terminou: os pesos já estão na VRAM e o backend está pronto. É o ponto
+    // onde o perfil por fase (`LLAMA_RS_LOAD_PROFILE=1`) tem o que dizer.
+    crate::perfil_carga::imprimir();
     let prompt_ids = tokenizer.encode(prompt, config.add_bos);
     if prompt_ids.is_empty() {
         return Err(ModelError::Gpu("prompt vazio".into()));
@@ -558,7 +666,14 @@ impl Model<'_> {
 
     /// Coleta os pesos auxiliares f32 para o backend GPU-resident.
     pub fn gpu_aux_weights(&self) -> Result<GpuAuxWeights<'_>, ModelError> {
-        let token_embd = self.token_embd_f32()?;
+        let _fase = crate::perfil_carga::Fase::nova("aux f32 (dequant)");
+        // Quantizada, emprestada do GGUF — o caminho de CPU tem o seu próprio cache f32,
+        // mas o decode residente só precisa de uma linha por token. Ver `TokenEmbd`.
+        let token_embd = TokenEmbd::nova(
+            self.weights.token_embd.ty,
+            self.weights.token_embd.bytes,
+            self.config.n_embd,
+        )?;
         let output_norm = self.output_norm_f32()?.to_vec();
         let freq_table = self.freq_table.clone();
         let mut layers = Vec::with_capacity(self.config.n_layer);
@@ -590,7 +705,7 @@ impl Model<'_> {
             });
         }
         Ok(GpuAuxWeights {
-            token_embd: std::borrow::Cow::Borrowed(token_embd),
+            token_embd,
             layers,
             output_norm,
             freq_table,
@@ -774,6 +889,94 @@ mod tests {
     use crate::config::LlamaConfig;
     use gguf::GgufFile;
     use std::path::Path;
+
+    /// GGUF sintético com um único tensor Q8_0 `token_embd.weight` de `vocab × n_embd`.
+    /// Sem KV: o teste chega no tensor por `GgufFile::parse` + `tensor_data`, que é o
+    /// caminho real da carga.
+    fn gguf_token_embd(vocab: usize, n_embd: usize, dados: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes()); // versão
+        out.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        out.extend_from_slice(&0u64.to_le_bytes()); // 0 KVs
+        let nome = "token_embd.weight";
+        out.extend_from_slice(&(nome.len() as u64).to_le_bytes());
+        out.extend_from_slice(nome.as_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes()); // 2 dimensões
+        out.extend_from_slice(&(n_embd as u64).to_le_bytes());
+        out.extend_from_slice(&(vocab as u64).to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes()); // Q8_0
+        out.extend_from_slice(&0u64.to_le_bytes()); // offset
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        out.extend_from_slice(dados);
+        out
+    }
+
+    /// Bytes Q8_0 determinísticos: escala f16 = 1.0 (0x3C00) e quantizados de um LCG.
+    /// Escala fixa e finita para que a comparação exata não esbarre em NaN.
+    fn bytes_q8_0(n_blocos: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocos * 34);
+        let mut x: u32 = 12345;
+        for _ in 0..n_blocos {
+            out.extend_from_slice(&[0x00, 0x3C]);
+            for _ in 0..32 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                out.push((x >> 24) as u8);
+            }
+        }
+        out
+    }
+
+    /// O caminho preguiçoso (uma linha por vez) tem de dar **exatamente** os mesmos
+    /// valores que dequantizar a tabela inteira — é o que autoriza trocar 5,1 GB de RAM
+    /// por alguns microssegundos por token.
+    #[test]
+    fn token_embd_por_linha_e_identico_ao_dequant_completo() {
+        let (vocab, n_embd) = (7usize, 64usize);
+        let dados = bytes_q8_0(vocab * n_embd / 32);
+        let bytes = gguf_token_embd(vocab, n_embd, &dados);
+        let f = GgufFile::parse(&bytes).unwrap();
+        let info = &f.tensors[0];
+        let raw = f.tensor_data(&bytes, info).unwrap();
+
+        let completo = ggml_cpu::dequant_to_f32(raw, info.ggml_type).unwrap();
+        assert_eq!(completo.len(), vocab * n_embd);
+        let te = TokenEmbd::nova(info.ggml_type, raw, n_embd).unwrap();
+
+        for t in 0..vocab {
+            assert_eq!(
+                te.linha(u32::try_from(t).unwrap()).unwrap(),
+                &completo[t * n_embd..(t + 1) * n_embd],
+                "linha {t}"
+            );
+        }
+
+        // O bloco de prefill é a concatenação das linhas, na ordem dos tokens.
+        let tokens = [3u32, 0, 6, 1];
+        let bloco = te.linhas(&tokens).unwrap();
+        assert_eq!(bloco.len(), tokens.len() * n_embd);
+        for (i, &t) in tokens.iter().enumerate() {
+            let r = t as usize * n_embd;
+            assert_eq!(
+                &bloco[i * n_embd..(i + 1) * n_embd],
+                &completo[r..r + n_embd]
+            );
+        }
+
+        // Token fora da tabela é erro, não pânico nem lixo.
+        assert!(te.linha(u32::try_from(vocab).unwrap()).is_err());
+    }
+
+    #[test]
+    fn token_embd_recusa_n_embd_que_nao_fecha_bloco() {
+        let dados = bytes_q8_0(2);
+        assert!(TokenEmbd::nova(GgmlType::Q8_0, &dados, 33).is_err());
+        assert!(TokenEmbd::nova(GgmlType::Q8_0, &dados, 64).is_ok());
+        // Bytes menores que uma linha também não passam.
+        assert!(TokenEmbd::nova(GgmlType::Q8_0, &dados[..34], 64).is_err());
+    }
 
     fn load_qwen() -> Option<(Vec<u8>, GgufFile, LlamaConfig)> {
         let bytes =

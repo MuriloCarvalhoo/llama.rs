@@ -20,6 +20,17 @@ pub struct LayerSplitForward<'ctx> {
     shards: Vec<ResidentForward<'ctx>>,
 }
 
+/// Shard recém-construído, a caminho da thread que vai usá-lo.
+///
+/// O `ResidentForward` guarda o ponteiro da memória mapeada dos logits, e ponteiro cru não
+/// é `Send`. Durante a carga o shard ainda não foi usado por ninguém — nenhum command
+/// buffer gravado, nenhuma referência viva ao mapa —, então movê-lo da thread que o
+/// construiu para a que vai usá-lo é seguro.
+struct EnviaShard<'ctx>(ResidentForward<'ctx>);
+// SAFETY: ver acima — a transferência acontece antes de qualquer uso concorrente, e o
+// ponteiro mapeado só é lido pela thread dona depois disso.
+unsafe impl Send for EnviaShard<'_> {}
+
 impl<'ctx> LayerSplitForward<'ctx> {
     /// Divide `config.n_layer` entre os devices **proporcionalmente à VRAM livre**, como o
     /// llama.cpp faz em `llama_model::load_tensors`. Divisão por contagem igual seria pior
@@ -29,7 +40,7 @@ impl<'ctx> LayerSplitForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
     ) -> Result<Self, MatmulError> {
         let devs = ctx.amd_compute_devices();
         if devs.len() < 2 {
@@ -66,24 +77,44 @@ impl<'ctx> LayerSplitForward<'ctx> {
             }
         };
 
-        let mut shards = Vec::with_capacity(boundaries.len());
-        for (i, &(first, end)) in boundaries.iter().enumerate() {
-            if first == end {
-                continue; // GPU sem camadas (VRAM livre desprezível)
+        // Uma thread por device: cada shard tem a sua fila, a sua command pool e o seu
+        // staging, então as duas cargas não se cruzam em nada do Vulkan — e são vários
+        // segundos de repack e cópia cada uma. Em série, uma GPU fica ociosa esperando a
+        // outra terminar de subir os pesos dela.
+        let shards = std::thread::scope(|escopo| {
+            let threads: Vec<_> = boundaries
+                .iter()
+                .enumerate()
+                // GPU sem camadas (VRAM livre desprezível) não abre thread.
+                .filter(|&(_, &(first, end))| first != end)
+                .map(|(i, &(first, end))| {
+                    escopo.spawn(move || {
+                        ResidentForward::new_shard(
+                            ctx,
+                            config,
+                            raw,
+                            aux,
+                            Shard {
+                                device: i,
+                                first_layer: first,
+                                end_layer: end,
+                                n_layer_total: config.n_layer,
+                            },
+                        )
+                        .map(EnviaShard)
+                    })
+                })
+                .collect();
+            let mut out = Vec::with_capacity(threads.len());
+            for t in threads {
+                // Pânico na thread de carga vira erro aqui: sem os pesos não há backend.
+                let r = t
+                    .join()
+                    .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+                out.push(r?.0);
             }
-            shards.push(ResidentForward::new_shard(
-                ctx,
-                config,
-                raw,
-                aux,
-                Shard {
-                    device: i,
-                    first_layer: first,
-                    end_layer: end,
-                    n_layer_total: config.n_layer,
-                },
-            )?);
-        }
+            Ok::<_, MatmulError>(out)
+        })?;
         Ok(Self { shards })
     }
 

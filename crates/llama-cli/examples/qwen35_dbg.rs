@@ -22,9 +22,10 @@ fn main() {
     let aux = llama_model::GpuAuxWeights::from_gguf(&f, &bytes, &cfg).unwrap();
     let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
 
-    let tok = 46usize;
+    let tok = 46u32;
     let n = cfg.n_embd;
-    let emb = &aux.token_embd[tok * n..(tok + 1) * n];
+    let emb = aux.token_embd.linha(tok).unwrap();
+    let emb = emb.as_slice();
     let ss: f32 = emb.iter().map(|x| x * x).sum::<f32>() / n as f32;
     let esc = 1.0 / (ss + cfg.rms_eps).sqrt();
     let w = &aux.layers[0].attn_norm;

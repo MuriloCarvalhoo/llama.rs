@@ -595,17 +595,21 @@ pub(crate) const MAX_SPLITS: usize = 16;
 
 /// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
-pub(crate) struct ResidentState {
+pub(crate) struct ResidentState<'w> {
     pub cfg: Cfg,
+    /// Memória device-local dos pesos, em chunks. Os `GpuTensor` de `qw`/`output_w`
+    /// apontam para pedaços dela e não têm memória própria — ver `GpuTensor::memory`.
+    pub pesos_mem: crate::alloc::GpuAllocator,
     pub qw: Vec<LayerQ>,
     pub output_w: QWeight,
     pub aux: Vec<LayerAux>,
     pub output_norm_buf: Buf,
     pub freq_buf: Buf,
-    /// Tabela de embedding f32 no host. Manter em VRAM custaria vocab*n_embd*4
-    /// (3.1 GB no 14B) para ler **uma** linha por token; a linha (n_embd f32,
-    /// ~20 KB) sobe por `embd_stage` a cada passo, ao custo de poucos µs.
-    pub token_embd: Vec<f32>,
+    /// Tabela de embedding **quantizada**, emprestada do GGUF. Manter em VRAM custaria
+    /// vocab*n_embd*4 (3.1 GB no 14B) para ler **uma** linha por token, e dequantizá-la
+    /// no host custaria a mesma coisa em RAM; a linha do token é dequantizada no passo e
+    /// sobe por `embd_stage`, ao custo de poucos µs. `None` fora do primeiro shard.
+    pub token_embd: Option<llama_model::TokenEmbd<'w>>,
     pub embd_stage: Buf,
     pub kcache: Buf,
     pub vcache: Buf,
@@ -741,7 +745,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_l2_qk: ComputePipeline,
     pub(crate) gate_quant: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
-    pub(crate) state: Option<ResidentState>,
+    pub(crate) state: Option<ResidentState<'ctx>>,
 }
 
 impl<'ctx> ResidentForward<'ctx> {
@@ -1071,7 +1075,7 @@ impl<'ctx> ResidentForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
     ) -> Result<Self, MatmulError> {
         let dev = Self::pick_device(ctx);
         Self::new_shard(ctx, config, raw, aux, Shard::whole(dev, config.n_layer))
@@ -1087,7 +1091,7 @@ impl<'ctx> ResidentForward<'ctx> {
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
-        aux: &GpuAuxWeights<'_>,
+        aux: &GpuAuxWeights<'ctx>,
         shard: Shard,
     ) -> Result<Self, MatmulError> {
         if config.head_dim > 256 {
@@ -1127,12 +1131,32 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let nbatch = cfg.n_batch;
 
-            let up_q = |t: &llama_model::QTensor<'_>,
+            // Teto do que os pesos deste shard ocupam na VRAM: o repack Q8_0 é o que mais
+            // cresce (34→36 B), então `cru × 36/34` cobre todos os tipos. É só a dica que
+            // dimensiona o último chunk do alocador — errar para menos custa um chunk
+            // extra do tamanho exato, não uma falha.
+            let crus: usize = raw.layers[shard.first_layer..shard.end_layer]
+                .iter()
+                .map(llama_model::GpuLayerRaw::bytes_totais)
+                .sum::<usize>()
+                + raw.output.bytes.len();
+            let vram_pesos = (crus as vk::DeviceSize).div_ceil(34) * 36;
+            let mut upl = crate::tensor::Uploader::new(
+                ctx,
+                phys,
+                dev_ref,
+                vram_pesos,
+                &format!("GPU{}", shard.device),
+            )?;
+
+            // O uploader é passado explicitamente porque `up_q` e `mk` o mutam: duas
+            // closures capturando o mesmo `&mut` não coexistem.
+            let up_q = |u: &mut crate::tensor::Uploader<'_>,
+                        t: &llama_model::QTensor<'_>,
                         n_in: usize,
                         n_out: usize|
              -> Result<QWeight, MatmulError> {
-                let gpu = GpuTensor::upload_quant(ctx, phys, dev_ref, t.ty, t.bytes, n_in, n_out)
-                    .map_err(MatmulError::from)?;
+                let gpu = u.tensor(t.ty, t.bytes, n_in, n_out)?;
                 Ok(QWeight { ty: t.ty, gpu })
             };
             let mut qw = Vec::with_capacity(cfg.n_layer);
@@ -1154,10 +1178,10 @@ impl<'ctx> ResidentForward<'ctx> {
                             None => (config.n_embd, config.n_embd),
                         };
                         MixerQ::Attn {
-                            attn_q: up_q(attn_q, cfg.n_embd, q_out)?,
-                            attn_k: up_q(attn_k, cfg.n_embd, kv_dim)?,
-                            attn_v: up_q(attn_v, cfg.n_embd, kv_dim)?,
-                            attn_output: up_q(attn_output, o_in, cfg.n_embd)?,
+                            attn_q: up_q(&mut upl, attn_q, cfg.n_embd, q_out)?,
+                            attn_k: up_q(&mut upl, attn_k, cfg.n_embd, kv_dim)?,
+                            attn_v: up_q(&mut upl, attn_v, cfg.n_embd, kv_dim)?,
+                            attn_output: up_q(&mut upl, attn_output, o_in, cfg.n_embd)?,
                         }
                     }
                     llama_model::MixerRaw::Delta {
@@ -1171,64 +1195,54 @@ impl<'ctx> ResidentForward<'ctx> {
                             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
                         let value_dim = dn.head_v_dim() * dn.n_v_heads;
                         MixerQ::Delta {
-                            attn_qkv: up_q(attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
-                            attn_gate: up_q(attn_gate, cfg.n_embd, value_dim)?,
-                            ssm_out: up_q(ssm_out, value_dim, cfg.n_embd)?,
+                            attn_qkv: up_q(&mut upl, attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
+                            attn_gate: up_q(&mut upl, attn_gate, cfg.n_embd, value_dim)?,
+                            ssm_out: up_q(&mut upl, ssm_out, value_dim, cfg.n_embd)?,
                         }
                     }
                 };
                 qw.push(LayerQ {
                     mixer,
-                    ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
-                    ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
-                    ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
+                    ffn_gate: up_q(&mut upl, &lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
+                    ffn_up: up_q(&mut upl, &lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
+                    ffn_down: up_q(&mut upl, &lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
                 });
             }
-            let output_w = up_q(&raw.output, cfg.n_embd, cfg.vocab)?;
+            let output_w = up_q(&mut upl, &raw.output, cfg.n_embd, cfg.vocab)?;
 
-            let mk = |data: &[f32]| -> Result<Buf, MatmulError> {
-                let b = Buf::device(ctx, phys, d, std::mem::size_of_val(data) as vk::DeviceSize)?;
+            // Auxiliares f32 (normas, tabela de frequências, estado inicial): buffer
+            // device-local próprio, mas a cópia entra na mesma fila de lotes dos pesos —
+            // eram ~450 fences de 20 KB cada, um por buffer.
+            let mk = |u: &mut crate::tensor::Uploader<'_>, data: &[f32]| -> Result<Buf, MatmulError> {
                 let bytes_val = std::mem::size_of_val(data) as vk::DeviceSize;
-                let staging = Buf::host(ctx, phys, d, bytes_val)?;
-                unsafe {
-                    let ptr =
-                        d.map_memory(staging.mem, 0, bytes_val, vk::MemoryMapFlags::empty())?;
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const u8,
-                        ptr as *mut u8,
-                        bytes_val as usize,
-                    );
-                    d.unmap_memory(staging.mem);
-                }
-                use crate::tensor::one_shot_copy;
-                let res = one_shot_copy(
-                    d,
-                    dev_ref.queue,
-                    dev_ref.cmd_pool,
-                    staging.buffer,
-                    b.buffer,
-                    bytes_val,
-                );
-                staging.destroy(d);
-                res?;
+                let b = Buf::device(ctx, phys, d, bytes_val)?;
+                // SAFETY: `f32` não tem padding nem invariantes de bit; o slice de bytes
+                // vive só até o fim desta chamada, e `bytes_para` copia na hora.
+                let brutos = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), bytes_val as usize)
+                };
+                u.bytes_para(b.buffer, brutos)?;
                 Ok(b)
             };
-            let mk_opt = |o: &Option<Vec<f32>>| -> Result<Option<Buf>, MatmulError> {
+            let mk_opt = |u: &mut crate::tensor::Uploader<'_>,
+                          o: &Option<Vec<f32>>|
+             -> Result<Option<Buf>, MatmulError> {
                 match o {
-                    Some(v) => Ok(Some(mk(v)?)),
+                    Some(v) => Ok(Some(mk(u, v)?)),
                     None => Ok(None),
                 }
             };
+            let fase_aux = llama_model::perfil_carga::Fase::nova("aux → VRAM");
             let mut aux_buf = Vec::with_capacity(cfg.n_layer);
             for al in &aux.layers[shard.first_layer..shard.end_layer] {
                 aux_buf.push(LayerAux {
-                    attn_norm: mk(&al.attn_norm)?,
-                    ffn_norm: mk(&al.ffn_norm)?,
-                    q_bias: mk_opt(&al.q_bias)?,
-                    k_bias: mk_opt(&al.k_bias)?,
-                    v_bias: mk_opt(&al.v_bias)?,
-                    q_norm: mk_opt(&al.q_norm)?,
-                    k_norm: mk_opt(&al.k_norm)?,
+                    attn_norm: mk(&mut upl, &al.attn_norm)?,
+                    ffn_norm: mk(&mut upl, &al.ffn_norm)?,
+                    q_bias: mk_opt(&mut upl, &al.q_bias)?,
+                    k_bias: mk_opt(&mut upl, &al.k_bias)?,
+                    v_bias: mk_opt(&mut upl, &al.v_bias)?,
+                    q_norm: mk_opt(&mut upl, &al.q_norm)?,
+                    k_norm: mk_opt(&mut upl, &al.k_norm)?,
                     delta: match (&al.delta, config.delta_net.as_ref()) {
                         (Some(da), Some(dn)) => {
                             // (ssm_a, dt_bias) intercalados: o `dn_gates` lê os dois de
@@ -1237,23 +1251,30 @@ impl<'ctx> ResidentForward<'ctx> {
                                 .flat_map(|h| [da.a[h], da.dt_bias[h]])
                                 .collect();
                             Some(DeltaBufs {
-                                conv1d: mk(&da.conv1d)?,
-                                adt: mk(&adt)?,
-                                alpha: mk(&da.alpha)?,
-                                beta: mk(&da.beta)?,
-                                norm: mk(&da.norm)?,
+                                conv1d: mk(&mut upl, &da.conv1d)?,
+                                adt: mk(&mut upl, &adt)?,
+                                alpha: mk(&mut upl, &da.alpha)?,
+                                beta: mk(&mut upl, &da.beta)?,
+                                norm: mk(&mut upl, &da.norm)?,
                                 // Estado recorrente e janela da convolução começam
                                 // zerados — é o "contexto vazio" desta arquitetura.
-                                estado: mk(&vec![0f32; dn.state_len()])?,
-                                janela: mk(&vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)])?,
+                                estado: mk(&mut upl, &vec![0f32; dn.state_len()])?,
+                                janela: mk(
+                                    &mut upl,
+                                    &vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)],
+                                )?,
                             })
                         }
                         _ => None,
                     },
                 });
             }
-            let output_norm_buf = mk(&aux.output_norm)?;
-            let freq_buf = mk(&aux.freq_table)?;
+            let output_norm_buf = mk(&mut upl, &aux.output_norm)?;
+            let freq_buf = mk(&mut upl, &aux.freq_table)?;
+            drop(fase_aux);
+            // Fecha o último lote e espera a GPU: daqui em diante todo peso está na VRAM.
+            // A memória dos chunks passa a ser do estado, e os dois staging morrem aqui.
+            let pesos_mem = upl.finalizar()?;
             let embd_stage =
                 Buf::host(ctx, phys, d, (config.n_embd * nbatch * 4) as vk::DeviceSize)?;
 
@@ -1322,18 +1343,14 @@ impl<'ctx> ResidentForward<'ctx> {
 
             ResidentState {
                 cfg,
+                pesos_mem,
                 qw,
                 output_w,
                 aux: aux_buf,
                 output_norm_buf,
                 freq_buf,
-                // Só o primeiro shard faz o embedding lookup; nos demais a tabela seria
-                // 3.1 GB de RAM sem uso (14B) — o suficiente para matar o processo por OOM.
-                token_embd: if shard.is_first() {
-                    aux.token_embd.to_vec()
-                } else {
-                    Vec::new()
-                },
+                // Só o primeiro shard faz o embedding lookup.
+                token_embd: shard.is_first().then_some(aux.token_embd),
                 embd_stage,
                 kcache,
                 vcache,
@@ -1759,7 +1776,7 @@ impl<'ctx> ResidentForward<'ctx> {
     #[allow(clippy::too_many_arguments)]
     fn plano_delta(
         plan: &mut Vec<PlannedOp>,
-        st: &ResidentState,
+        st: &ResidentState<'_>,
         la: &LayerAux,
         c: &Cfg,
         n_tok: usize,
@@ -2196,7 +2213,7 @@ impl<'ctx> ResidentForward<'ctx> {
     ///
     /// `LLAMA_RS_NO_GROUP=1` volta a uma barreira por op, para comparar. Motivação e ganho
     /// medido em `docs/performance-tuning.md`.
-    fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState) -> Vec<bool> {
+    fn marcar_barreiras(plan: &[PlannedOp], st: &ResidentState<'_>) -> Vec<bool> {
         // `LLAMA_RS_NO_GROUP=1` volta ao comportamento antigo (uma barreira por op) para
         // poder medir o efeito do agrupamento no mesmo binário.
         if std::env::var("LLAMA_RS_NO_GROUP").is_ok_and(|v| v != "0") {
@@ -2463,27 +2480,13 @@ impl<'ctx> ResidentForward<'ctx> {
                     // Fonte: a linha de cada token do bloco (primeiro shard) ou a stream
                     // residual que veio da GPU anterior. Vai para `embd_stage` e daí para b_x.
                     let bytes = (c.n_embd * n_tok * 4) as vk::DeviceSize;
-                    let linha = |&t: &u32| -> Option<&[f32]> {
-                        let row = t as usize * c.n_embd;
-                        st.token_embd.get(row..row + c.n_embd)
+                    // Dequantiza só as linhas deste passo: uma no decode, `n_tok` no
+                    // bloco de prefill. A tabela inteira em f32 custaria 5,1 GB de RAM.
+                    let linhas: Option<Vec<f32>> = match (x_in, st.token_embd.as_ref()) {
+                        (None, Some(te)) => te.linhas(tokens).ok(),
+                        _ => None,
                     };
-                    // O decode lê a linha direto da tabela, sem alocar — é o caminho
-                    // crítico. Só o bloco precisa concatenar as N linhas antes da cópia.
-                    let unica = if n_tok == 1 && x_in.is_none() {
-                        tokens.first().and_then(linha)
-                    } else {
-                        None
-                    };
-                    let bloco: Option<Vec<f32>> = if n_tok > 1 && x_in.is_none() {
-                        tokens
-                            .iter()
-                            .map(linha)
-                            .collect::<Option<Vec<_>>>()
-                            .map(|linhas| linhas.concat())
-                    } else {
-                        None
-                    };
-                    if let Some(src) = x_in.or(unica).or(bloco.as_deref()) {
+                    if let Some(src) = x_in.or(linhas.as_deref()) {
                         // SAFETY: embd_stage é host-visible/coherent com `bytes`;
                         // o ponteiro é válido até unmap e a cópia respeita n_embd floats.
                         unsafe {
@@ -3281,7 +3284,7 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Lê os timestamps do token e acumula o tempo de GPU por op. No-op sem profiling.
-    fn collect_prof(&self, st: &ResidentState, n_tok: usize) -> Result<(), MatmulError> {
+    fn collect_prof(&self, st: &ResidentState<'_>, n_tok: usize) -> Result<(), MatmulError> {
         let Some(pf) = &st.prof else { return Ok(()) };
         let plano = if n_tok > 1 { &st.plan_batch } else { &st.plan };
         let n = plano.len() + 1;
@@ -3373,7 +3376,7 @@ impl<'ctx> ResidentForward<'ctx> {
 
     /// Uma tabela do perfil: `bloco` escolhe entre o plano do prefill e o do decode.
     #[allow(clippy::cast_precision_loss)]
-    fn perfil_de(&self, st: &ResidentState, bloco: bool) {
+    fn perfil_de(&self, st: &ResidentState<'_>, bloco: bool) {
         let Some(pf) = &st.prof else { return };
         let (plano, accum, passos) = if bloco {
             (&st.plan_batch, pf.accum_batch.borrow(), pf.blocos.get())
@@ -3641,7 +3644,7 @@ impl<'ctx> ResidentForward<'ctx> {
     /// pela IRQ da GPU passa a custar milissegundos em vez de microssegundos. O custo é um
     /// núcleo ocupado enquanto a GPU trabalha; é o mesmo compromisso que o llama.cpp faz no
     /// seu laço de espera. Diagnóstico e números medidos em `docs/performance-tuning.md`.
-    fn espera_fence(&self, st: &ResidentState) -> Result<(), MatmulError> {
+    fn espera_fence(&self, st: &ResidentState<'_>) -> Result<(), MatmulError> {
         let d = &self.dev.device;
         loop {
             // SAFETY: fence válido e submetido.
@@ -3848,6 +3851,9 @@ impl Drop for ResidentForward<'_> {
             ] {
                 b.destroy(d);
             }
+            // Os chunks dos pesos por último: os buffers acima apontavam para dentro deles.
+            let mut pesos_mem = st.pesos_mem;
+            pesos_mem.cleanup(d);
             // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
             unsafe {
                 d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
