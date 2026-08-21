@@ -526,3 +526,58 @@ fn gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x() {
         "xd difere do quantize_x"
     );
 }
+
+/// `swiglu_quant` funde o SwiGLU com a quantização que vinha logo depois. O `silu(g)*u`
+/// contra a CPU está em `resident_fwd_swiglu_igual_cpu`; aqui o que se prende é a outra
+/// metade: `xq`/`xd` **exatos** contra o `quantize_x.comp` rodado sobre a saída que o
+/// próprio shader escreveu em `b_act`. É o que sustenta a fusão como "mesma matemática".
+#[test]
+fn swiglu_quant_quantiza_igual_ao_quantize_x() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n = 4864usize; // múltiplo de 32, como todo `n_ff`
+    let g = pseudo(n, 71);
+    let u = pseudo(n, 72);
+    let grupos = u32::try_from((n / 32).div_ceil(64)).unwrap();
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::SwigluQuant,
+            &[
+                g.clone(),
+                u.clone(),
+                vec![0f32; n],
+                vec![0f32; n / 32 * 8],
+                vec![0f32; n / 32],
+            ],
+            &u32::try_from(n).unwrap().to_le_bytes(),
+            grupos,
+        )
+        .expect("dispatch swiglu_quant");
+
+    let mut qx_push = Vec::with_capacity(12);
+    qx_push.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    qx_push.extend_from_slice(&0u32.to_le_bytes());
+    let sozinho = fwd
+        .dbg_dn(
+            DnPipe::QuantizeX,
+            &[saida[2].clone(), vec![0f32; n / 32 * 8], vec![0f32; n / 32]],
+            &qx_push,
+            grupos,
+        )
+        .expect("dispatch quantize_x");
+
+    let bits2 = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits2(&saida[3]),
+        bits2(&sozinho[1]),
+        "xq difere do quantize_x"
+    );
+    assert_eq!(
+        bits2(&saida[4]),
+        bits2(&sozinho[2]),
+        "xd difere do quantize_x"
+    );
+}

@@ -16,7 +16,7 @@ fn main() {
         // Atenção com o KV fatiado entre workgroups (contexto longo) + a redução.
         ("attention_split.comp", "ATTENTION_SPLIT_SPV"),
         ("attn_reduce.comp", "ATTN_REDUCE_SPV"),
-        ("swiglu.comp", "SWIGLU_SPV"),
+        ("swiglu_quant.comp", "SWIGLU_QUANT_SPV"),
         ("add.comp", "ADD_SPV"),
         // Camadas de atenção linear (qwen35) — ver docs/qwen35-arquitetura.md.
         ("delta_net.comp", "DELTA_NET_SPV"),

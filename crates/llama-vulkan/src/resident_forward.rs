@@ -374,7 +374,8 @@ pub(crate) enum PipeId {
     Attention,
     AttentionSplit,
     AttnReduce,
-    Swiglu,
+    /// silu(gate) * up + quantização em int8 na mesma passada — `swiglu_quant.comp`.
+    SwigluQuant,
     Add,
     DeltaNet,
     DnConv,
@@ -404,7 +405,7 @@ impl PipeId {
             PipeId::Attention => "attention",
             PipeId::AttentionSplit => "attention_split",
             PipeId::AttnReduce => "attn_reduce",
-            PipeId::Swiglu => "swiglu",
+            PipeId::SwigluQuant => "swiglu_quant",
             PipeId::Add => "add",
             PipeId::DeltaNet => "delta_net",
             PipeId::DnConv => "dn_conv",
@@ -437,7 +438,8 @@ impl PipeId {
             PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
-            PipeId::Swiglu => (&[0, 1], &[2]),
+            // a saída é inout: a segunda passada relê o que a primeira escreveu.
+            PipeId::SwigluQuant => (&[0, 1, 2], &[2, 3, 4]),
             // x é inout (recebe o residual); sai a soma parcial por workgroup.
             PipeId::NormFused => (&[0, 1], &[0, 2]),
             PipeId::NormP2 => (&[0, 1, 2], &[3, 4, 5]),
@@ -660,6 +662,8 @@ pub enum DnPipe {
     L2Qk,
     /// Portão sigmoide + quantização fundidos — `gate_quant.comp`.
     GateQuant,
+    /// SwiGLU + quantização fundidos — `swiglu_quant.comp`.
+    SwigluQuant,
     /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
     QuantizeX,
     /// Idem — os dois passos da norma fundida, para testar o batch pela dimensão Y.
@@ -699,7 +703,7 @@ pub struct ResidentForward<'ctx> {
     /// com contexto longo, onde a cadeia serial do `attention` domina o token.
     pub(crate) attention_split: ComputePipeline,
     pub(crate) attn_reduce: ComputePipeline,
-    pub(crate) swiglu: ComputePipeline,
+    pub(crate) swiglu_quant: ComputePipeline,
     pub(crate) add: ComputePipeline,
     // Camadas de atenção linear (qwen35).
     pub(crate) delta_net: ComputePipeline,
@@ -966,7 +970,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
         let attention_split = ComputePipeline::with(d, crate::ATTENTION_SPLIT_SPV, 4, 28, &[])?;
         let attn_reduce = ComputePipeline::with(d, crate::ATTN_REDUCE_SPV, 2, 12, &[])?;
-        let swiglu = ComputePipeline::with(d, crate::SWIGLU_SPV, 3, 4, &[])?;
+        // (gate, up, act inout, xq, xd) + n.
+        let swiglu_quant = ComputePipeline::with(d, crate::SWIGLU_QUANT_SPV, 5, 4, &[])?;
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
         // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
         // (x, alpha, beta, a|dt, saída) e (x, w, z, saída).
@@ -1015,7 +1020,7 @@ impl<'ctx> ResidentForward<'ctx> {
             attention,
             attention_split,
             attn_reduce,
-            swiglu,
+            swiglu_quant,
             add,
             delta_net,
             dn_conv,
@@ -1958,6 +1963,7 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::Norm => &self.dn_norm,
             DnPipe::L2Qk => &self.dn_l2_qk,
             DnPipe::GateQuant => &self.gate_quant,
+            DnPipe::SwigluQuant => &self.swiglu_quant,
             DnPipe::QuantizeX => &self.quantize_x,
             DnPipe::NormFused => &self.norm_fused,
             DnPipe::NormP2 => &self.norm_p2,
@@ -1984,49 +1990,6 @@ impl<'ctx> ResidentForward<'ctx> {
         for buf in gpu {
             buf.destroy(d);
         }
-        Ok(out)
-    }
-
-    pub fn dbg_swiglu(&self, g: &[f32], u: &[f32]) -> Result<Vec<f32>, MatmulError> {
-        #[repr(C)]
-        struct P {
-            n: u32,
-        }
-        let d = &self.dev.device;
-        let n = g.len();
-        let gb = Buf::device(
-            self.ctx,
-            self.phys(),
-            d,
-            std::mem::size_of_val(g) as vk::DeviceSize,
-        )?;
-        let ub = Buf::device(
-            self.ctx,
-            self.phys(),
-            d,
-            std::mem::size_of_val(u) as vk::DeviceSize,
-        )?;
-        let ob = Buf::device(self.ctx, self.phys(), d, (n * 4) as vk::DeviceSize)?;
-        self.upload_f32(&gb, g)?;
-        self.upload_f32(&ub, u)?;
-        let set = self.alloc_set(&self.swiglu)?;
-        let push = P { n: n as u32 };
-        let pb = unsafe { std::slice::from_raw_parts(&push as *const P as *const u8, 4) };
-        self.dispatch1(
-            &self.swiglu,
-            set,
-            &[
-                (gb.buffer, 0, gb.size),
-                (ub.buffer, 0, ub.size),
-                (ob.buffer, 0, ob.size),
-            ],
-            pb,
-            Self::groups_for(n),
-        )?;
-        let out = self.readback(&ob, n)?;
-        gb.destroy(d);
-        ub.destroy(d);
-        ob.destroy(d);
         Ok(out)
     }
 
@@ -2587,7 +2550,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::Attention => &self.attention,
             PipeId::AttentionSplit => &self.attention_split,
             PipeId::AttnReduce => &self.attn_reduce,
-            PipeId::Swiglu => &self.swiglu,
+            PipeId::SwigluQuant => &self.swiglu_quant,
             PipeId::Add => &self.add,
         }
     }
@@ -2629,8 +2592,8 @@ impl<'ctx> ResidentForward<'ctx> {
     ///
     /// - **`COLS`** nos matvec — o peso sai da VRAM uma vez para as N ativações;
     /// - **`gl_WorkGroupID.y`** em `attention`, `rope`, `norm_fused` e `norm_p2`;
-    /// - **`n × N` elementos** no que já é token-major (`quantize_x`, `swiglu`, `add`,
-    ///   `gate_quant`) — nada muda no shader.
+    /// - **`n × N` elementos** no que já é token-major (`quantize_x`, `swiglu_quant`,
+    ///   `add`, `gate_quant`) — nada muda no shader.
     ///
     /// O que sobra são as ops com estado (`dn_conv`, `delta_net`) e as que indexam peso
     /// pela cabeça (`dn_gates`): essas viram N dispatches com os bindings deslocados,
@@ -3168,25 +3131,20 @@ impl<'ctx> ResidentForward<'ctx> {
             plan.extend(norma(&st.b_proj, &la.ffn_norm, true)?);
             plan.push(mv(&lq.ffn_gate, &st.b_gate, c.n_embd, c.n_ff)?);
             plan.push(mv(&lq.ffn_up, &st.b_up, c.n_embd, c.n_ff)?);
+            // silu(gate) * up já saindo quantizado para o `ffn_down`: eram dois dispatches
+            // em todas as camadas, com o swiglu escrevendo `b_act` inteiro e o quantize
+            // relendo o mesmo buffer logo depois.
             plan.push(mk(
-                PipeId::Swiglu,
+                PipeId::SwigluQuant,
                 &[
                     (st.b_gate.buffer, 0, nbt(c.n_ff)),
                     (st.b_up.buffer, 0, nbt(c.n_ff)),
-                    (st.b_act.buffer, 0, nbt(c.n_ff)),
-                ],
-                Self::groups_for(c.n_ff * n_tok),
-                PushSpec::Static(n_push(c.n_ff * n_tok)),
-            )?);
-            plan.push(mk(
-                PipeId::QuantizeX,
-                &[
                     (st.b_act.buffer, 0, nbt(c.n_ff)),
                     (st.b_xq.buffer, 0, st.b_xq.size),
                     (st.b_xd.buffer, 0, st.b_xd.size),
                 ],
                 qx_groups(c.n_ff * n_tok),
-                PushSpec::Static(qx_push(c.n_ff * n_tok)),
+                PushSpec::Static(n_push(c.n_ff * n_tok)),
             )?);
             plan.push(mv(&lq.ffn_down, &st.b_ffn, c.n_ff, c.n_embd)?);
             // Sem `Add` aqui: o residual do FFN é somado pela norma da camada seguinte, ou
@@ -3823,7 +3781,7 @@ impl Drop for ResidentForward<'_> {
             &self.norm_p2,
             &self.rope,
             &self.attention,
-            &self.swiglu,
+            &self.swiglu_quant,
             &self.add,
         ] {
             // SAFETY: handles criados por nós, ordem inversa.

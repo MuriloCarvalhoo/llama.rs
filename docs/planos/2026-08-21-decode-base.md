@@ -107,7 +107,11 @@ integração) — o risco conhecido é binding silencioso errado
       `gate_mul.comp` ficou sem uso e saiu junto. Teste
       `gate_quant_bate_com_o_portao_da_cpu_e_com_o_quantize_x` (portão contra a CPU,
       `xq`/`xd` exatos contra o `quantize_x`). **Pendente de medição.**
-- [ ] **`swiglu` + `quantize_x`** (todas as 65 camadas): mesmo padrão.
+- [x] **`swiglu` + `quantize_x`** (todas as 65 camadas): mesmo padrão.
+      **Feito** — `swiglu_quant.comp`; `swiglu.comp` e `dbg_swiglu` saíram junto. O teste
+      `resident_fwd_swiglu_igual_cpu` passou a rodar no shader fundido (silu(g)*u contra a
+      CPU) e `swiglu_quant_quantiza_igual_ao_quantize_x` prende `xq`/`xd` exatos.
+      **Pendente de medição.**
 - [ ] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
       rope in-place + `kv_append` (cópia). Rope com binding de saída no cache elimina a
       cópia de K; V continua no append. Atenção ao offset por posição — é o motivo de o

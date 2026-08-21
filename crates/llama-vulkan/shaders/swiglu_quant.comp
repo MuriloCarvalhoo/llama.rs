@@ -1,0 +1,59 @@
+#version 450
+
+// `swiglu` + `quantize_x` na mesma passada: silu(gate) * up e a ativação já quantizada em
+// int8 por bloco de 32, para o `ffn_down` que vem logo depois.
+//
+// Eram dois dispatches por camada — em **todas** as 65 do Qwen3.8, densa ou linear. O
+// swiglu escrevia `b_act` inteiro e o quantize relia o mesmo buffer, com uma barreira no
+// meio; aqui o valor não sai do registrador entre uma coisa e outra.
+//
+// Distribuição do `norm_p2.comp`, que já quantiza direto: **uma lane por bloco de 32** — o
+// bloco de quantização do Q8_0 e o sub-bloco dos K-quants, o que faz as escalas casarem sem
+// conversão no matvec.
+//
+// `n` tem de ser múltiplo de 32: o que sobra do último bloco não é quantizado. É a mesma
+// condição que o `quantize_x` já impunha (`n_blocks = n / 32`), e `n_ff * n_tok` sempre a
+// satisfaz.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer GBuf { float g[]; } gb;
+layout(set = 0, binding = 1) readonly buffer UBuf { float u[]; } ub;
+// Não é `writeonly`: a segunda passada relê o que esta mesma lane acabou de escrever.
+layout(set = 0, binding = 2) buffer OBuf { float o[]; } ob;
+layout(set = 0, binding = 3) writeonly buffer XqBuf { int xq[]; } xqb;
+layout(set = 0, binding = 4) writeonly buffer XdBuf { float xd[]; } xdb;
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    uint n_blocks = pc.n / 32u;
+    if (blk >= n_blocks) { return; }
+
+    uint base = blk * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        float g = gb.g[base + i];
+        float v = (g / (1.0 + exp(-g))) * ub.u[base + i];
+        ob.o[base + i] = v;
+        amax = max(amax, abs(v));
+    }
+
+    float d_x = amax / 127.0;
+    float inv = d_x > 0.0 ? 1.0 / d_x : 0.0;
+    xdb.xd[blk] = d_x;
+
+    // Relê `o` em vez de guardar os 32 valores (32 VGPRs vivos) ou de refazer o `exp` do
+    // silu: a própria lane acabou de escrevê-los, então saem do L1. Mesmo compromisso que o
+    // `norm_p2` faz ao recalcular a partir de `x` e `w`.
+    for (uint g = 0u; g < 8u; g++) {
+        int packed = 0;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = int(round(ob.o[base + g * 4u + j] * inv));
+            q = clamp(q, -127, 127);
+            packed |= (q & 0xff) << (8u * j);
+        }
+        xqb.xq[blk * 8u + g] = packed;
+    }
+}

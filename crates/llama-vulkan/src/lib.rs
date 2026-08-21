@@ -36,7 +36,7 @@ pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_S
 pub(crate) const ATTENTION_SPLIT_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPLIT_SPV")));
 pub(crate) const ATTN_REDUCE_SPV: &[u8] = include_bytes!(concat!(env!("ATTN_REDUCE_SPV")));
 #[allow(dead_code)]
-pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_SPV")));
+pub(crate) const SWIGLU_QUANT_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_QUANT_SPV")));
 #[allow(dead_code)]
 pub(crate) const DELTA_NET_SPV: &[u8] = include_bytes!(concat!(env!("DELTA_NET_SPV")));
 #[allow(dead_code)]
