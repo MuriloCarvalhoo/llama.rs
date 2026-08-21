@@ -380,3 +380,62 @@ fn norm_l2_e_norm_gated_batem_com_a_referencia() {
     assert!(dif_l2 < 1e-6, "L2 divergiu: {dif_l2}");
     assert!(dif_gated < 1e-5, "norma gated divergiu: {dif_gated}");
 }
+
+/// `dn_l2_qk` funde as duas L2 (q e k) que eram dois dispatches. O teste compara com a
+/// mesma referência do modo 0 do `dn_norm`, e o que ele de fato protege é o **roteamento**:
+/// q e k entram contíguos num binding só e saem em dois buffers distintos, então um shader
+/// que trocasse os destinos, ou que normalizasse as 2×n_heads cabeças como se fossem um
+/// tensor só, ainda produziria números plausíveis. Por isso q e k usam sementes diferentes
+/// e o teste confere buffer a buffer.
+#[test]
+fn l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let dim = 128usize; // d_state do Qwen3.8
+    let n_heads = 6usize; // n_k_heads
+    let eps = 1e-6f32;
+    // Entrada como sai da convolução: as cabeças de q seguidas das de k, contíguas.
+    let qk = pseudo(2 * n_heads * dim, 51);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct P {
+        dim: u32,
+        n_heads: u32,
+        eps: f32,
+    }
+
+    let saida = fwd
+        .dbg_dn(
+            DnPipe::L2Qk,
+            &[
+                qk.clone(),
+                vec![0f32; n_heads * dim],
+                vec![0f32; n_heads * dim],
+            ],
+            &push_bytes(&P {
+                dim: dim as u32,
+                n_heads: n_heads as u32,
+                eps,
+            }),
+            (2 * n_heads) as u32,
+        )
+        .expect("dispatch dn_l2_qk");
+
+    // Referência: a mesma L2 por linha da CPU, sobre o bloco inteiro de 2*n_heads cabeças.
+    let mut esperado = qk.clone();
+    llama_model::delta_net::l2_norm_rows(&mut esperado, dim, eps);
+    let dif_q = max_dif(&saida[1], &esperado[..n_heads * dim]);
+    let dif_k = max_dif(&saida[2], &esperado[n_heads * dim..]);
+
+    eprintln!("dn_l2_qk: dif q={dif_q:.3e} k={dif_k:.3e}");
+    assert!(dif_q < 1e-6, "q divergiu: {dif_q}");
+    assert!(dif_k < 1e-6, "k divergiu: {dif_k}");
+    // A metade de k não pode ter caído no buffer de q: sem isto, um shader que ignorasse
+    // `eh_k` e escrevesse tudo em `qn` passaria no `dif_q` acima.
+    assert_ne!(
+        saida[1], saida[2],
+        "q e k saíram iguais — o roteamento entre os dois destinos está errado"
+    );
+}

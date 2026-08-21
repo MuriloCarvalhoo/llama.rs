@@ -380,6 +380,8 @@ pub(crate) enum PipeId {
     DnConv,
     DnGates,
     DnNorm,
+    /// L2 de q e k num dispatch só — o modo 0 do `dn_norm`, fundido.
+    DnL2Qk,
     GateMul,
 }
 
@@ -407,6 +409,7 @@ impl PipeId {
             PipeId::DnConv => "dn_conv",
             PipeId::DnGates => "dn_gates",
             PipeId::DnNorm => "dn_norm",
+            PipeId::DnL2Qk => "dn_l2_qk",
             PipeId::GateMul => "gate_mul",
         }
     }
@@ -444,6 +447,8 @@ impl PipeId {
             PipeId::DnConv => (&[0, 1, 2], &[0, 3]),
             PipeId::DnGates => (&[0, 1, 2, 3], &[4]),
             PipeId::DnNorm => (&[0, 1, 2], &[3]),
+            // conv (q|k contíguos) → qn, kn.
+            PipeId::DnL2Qk => (&[0], &[1, 2]),
         }
     }
 }
@@ -648,6 +653,8 @@ pub enum DnPipe {
     Conv,
     Gates,
     Norm,
+    /// L2 de q e k fundida — `dn_l2_qk.comp`.
+    L2Qk,
     /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
     QuantizeX,
     /// Idem — os dois passos da norma fundida, para testar o batch pela dimensão Y.
@@ -694,6 +701,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) dn_conv: ComputePipeline,
     pub(crate) dn_gates: ComputePipeline,
     pub(crate) dn_norm: ComputePipeline,
+    pub(crate) dn_l2_qk: ComputePipeline,
     pub(crate) gate_mul: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState>,
@@ -961,6 +969,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let dn_conv = ComputePipeline::with(d, crate::DN_CONV_SPV, 4, 12, &[])?;
         let dn_gates = ComputePipeline::with(d, crate::DN_GATES_SPV, 5, 12, &[])?;
         let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 20, &[])?;
+        // (conv, qn, kn) + dim, n_heads, eps.
+        let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 12, &[])?;
         let gate_mul = ComputePipeline::with(d, crate::GATE_MUL_SPV, 2, 12, &[])?;
 
         let pool_sizes = [vk::DescriptorPoolSize {
@@ -1005,6 +1015,7 @@ impl<'ctx> ResidentForward<'ctx> {
             dn_conv,
             dn_gates,
             dn_norm,
+            dn_l2_qk,
             gate_mul,
             desc_pool,
             state: None,
@@ -1803,27 +1814,35 @@ impl<'ctx> ResidentForward<'ctx> {
         }
 
         // L2 por cabeça em q e k, que estão nos dois primeiros terços de `conv` — e por
-        // isso não são contíguos entre tokens: um dispatch por token.
+        // isso não são contíguos entre tokens: um dispatch por token. Os dois tensores
+        // saem no mesmo dispatch (`dn_l2_qk`): são cabeças contíguas em `conv`, então o
+        // shader só precisa de `2 * n_k_heads` workgroups e dos dois destinos.
         let eps = c.rms_eps;
-        for (off, dst) in [(0usize, &b.qn), (key_dim, &b.kn)] {
-            for t in 0..n_tok {
-                plan.push(mk(
-                    PipeId::DnNorm,
-                    &[
-                        (b.conv.buffer, nb(t * conv_dim + off), nb(key_dim)),
-                        (da.norm.buffer, 0, da.norm.size), // não usado no modo 0
-                        (b.conv.buffer, nb(t * conv_dim + off), nb(key_dim)), // idem
-                        (dst.buffer, nb(t * key_dim), nb(key_dim)),
-                    ],
-                    u32::try_from(dn_cfg.n_k_heads).unwrap_or(u32::MAX),
-                    PushSpec::Static(push_norm(
-                        u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
-                        u32::try_from(dn_cfg.n_k_heads).unwrap_or(u32::MAX),
-                        0,
-                        eps,
-                    )),
-                )?);
-            }
+        for t in 0..n_tok {
+            plan.push(mk(
+                PipeId::DnL2Qk,
+                &[
+                    (b.conv.buffer, nb(t * conv_dim), nb(2 * key_dim)),
+                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
+                ],
+                u32::try_from(dn_cfg.n_k_heads * 2).unwrap_or(u32::MAX),
+                PushSpec::Static({
+                    let mut v = Vec::with_capacity(12);
+                    v.extend_from_slice(
+                        &u32::try_from(dn_cfg.d_state)
+                            .unwrap_or(u32::MAX)
+                            .to_le_bytes(),
+                    );
+                    v.extend_from_slice(
+                        &u32::try_from(dn_cfg.n_k_heads)
+                            .unwrap_or(u32::MAX)
+                            .to_le_bytes(),
+                    );
+                    v.extend_from_slice(&eps.to_le_bytes());
+                    v
+                }),
+            )?);
         }
 
         // Recorrência: lê e reescreve o estado da camada, um token de cada vez.
@@ -1931,6 +1950,7 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::Conv => &self.dn_conv,
             DnPipe::Gates => &self.dn_gates,
             DnPipe::Norm => &self.dn_norm,
+            DnPipe::L2Qk => &self.dn_l2_qk,
             DnPipe::QuantizeX => &self.quantize_x,
             DnPipe::NormFused => &self.norm_fused,
             DnPipe::NormP2 => &self.norm_p2,
@@ -2551,6 +2571,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
             PipeId::DnNorm => &self.dn_norm,
+            PipeId::DnL2Qk => &self.dn_l2_qk,
             PipeId::GateMul => &self.gate_mul,
             PipeId::QuantizeX => &self.quantize_x,
             PipeId::NormFused => &self.norm_fused,

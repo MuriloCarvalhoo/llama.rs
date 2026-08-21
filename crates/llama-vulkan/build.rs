@@ -23,6 +23,7 @@ fn main() {
         ("dn_conv.comp", "DN_CONV_SPV"),
         ("dn_gates.comp", "DN_GATES_SPV"),
         ("dn_norm.comp", "DN_NORM_SPV"),
+        ("dn_l2_qk.comp", "DN_L2_QK_SPV"),
         ("gate_mul.comp", "GATE_MUL_SPV"),
     ];
 

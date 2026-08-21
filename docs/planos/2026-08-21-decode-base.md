@@ -92,9 +92,14 @@ contra a referência CPU (`crates/llama-model/src/delta_net.rs` e os testes de
 integração) — o risco conhecido é binding silencioso errado
 (`docs/mtp-implementacao.md:82-85`):
 
-- [ ] **`dn_norm` L2 de q e k num dispatch só** (hoje são 2 por token por camada linear —
+- [x] **`dn_norm` L2 de q e k num dispatch só** (hoje são 2 por token por camada linear —
       96 dispatches/token). O shader já tem `modo` por push constant; adicionar modo que
       processa os dois tensores com offsets.
+      **Feito** como shader próprio `dn_l2_qk.comp` (3 bindings: conv → qn, kn) em vez de
+      um modo: q e k saem em **buffers distintos**, e o `dn_norm` só tem um binding de
+      saída — acrescentar outro mudaria o número de bindings de todos os modos. 96 → 48
+      dispatches/token. Teste `l2_de_q_e_k_no_mesmo_dispatch_bate_com_a_referencia`.
+      **Pendente de medição.**
 - [ ] **`gate_mul` + `quantize_x`** (camadas de atenção): o portão sigmoide escreve e o
       quantize relê o mesmo buffer. Um shader `gate_quant` que aplica o portão e
       quantiza na mesma passada; o precedente é o `norm_p2`, que já quantiza direto.
