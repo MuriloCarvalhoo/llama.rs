@@ -73,6 +73,7 @@ contra a VRAM livre — ver `scripts/run.sh -h`.
 | Layer-split, 2 GPUs | ✅ |
 | Qwen2 / Qwen2.5 (denso) | ✅ |
 | Qwen3.5 / 3.8 (híbrido atenção + gated delta-net) | ✅ |
+| Servidor HTTP (API OpenAI) com tools e reasoning | ✅ `llama-server` — ver [`docs/servidor-opencode.md`](docs/servidor-opencode.md) |
 | MTP / speculative decoding | ⏳ não implementado — ver [`docs/mtp-e-k80.md`](docs/mtp-e-k80.md) |
 
 ## Estrutura do workspace
@@ -85,7 +86,9 @@ crates/
 ├── ggml-cpu/          # Dequantização e operações GGML de baixo nível no CPU
 ├── llama-vulkan/      # Backend Vulkan: shaders SPIR-V, decode residente, layer-split
 ├── llama-sampling/    # Estratégias de sampling
-└── llama-cli/         # CLI de geração de texto
+├── llama-chat/        # Chat template do Qwen3.5/3.8 (ChatML + tools em XML)
+├── llama-cli/         # CLI de geração de texto
+└── llama-server/      # Servidor HTTP compatível com a API da OpenAI
 ```
 
 ## Hardware suportado
@@ -102,6 +105,8 @@ os limites de VRAM.
   medido e descartado
 - [`docs/hardware.md`](docs/hardware.md) — requisitos e limites de hardware
 - [`docs/debugging.md`](docs/debugging.md) — profiling por operação e timeline CPU+GPU
+- [`docs/servidor-opencode.md`](docs/servidor-opencode.md) — o servidor de chat, o formato
+  de tool call deste modelo e os limites do reuso de KV-cache
 
 ## Requisitos
 

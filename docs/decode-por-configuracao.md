@@ -74,6 +74,67 @@ Perfil de `LLAMA_RS_PROFILE=1` no baseline. Os três matvec são 77%.
 | as outras 13 ops | 6,91 | 16,3 | |
 | **total** | **42,44** | | 501 GB/s agregado |
 
+## Decode e prefill por comprimento de contexto — o gargalo é a atenção
+
+Medido pelo `llama-server` (2026-08-21), 2× MI50 layer-split, `--ctx 32768`, greedy. O
+log separa prefill de decode, que é o que torna o efeito visível:
+
+| KV no momento do decode | prefill | decode |
+|---:|---:|---:|
+| ~1,5k tok | 73,2 tok/s | **18,5 tok/s** (54 ms/tok) |
+| ~2,3k → 4,1k tok | 71,1 tok/s | **14,5 tok/s** (69 ms/tok) |
+| ~26,5k tok | 39,9 tok/s | **4,3 tok/s** (233 ms/tok) |
+
+O decode com contexto curto bate com o benchmark (22,3 tok/s medido com prompt de poucas
+dezenas de tokens; aqui já há 1,5k no cache). Mas **a 26k tokens o decode custa 5,5× mais**,
+e a conta diz de onde vem:
+
+- KV lido por token a 26 472 de contexto: `26472 × 1024 × 2 (K,V) × 4 B × 16 camadas` =
+  **3,47 GB**.
+- Tempo a mais em relação ao decode de contexto curto: 233 − 42 = 191 ms.
+- Banda efetiva da atenção: **18 GB/s** — contra os ~500 GB/s que os matvec sustentam.
+
+A atenção dispara um workgroup por cabeça (24) e cada um varre o KV inteiro em série: em
+contexto curto isso não aparecia (era 1,5% do passo), em 26k domina o token.
+
+### O split-K resolveu — 9× no kernel
+
+`attention_split.comp` fatia o KV entre os workgroups da dimensão Z e publica (m, l, acc)
+parciais; `attn_reduce.comp` combina pela mesma álgebra do softmax online, que é
+associativa nesses três. É o mesmo desenho do `flash_attn_split_k_reduce` do llama.cpp.
+
+Medido com a geometria do Qwen3.8-27B e 26 472 posições (só o dispatch, sem o upload do
+KV — `atencao_fatiada_e_mais_rapida_com_kv_longo`):
+
+| caminho | por camada de atenção |
+|---|---:|
+| 1 workgroup por cabeça | 15,3 ms |
+| **16 fatias** | **1,7 ms** |
+
+São 16 camadas de atenção no modelo: 245 ms/token de atenção viram 27 ms.
+
+A escolha é por token, em `splits_do_kv`: uma fatia a cada 512 posições, teto de 16. Com
+contexto curto o caminho antigo continua sendo o gravado — a redução não se pagaria.
+`LLAMA_RS_ATTN_SPLIT=N` força o número de fatias para comparar os dois no mesmo binário.
+
+Ponta a ponta pelo servidor, **mesmo prompt de 9 110 tokens**, mesma máquina, só o kernel
+mudando:
+
+| | prefill | decode |
+|---|---:|---:|
+| 1 workgroup por cabeça | 155,1 s (58,7 tok/s) | **9,2 tok/s** |
+| KV fatiado | 147,4 s (61,8 tok/s) | **19,6 tok/s** |
+
+O decode **dobra**; o prefill quase não muda, porque lá a atenção divide o passo com os
+matvec em batch — e é ele o próximo gargalo (11 min para os ~27k tokens que o opencode
+manda no primeiro turno).
+
+A amostragem, suspeita óbvia, **não** é o problema: 0,4–1,4 ms/token medidos.
+
+O prefill em batch de 8 rende ~3× sobre o decode (73 contra 22 tok/s), não 8×: as 48
+camadas delta-net são recorrentes e rodam um dispatch por token, e a atenção em batch tem
+o mesmo problema de banda acima.
+
 ## llama.cpp no mesmo hardware — referência
 
 Do `docs/mtp-e-k80.md` (2026-08-15, ROCm, **2× MI50**, Q5_K_M — não Q4_K_M):
