@@ -47,6 +47,31 @@ pub struct GpuLayerRaw<'a> {
 }
 
 impl<'a> GpuLayerRaw<'a> {
+    /// Bytes quantizados da camada, como estão no GGUF. Serve ao backend para dimensionar
+    /// a alocação de VRAM antes de subir peso nenhum.
+    #[must_use]
+    pub fn bytes_totais(&self) -> usize {
+        let mixer = match &self.mixer {
+            MixerRaw::Attn {
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+            } => {
+                attn_q.bytes.len()
+                    + attn_k.bytes.len()
+                    + attn_v.bytes.len()
+                    + attn_output.bytes.len()
+            }
+            MixerRaw::Delta {
+                attn_qkv,
+                attn_gate,
+                ssm_out,
+            } => attn_qkv.bytes.len() + attn_gate.bytes.len() + ssm_out.bytes.len(),
+        };
+        mixer + self.ffn_gate.bytes.len() + self.ffn_up.bytes.len() + self.ffn_down.bytes.len()
+    }
+
     /// Atalho para as camadas densas, onde o mixer é sempre atenção.
     ///
     /// # Panics

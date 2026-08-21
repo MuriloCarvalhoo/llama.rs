@@ -536,6 +536,9 @@ pub(crate) const MAX_SPLITS: usize = 16;
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
 pub(crate) struct ResidentState<'w> {
     pub cfg: Cfg,
+    /// Memória device-local dos pesos, em chunks. Os `GpuTensor` de `qw`/`output_w`
+    /// apontam para pedaços dela e não têm memória própria — ver `GpuTensor::memory`.
+    pub pesos_mem: crate::alloc::GpuAllocator,
     pub qw: Vec<LayerQ>,
     pub output_w: QWeight,
     pub aux: Vec<LayerAux>,
@@ -1047,12 +1050,32 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let nbatch = cfg.n_batch;
 
-            let up_q = |t: &llama_model::QTensor<'_>,
+            // Teto do que os pesos deste shard ocupam na VRAM: o repack Q8_0 é o que mais
+            // cresce (34→36 B), então `cru × 36/34` cobre todos os tipos. É só a dica que
+            // dimensiona o último chunk do alocador — errar para menos custa um chunk
+            // extra do tamanho exato, não uma falha.
+            let crus: usize = raw.layers[shard.first_layer..shard.end_layer]
+                .iter()
+                .map(llama_model::GpuLayerRaw::bytes_totais)
+                .sum::<usize>()
+                + raw.output.bytes.len();
+            let vram_pesos = (crus as vk::DeviceSize).div_ceil(34) * 36;
+            let mut upl = crate::tensor::Uploader::new(
+                ctx,
+                phys,
+                dev_ref,
+                vram_pesos,
+                &format!("GPU{}", shard.device),
+            )?;
+
+            // O uploader é passado explicitamente porque `up_q` e `mk` o mutam: duas
+            // closures capturando o mesmo `&mut` não coexistem.
+            let up_q = |u: &mut crate::tensor::Uploader<'_>,
+                        t: &llama_model::QTensor<'_>,
                         n_in: usize,
                         n_out: usize|
              -> Result<QWeight, MatmulError> {
-                let gpu = GpuTensor::upload_quant(ctx, phys, dev_ref, t.ty, t.bytes, n_in, n_out)
-                    .map_err(MatmulError::from)?;
+                let gpu = u.tensor(t.ty, t.bytes, n_in, n_out)?;
                 Ok(QWeight { ty: t.ty, gpu })
             };
             let mut qw = Vec::with_capacity(cfg.n_layer);
@@ -1076,10 +1099,10 @@ impl<'ctx> ResidentForward<'ctx> {
                             None => (config.n_embd, config.n_embd),
                         };
                         MixerQ::Attn {
-                            attn_q: up_q(attn_q, cfg.n_embd, q_out)?,
-                            attn_k: up_q(attn_k, cfg.n_embd, kv_dim)?,
-                            attn_v: up_q(attn_v, cfg.n_embd, kv_dim)?,
-                            attn_output: up_q(attn_output, o_in, cfg.n_embd)?,
+                            attn_q: up_q(&mut upl, attn_q, cfg.n_embd, q_out)?,
+                            attn_k: up_q(&mut upl, attn_k, cfg.n_embd, kv_dim)?,
+                            attn_v: up_q(&mut upl, attn_v, cfg.n_embd, kv_dim)?,
+                            attn_output: up_q(&mut upl, attn_output, o_in, cfg.n_embd)?,
                         }
                     }
                     llama_model::MixerRaw::Delta {
@@ -1093,51 +1116,40 @@ impl<'ctx> ResidentForward<'ctx> {
                             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
                         let value_dim = dn.head_v_dim() * dn.n_v_heads;
                         MixerQ::Delta {
-                            attn_qkv: up_q(attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
-                            attn_gate: up_q(attn_gate, cfg.n_embd, value_dim)?,
-                            ssm_out: up_q(ssm_out, value_dim, cfg.n_embd)?,
+                            attn_qkv: up_q(&mut upl, attn_qkv, cfg.n_embd, conv_dim_de(dn))?,
+                            attn_gate: up_q(&mut upl, attn_gate, cfg.n_embd, value_dim)?,
+                            ssm_out: up_q(&mut upl, ssm_out, value_dim, cfg.n_embd)?,
                         }
                     }
                 };
                 qw.push(LayerQ {
                     mixer,
-                    ffn_gate: up_q(&lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
-                    ffn_up: up_q(&lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
-                    ffn_down: up_q(&lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
+                    ffn_gate: up_q(&mut upl, &lw.ffn_gate, cfg.n_embd, cfg.n_ff)?,
+                    ffn_up: up_q(&mut upl, &lw.ffn_up, cfg.n_embd, cfg.n_ff)?,
+                    ffn_down: up_q(&mut upl, &lw.ffn_down, cfg.n_ff, cfg.n_embd)?,
                 });
             }
-            let output_w = up_q(&raw.output, cfg.n_embd, cfg.vocab)?;
+            let output_w = up_q(&mut upl, &raw.output, cfg.n_embd, cfg.vocab)?;
 
-            let mk = |data: &[f32]| -> Result<Buf, MatmulError> {
-                let b = Buf::device(ctx, phys, d, std::mem::size_of_val(data) as vk::DeviceSize)?;
+            // Auxiliares f32 (normas, tabela de frequências, estado inicial): buffer
+            // device-local próprio, mas a cópia entra na mesma fila de lotes dos pesos —
+            // eram ~450 fences de 20 KB cada, um por buffer.
+            let mk = |u: &mut crate::tensor::Uploader<'_>, data: &[f32]| -> Result<Buf, MatmulError> {
                 let bytes_val = std::mem::size_of_val(data) as vk::DeviceSize;
-                let staging = Buf::host(ctx, phys, d, bytes_val)?;
-                unsafe {
-                    let ptr =
-                        d.map_memory(staging.mem, 0, bytes_val, vk::MemoryMapFlags::empty())?;
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const u8,
-                        ptr as *mut u8,
-                        bytes_val as usize,
-                    );
-                    d.unmap_memory(staging.mem);
-                }
-                use crate::tensor::one_shot_copy;
-                let res = one_shot_copy(
-                    d,
-                    dev_ref.queue,
-                    dev_ref.cmd_pool,
-                    staging.buffer,
-                    b.buffer,
-                    bytes_val,
-                );
-                staging.destroy(d);
-                res?;
+                let b = Buf::device(ctx, phys, d, bytes_val)?;
+                // SAFETY: `f32` não tem padding nem invariantes de bit; o slice de bytes
+                // vive só até o fim desta chamada, e `bytes_para` copia na hora.
+                let brutos = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), bytes_val as usize)
+                };
+                u.bytes_para(b.buffer, brutos)?;
                 Ok(b)
             };
-            let mk_opt = |o: &Option<Vec<f32>>| -> Result<Option<Buf>, MatmulError> {
+            let mk_opt = |u: &mut crate::tensor::Uploader<'_>,
+                          o: &Option<Vec<f32>>|
+             -> Result<Option<Buf>, MatmulError> {
                 match o {
-                    Some(v) => Ok(Some(mk(v)?)),
+                    Some(v) => Ok(Some(mk(u, v)?)),
                     None => Ok(None),
                 }
             };
@@ -1145,13 +1157,13 @@ impl<'ctx> ResidentForward<'ctx> {
             let mut aux_buf = Vec::with_capacity(cfg.n_layer);
             for al in &aux.layers[shard.first_layer..shard.end_layer] {
                 aux_buf.push(LayerAux {
-                    attn_norm: mk(&al.attn_norm)?,
-                    ffn_norm: mk(&al.ffn_norm)?,
-                    q_bias: mk_opt(&al.q_bias)?,
-                    k_bias: mk_opt(&al.k_bias)?,
-                    v_bias: mk_opt(&al.v_bias)?,
-                    q_norm: mk_opt(&al.q_norm)?,
-                    k_norm: mk_opt(&al.k_norm)?,
+                    attn_norm: mk(&mut upl, &al.attn_norm)?,
+                    ffn_norm: mk(&mut upl, &al.ffn_norm)?,
+                    q_bias: mk_opt(&mut upl, &al.q_bias)?,
+                    k_bias: mk_opt(&mut upl, &al.k_bias)?,
+                    v_bias: mk_opt(&mut upl, &al.v_bias)?,
+                    q_norm: mk_opt(&mut upl, &al.q_norm)?,
+                    k_norm: mk_opt(&mut upl, &al.k_norm)?,
                     delta: match (&al.delta, config.delta_net.as_ref()) {
                         (Some(da), Some(dn)) => {
                             // (ssm_a, dt_bias) intercalados: o `dn_gates` lê os dois de
@@ -1160,24 +1172,30 @@ impl<'ctx> ResidentForward<'ctx> {
                                 .flat_map(|h| [da.a[h], da.dt_bias[h]])
                                 .collect();
                             Some(DeltaBufs {
-                                conv1d: mk(&da.conv1d)?,
-                                adt: mk(&adt)?,
-                                alpha: mk(&da.alpha)?,
-                                beta: mk(&da.beta)?,
-                                norm: mk(&da.norm)?,
+                                conv1d: mk(&mut upl, &da.conv1d)?,
+                                adt: mk(&mut upl, &adt)?,
+                                alpha: mk(&mut upl, &da.alpha)?,
+                                beta: mk(&mut upl, &da.beta)?,
+                                norm: mk(&mut upl, &da.norm)?,
                                 // Estado recorrente e janela da convolução começam
                                 // zerados — é o "contexto vazio" desta arquitetura.
-                                estado: mk(&vec![0f32; dn.state_len()])?,
-                                janela: mk(&vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)])?,
+                                estado: mk(&mut upl, &vec![0f32; dn.state_len()])?,
+                                janela: mk(
+                                    &mut upl,
+                                    &vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)],
+                                )?,
                             })
                         }
                         _ => None,
                     },
                 });
             }
-            let output_norm_buf = mk(&aux.output_norm)?;
-            let freq_buf = mk(&aux.freq_table)?;
+            let output_norm_buf = mk(&mut upl, &aux.output_norm)?;
+            let freq_buf = mk(&mut upl, &aux.freq_table)?;
             drop(fase_aux);
+            // Fecha o último lote e espera a GPU: daqui em diante todo peso está na VRAM.
+            // A memória dos chunks passa a ser do estado, e os dois staging morrem aqui.
+            let pesos_mem = upl.finalizar()?;
             let embd_stage =
                 Buf::host(ctx, phys, d, (config.n_embd * nbatch * 4) as vk::DeviceSize)?;
 
@@ -1246,6 +1264,7 @@ impl<'ctx> ResidentForward<'ctx> {
 
             ResidentState {
                 cfg,
+                pesos_mem,
                 qw,
                 output_w,
                 aux: aux_buf,
@@ -3679,6 +3698,9 @@ impl Drop for ResidentForward<'_> {
             ] {
                 b.destroy(d);
             }
+            // Os chunks dos pesos por último: os buffers acima apontavam para dentro deles.
+            let mut pesos_mem = st.pesos_mem;
+            pesos_mem.cleanup(d);
             // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
             unsafe {
                 d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);

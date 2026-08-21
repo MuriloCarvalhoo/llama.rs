@@ -41,15 +41,22 @@ struct Chunk {
 pub struct GpuAllocator {
     chunks: Vec<Chunk>,
     mem_type_idx: u32,
+    /// Quanto ainda se espera alocar. Dimensiona o **último** chunk: sem isso ele nasceria
+    /// com 1.5 GB para guardar o resto do modelo, e VRAM reservada e não usada empurra os
+    /// pesos da outra GPU para GTT (medimos 95 GB/s contra 714 quando isso acontece).
+    restante: vk::DeviceSize,
 }
 
 impl GpuAllocator {
     /// Cria o alocador, selecionando o tipo de memoria DEVICE_LOCAL.
+    ///
+    /// `total_bytes` é a estimativa do que será alocado no total; errar para menos só cria
+    /// um chunk extra do tamanho exato, errar para mais desperdiça no último chunk.
     pub fn new(
         ctx: &VulkanContext,
         phys: &VulkanPhysicalDevice,
         _dev: &VulkanDevice,
-        _total_bytes: vk::DeviceSize,
+        total_bytes: vk::DeviceSize,
     ) -> Result<Self, AllocError> {
         let mem_props = unsafe {
             // SAFETY: ctx.instance e phys.handle sao validos — criados e verificados
@@ -68,7 +75,19 @@ impl GpuAllocator {
         Ok(Self {
             chunks: Vec::new(),
             mem_type_idx,
+            restante: total_bytes,
         })
+    }
+
+    /// Tipo de memoria escolhido, para o caller conferir contra o `memory_type_bits` do
+    /// buffer que vai fazer bind.
+    pub fn mem_type_idx(&self) -> u32 {
+        self.mem_type_idx
+    }
+
+    /// Memoria do chunk desta alocacao, para `bind_buffer_memory`.
+    pub fn memoria(&self, a: &Allocation) -> Option<vk::DeviceMemory> {
+        self.chunks.get(a.chunk_idx).map(|c| c.memory)
     }
 
     /// Aloca `size` bytes alinhados a 256. Cria novo chunk se necessario.
@@ -92,8 +111,9 @@ impl GpuAllocator {
             }
         }
 
-        // Novo chunk: tamanho maximo entre size e MAX_CHUNK_BYTES
-        let chunk_size = size.max(MAX_CHUNK_BYTES);
+        // Novo chunk: cabe o pedido e, se ainda falta muito, vai ate o teto do chunk.
+        let chunk_size = tamanho_do_chunk(size, self.restante);
+        self.restante = self.restante.saturating_sub(chunk_size);
         let alloc_info = vk::MemoryAllocateInfo {
             allocation_size: chunk_size,
             memory_type_index: self.mem_type_idx,
@@ -134,6 +154,12 @@ fn align_up(v: vk::DeviceSize, align: vk::DeviceSize) -> vk::DeviceSize {
     (v + align - 1) & !(align - 1)
 }
 
+/// Tamanho de um chunk novo: nunca menor que o pedido, nunca maior que `MAX_CHUNK_BYTES`
+/// nem que o que ainda falta alocar.
+fn tamanho_do_chunk(size: vk::DeviceSize, restante: vk::DeviceSize) -> vk::DeviceSize {
+    size.max(MAX_CHUNK_BYTES.min(restante))
+}
+
 impl Drop for GpuAllocator {
     fn drop(&mut self) {
         // Nao podemos liberar sem o device — o caller deve chamar cleanup() antes.
@@ -168,5 +194,26 @@ mod tests {
     #[test]
     fn align_up_zero() {
         assert_eq!(align_up(0, 256), 0);
+    }
+
+    #[test]
+    fn chunk_cheio_enquanto_falta_muito() {
+        // Ainda faltam 9 GB: vale a pena um chunk do tamanho maximo.
+        assert_eq!(tamanho_do_chunk(1_000, 9_000_000_000), MAX_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn ultimo_chunk_so_o_que_falta() {
+        // Sobram 300 MB do modelo: reservar 1.5 GB tiraria VRAM da outra GPU a toa.
+        assert_eq!(tamanho_do_chunk(1_000, 300_000_000), 300_000_000);
+        // Estimativa zerada (ou estourada) degrada para o tamanho exato do pedido.
+        assert_eq!(tamanho_do_chunk(4_096, 0), 4_096);
+    }
+
+    #[test]
+    fn chunk_nunca_menor_que_o_pedido() {
+        let grande = MAX_CHUNK_BYTES + 1;
+        assert_eq!(tamanho_do_chunk(grande, 100), grande);
+        assert_eq!(tamanho_do_chunk(grande, 9_000_000_000), grande);
     }
 }
