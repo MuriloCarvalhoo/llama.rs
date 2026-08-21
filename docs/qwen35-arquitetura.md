@@ -1,5 +1,9 @@
 # Qwen3.5/3.8 (`qwen35`) — o que o llama-rs precisa implementar
 
+> **Nota (2026-08-21):** este é o doc de projeto **pré-implementação**. O suporte descrito
+> aqui está implementado e medido (`docs/benchmarks.md`); a seção "O que falta" no fim é
+> histórica. O plano de trabalho atual está em `docs/planos/`.
+
 Notas tiradas da implementação de referência do llama.cpp (`src/models/qwen35.cpp`,
 `src/models/delta-net-base.cpp`, `ggml/src/ggml-cpu/ops.cpp`) antes de escrever código.
 Modelo alvo: **Qwen3.8-27B**, 64 camadas, `n_embd = 5120`, `n_ff = 17408`, vocab 248320.
