@@ -65,7 +65,7 @@ dimensão de batch, em ordem de dificuldade:
 |---|---|
 | `quantize_x` | N vetores em vez de 1 — só multiplicar o índice |
 | `rmsnorm` | um workgroup por token em vez de um total |
-| `swiglu`, `add`, `gate_mul` | elementwise: só o tamanho muda |
+| `swiglu_quant`, `add`, `gate_quant` | elementwise: só o tamanho muda |
 | `rope` | posição por token, não uma só |
 | `kv_append` | N posições contíguas — uma cópia só |
 | `attention` | **máscara causal**: o token i só vê 0..i |

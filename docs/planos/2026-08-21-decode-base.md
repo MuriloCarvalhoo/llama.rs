@@ -9,6 +9,13 @@
 **Meta:** base sem MTP em 31–33 tok/s. É o caminho "sem MTP" do pedido e o
 pré-requisito aritmético do "com MTP ≥50".
 
+> **Estado (execução sem o modelo em disco):** tarefas 1 a 3 implementadas e validadas
+> contra referência de CPU nos testes de shader, que rodam na GPU sem GGUF. **Nada foi
+> medido** — não havia `models/` nesta árvore. Tarefa 4 nem começou: ela depende da
+> medição do host. O que precisa de A/B ficou atrás de env var com o default no
+> comportamento antigo (`LLAMA_RS_MATVEC_LDS_PAD`, `LLAMA_RS_ROPE_KV`); as fusões puras
+> — mesma matemática, menos dispatches — entraram como padrão.
+
 **Onde está o tempo hoje** (`LLAMA_RS_PROFILE=1`, soma das 2 GPUs, pós-`dn_gates`):
 
 | op | ms/token | banda | teto realista |

@@ -98,9 +98,10 @@ de antes — o que os 28 testes de integração existentes confirmam a cada muda
 | `attention` | `gl_WorkGroupID.y` é o token; máscara causal por laço curto | `bacc81f` |
 | `norm_fused` / `norm_p2` | parciais e `xq`/`xd` separados por token | `f9434ca` |
 | `rope` | `pos - (n_tok - 1) + t` por token | `f9434ca` |
-| `quantize_x`, `gate_mul`, `add`, `swiglu` | **nenhuma mudança** — já são token-major | — |
+| `quantize_x`, `gate_quant`, `add`, `swiglu_quant` | **nenhuma mudança** — já são token-major | — |
 
-`gate_mul` merece nota: com `n = attn_dim × n_tok`, o `h = i / head_dim` do shader avança
+`gate_quant` (na época `gate_mul`, antes de ser fundido com o `quantize_x`) merece nota:
+com `n = attn_dim × n_tok`, o `h = i / head_dim` do shader avança
 sozinho para `t * n_head + hh`, e `b_q` tem exatamente esse layout. Foi sorte da estrutura,
 não projeto — mas está coberto pelo teste de ponta a ponta.
 

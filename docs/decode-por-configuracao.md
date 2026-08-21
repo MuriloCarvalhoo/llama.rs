@@ -79,6 +79,23 @@ workgroups por CU — e portanto as waves por SIMD — a `floor(64/K)`:
 **Nada medido ainda.** O teste de shader confirma só que o resultado não muda com o pad
 ligado (erro relativo idêntico em K = 0, 13 e 33).
 
+### Fusão das ops pequenas — implementada, **não medida**
+
+Quatro fusões da frente 1 (`docs/planos/2026-08-21-decode-base.md`). Todas validadas
+contra referência de CPU ou contra o shader que substituem, nenhuma medida ainda —
+a linha de tok/s e `TOTAL GPU` fica em aberto.
+
+| fusão | shader | efeito no plano | knob |
+|---|---|---|---|
+| L2 de q e k | `dn_l2_qk.comp` | 96 → 48 dispatches/token | — (padrão) |
+| portão + quantize | `gate_quant.comp` | −1 dispatch por camada de atenção | — (padrão) |
+| SwiGLU + quantize | `swiglu_quant.comp` | −1 dispatch por camada (são 65) | — (padrão) |
+| RoPE de K no cache | `rope_kv.comp` | −1 cópia e −1 barreira por camada de atenção | `LLAMA_RS_ROPE_KV=0` volta |
+
+As três primeiras são fusão pura (mesma matemática, menos dispatches) e entraram como
+padrão sem knob. A quarta não reduz dispatches — troca uma cópia por uma escrita direta —
+então tem saída de emergência para o A/B, como o `LLAMA_RS_NO_GROUP` das barreiras.
+
 ### Varredura de geometria do matvec — sem efeito
 
 `LLAMA_RS_MATVEC_GEOM=wg,linhas`, 3 execuções cada. Diferença de 1,2%, dentro do ruído:
