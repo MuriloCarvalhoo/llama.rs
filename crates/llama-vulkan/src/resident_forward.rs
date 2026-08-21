@@ -1140,6 +1140,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     None => Ok(None),
                 }
             };
+            let fase_aux = llama_model::perfil_carga::Fase::nova("aux → VRAM");
             let mut aux_buf = Vec::with_capacity(cfg.n_layer);
             for al in &aux.layers[shard.first_layer..shard.end_layer] {
                 aux_buf.push(LayerAux {
@@ -1175,6 +1176,7 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             let output_norm_buf = mk(&aux.output_norm)?;
             let freq_buf = mk(&aux.freq_table)?;
+            drop(fase_aux);
             let embd_stage =
                 Buf::host(ctx, phys, d, (config.n_embd * nbatch * 4) as vk::DeviceSize)?;
 

@@ -45,11 +45,16 @@ impl GpuTensor {
                 Self::upload_raw(ctx, phys, dev, bytes, n_in, n_out)
             }
             gguf::GgmlType::Q6_K => {
-                let n_sb = bytes.len() / 210;
-                let mut padded = vec![0u8; n_sb * 212];
-                for i in 0..n_sb {
-                    padded[i * 212..i * 212 + 210].copy_from_slice(&bytes[i * 210..(i + 1) * 210]);
-                }
+                let padded = {
+                    let _fase = llama_model::perfil_carga::Fase::nova("repack+staging");
+                    let n_sb = bytes.len() / 210;
+                    let mut padded = vec![0u8; n_sb * 212];
+                    for i in 0..n_sb {
+                        padded[i * 212..i * 212 + 210]
+                            .copy_from_slice(&bytes[i * 210..(i + 1) * 210]);
+                    }
+                    padded
+                };
                 Self::upload_raw(ctx, phys, dev, &padded, n_in, n_out)
             }
             _ => Err(TensorError::Vulkan(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)),
@@ -69,11 +74,14 @@ impl GpuTensor {
         let size = bytes.len() as vk::DeviceSize;
         let staging = create_buf(d, size, vk::BufferUsageFlags::TRANSFER_SRC)?;
         let staging_mem = alloc_and_bind_cached(ctx, phys, d, staging)?;
-        // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
-        unsafe {
-            let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            d.unmap_memory(staging_mem);
+        {
+            let _fase = llama_model::perfil_carga::Fase::nova("repack+staging");
+            // SAFETY: staging_mem é host-visible com `size`; ptr válido até unmap.
+            unsafe {
+                let ptr = d.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+                d.unmap_memory(staging_mem);
+            }
         }
         let buffer = create_buf(
             d,
@@ -81,7 +89,10 @@ impl GpuTensor {
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         let memory = alloc_and_bind(ctx, phys, d, buffer, false)?;
-        one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buffer, size)?;
+        {
+            let _fase = llama_model::perfil_carga::Fase::nova("espera GPU (upload)");
+            one_shot_copy(d, dev.queue, dev.cmd_pool, staging, buffer, size)?;
+        }
         // SAFETY: staging já copiado; ambos criados por nós.
         unsafe {
             d.destroy_buffer(staging, None);

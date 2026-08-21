@@ -101,6 +101,7 @@ impl<'a> GpuRawWeights<'a> {
     /// para os quais existe shader de matvec. Valida a granularidade que cada um exige:
     /// 32 elementos por bloco no Q8_0, 256 por superbloco nos K-quants.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+        let _fase = crate::perfil_carga::Fase::nova("pesos crus (mmap)");
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
 
         let read = |name: &str, n_in: usize, n_out: usize| -> Result<QTensor<'a>, ModelError> {
@@ -310,6 +311,7 @@ impl<'a> GpuAuxWeights<'a> {
     /// O caminho por `Model::gpu_aux_weights` exige a estrutura densa (`attn_q` em toda
     /// camada), que o `qwen35` não tem. Aqui cada camada é lida conforme a sua variante.
     pub fn from_gguf(f: &GgufFile, bytes: &'a [u8], cfg: &LlamaConfig) -> Result<Self, ModelError> {
+        let _fase = crate::perfil_carga::Fase::nova("aux f32 (dequant)");
         let f32s = |name: &str, esperado: usize| -> Result<Vec<f32>, ModelError> {
             let info = f
                 .tensors
@@ -444,6 +446,9 @@ pub fn gerar_streaming_residente(
     gpu: &dyn GpuResidentDecode,
     on_token: &mut impl FnMut(&str),
 ) -> Result<(), ModelError> {
+    // Aqui a carga terminou: os pesos já estão na VRAM e o backend está pronto. É o ponto
+    // onde o perfil por fase (`LLAMA_RS_LOAD_PROFILE=1`) tem o que dizer.
+    crate::perfil_carga::imprimir();
     let prompt_ids = tokenizer.encode(prompt, config.add_bos);
     if prompt_ids.is_empty() {
         return Err(ModelError::Gpu("prompt vazio".into()));
@@ -558,6 +563,7 @@ impl Model<'_> {
 
     /// Coleta os pesos auxiliares f32 para o backend GPU-resident.
     pub fn gpu_aux_weights(&self) -> Result<GpuAuxWeights<'_>, ModelError> {
+        let _fase = crate::perfil_carga::Fase::nova("aux f32 (dequant)");
         let token_embd = self.token_embd_f32()?;
         let output_norm = self.output_norm_f32()?.to_vec();
         let freq_table = self.freq_table.clone();

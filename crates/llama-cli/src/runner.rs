@@ -262,9 +262,11 @@ pub fn run_generate(
     #[cfg(feature = "profiling")]
     let trace_guard = args.trace.clone().map(crate::trace::init);
 
+    let fase_mmap = llama_model::perfil_carga::Fase::nova("mmap+parse");
     let bytes = map_model(&args.model)?;
     let f = GgufFile::parse(&bytes)?;
     let cfg = model_config(&f, args)?;
+    drop(fase_mmap);
 
     // Arquiteturas híbridas (`qwen35`) não têm a estrutura densa que o `Model` exige — em
     // 3 de cada 4 camadas não existe `attn_q` —, então o caminho de GPU delas monta os

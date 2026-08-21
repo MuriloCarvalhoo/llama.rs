@@ -24,6 +24,7 @@ mod model;
 #[cfg(feature = "gpu")]
 mod mtp;
 mod ops;
+pub mod perfil_carga;
 mod sessao;
 pub(crate) mod spin_pool;
 mod weights;
