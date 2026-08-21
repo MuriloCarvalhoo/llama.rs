@@ -295,15 +295,19 @@ Atenção: há bug histórico de hang com `lto=true` + `target-cpu=native`
 | 3 | `token_embd` fora da VRAM | 3.1 GB VRAM | Baixo | ✅ feito |
 | 4 | **Eliminar `queue_wait_idle`** (usar fences/timeline) | **~22% (medido pela Khronos)** | Médio | ⬜ pendente |
 | 5 | `[profile.release]`: `lto="thin"`, `codegen-units=1` | 3–20% | Trivial | ⬜ pendente |
-| 6 | `MmapOptions::populate()` + `Advice::Sequential` | Load mais rápido | Trivial | ⬜ pendente |
+| 6 | `MmapOptions::populate()` + `Advice::Sequential` | Load mais rápido | Trivial | ✅ feito (`map_model`; efeito pendente de medição) |
 | 7 | 2 threads persistentes (1/GPU) em vez de `rayon::join` | Latência determinística | Médio | ⬜ pendente |
-| 8 | `token_embd` sem materializar f32 (dequant de 1 linha) | 6.2 GB RAM | Médio | ⬜ pendente |
-| 9 | Upload em chunks + `posix_fadvise(DONTNEED)` | Pico de page cache | Médio | ⬜ pendente |
+| 8 | `token_embd` sem materializar f32 (dequant de 1 linha) | 6.2 GB RAM | Médio | ✅ feito (`llama_model::TokenEmbd`) |
+| 9 | Upload em chunks + `posix_fadvise(DONTNEED)` | Pico de page cache | Médio | 🟡 chunks feitos (staging duplo de 256 MB); **sem** `fadvise` |
 | 10 | `zerocopy` no crate `gguf` | Remove `unsafe` | Médio | ⬜ pendente |
 | — | Trocar alocador global | **~0** | Trivial | ❌ não fazer |
 | — | async/await | negativo | — | ❌ não fazer |
 | — | `parking_lot`, `crossbeam` para canais | ~0 | — | ❌ não fazer |
 | — | `Arc<[u8]>::from(vec)` | **copia 15 GB** | — | ❌ nunca |
+
+Sobre a 9: o `posix_fadvise(DONTNEED)` ficou de fora de propósito. Devolver o page cache
+depois de subir os pesos deixa **a próxima carga fria**, e a meta da frente 4 é justamente
+carga quente em ≤6 s. Só vale se o pico de page cache virar problema medido.
 
 ---
 
