@@ -112,11 +112,20 @@ integração) — o risco conhecido é binding silencioso errado
       `resident_fwd_swiglu_igual_cpu` passou a rodar no shader fundido (silu(g)*u contra a
       CPU) e `swiglu_quant_quantiza_igual_ao_quantize_x` prende `xq`/`xd` exatos.
       **Pendente de medição.**
-- [ ] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
+- [x] **`rope` escrevendo K direto no slot do KV-cache** (camadas de atenção): hoje é
       rope in-place + `kv_append` (cópia). Rope com binding de saída no cache elimina a
       cópia de K; V continua no append. Atenção ao offset por posição — é o motivo de o
       planejador tratar o cache como buffer único em `marcar_barreiras`.
-- [ ] Medir o conjunto; alvo ≤4,5 ms para "outras ops".
+      **Feito** como `rope_kv.comp` (3 bindings; `kv_off` no push, montado na gravação a
+      partir de `total_len` e de `groups_y`). Ele cobre `head_dim/2` pares por cabeça, não
+      `rope_dim/2`: com rotary parcial o que não gira ainda precisa chegar ao cache. O
+      `kv_append` ficou só com V, e com isso `rope`, `rope_kv` e o append caem no mesmo
+      grupo de barreiras — **uma barreira a menos por camada de atenção**.
+      Ligado por padrão; `LLAMA_RS_ROPE_KV=0` volta ao caminho antigo para o A/B.
+      Teste `rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia`: saída **bit a bit**
+      igual à do `rope.comp` em rotary completa e parcial, com 1 e 2 tokens.
+      **Pendente de medição.**
+- [ ] Medir o conjunto; alvo ≤4,5 ms para "outras ops". **Pendente de medição.**
 
 ## Tarefa 4 — Host: só se a medição mandar
 

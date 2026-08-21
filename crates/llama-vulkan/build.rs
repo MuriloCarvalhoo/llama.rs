@@ -12,6 +12,7 @@ fn main() {
         ("norm_fused.comp", "NORM_FUSED_SPV"),
         ("norm_p2.comp", "NORM_P2_SPV"),
         ("rope.comp", "ROPE_SPV"),
+        ("rope_kv.comp", "ROPE_KV_SPV"),
         ("attention.comp", "ATTENTION_SPV"),
         // Atenção com o KV fatiado entre workgroups (contexto longo) + a redução.
         ("attention_split.comp", "ATTENTION_SPLIT_SPV"),

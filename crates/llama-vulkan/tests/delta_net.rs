@@ -581,3 +581,96 @@ fn swiglu_quant_quantiza_igual_ao_quantize_x() {
         "xd difere do quantize_x"
     );
 }
+
+/// `rope_kv` gira K e escreve direto no slot do KV-cache, no lugar de girar `b_k` in-place
+/// e deixar a cópia para o `kv_append`. A referência é o **próprio `rope.comp`**, que é o
+/// que ele substitui: o conteúdo do slot tem de ficar igual ao que a cópia teria posto lá.
+///
+/// Três coisas só quebram aqui e em nenhum outro teste:
+///
+/// - **rotary parcial** (`rope_dim < head_dim`): o RoPE in-place não tocava nessas dimensões
+///   e a cópia as levava assim mesmo. Escrevendo direto, o shader tem de copiá-las — se ele
+///   cobrisse só `rope_dim/2` pares, o resto do K nunca chegaria ao cache;
+/// - **`kv_off`**: o único offset do plano que depende da posição;
+/// - **bloco de N tokens**: cada um gira pelo seu ângulo e vai para o seu slot.
+#[test]
+fn rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia() {
+    let Some((ctx, ())) = ctx_fwd() else { return };
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+
+    let n_head_kv = 8usize;
+    let head_dim = 128usize;
+    let kv_dim = n_head_kv * head_dim;
+    let freq: Vec<f32> = (0..head_dim / 2)
+        .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
+        .collect();
+
+    // `head_dim` = rotary completa; `head_dim / 2` = parcial, com metade das dimensões só
+    // copiadas para o cache.
+    for rope_dim in [head_dim, head_dim / 2] {
+        for n_tok in [1usize, 2] {
+            let pos = 37usize; // posição do ÚLTIMO token do bloco
+            let slot_off = 5usize * kv_dim; // slot da camada + posições anteriores
+            let k = pseudo(kv_dim * n_tok, 81 + rope_dim + n_tok);
+            // Cache maior que o bloco, para pegar escrita fora do slot.
+            let cache = vec![0f32; slot_off + kv_dim * (n_tok + 2)];
+
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct P {
+                n_head: u32,
+                head_dim: u32,
+                rope_dim: u32,
+                pos: f32,
+                kv_off: u32,
+            }
+            let saida = fwd
+                .dbg_dn_xy(
+                    DnPipe::RopeKv,
+                    &[k.clone(), freq.clone(), cache.clone()],
+                    &push_bytes(&P {
+                        n_head: n_head_kv as u32,
+                        head_dim: head_dim as u32,
+                        rope_dim: rope_dim as u32,
+                        pos: pos as f32,
+                        kv_off: slot_off as u32,
+                    }),
+                    u32::try_from((n_head_kv * (head_dim / 2)).div_ceil(64)).unwrap(),
+                    u32::try_from(n_tok).unwrap(),
+                )
+                .expect("dispatch rope_kv");
+
+            // Referência: o `rope.comp` sobre a mesma entrada — o que o `kv_append` copiaria.
+            let mut ref_k = k.clone();
+            let girado = fwd
+                .dbg_rope_xy(
+                    &mut ref_k,
+                    n_head_kv,
+                    head_dim,
+                    rope_dim,
+                    &freq,
+                    pos,
+                    u32::try_from(n_tok).unwrap(),
+                )
+                .expect("dispatch rope");
+
+            let no_slot = &saida[2][slot_off..slot_off + kv_dim * n_tok];
+            let dif = max_dif(no_slot, &girado);
+            eprintln!("rope_kv (rope_dim={rope_dim}, n_tok={n_tok}): dif={dif:.3e}");
+            assert!(dif < 1e-6, "slot difere do rope+cópia: {dif}");
+
+            // Nada fora do slot pode ter sido escrito: um `kv_off` errado passaria no
+            // assert acima se por acaso o bloco caísse todo dentro da janela comparada.
+            assert!(
+                saida[2][..slot_off].iter().all(|&v| v == 0.0),
+                "escreveu antes do slot (rope_dim={rope_dim}, n_tok={n_tok})"
+            );
+            assert!(
+                saida[2][slot_off + kv_dim * n_tok..]
+                    .iter()
+                    .all(|&v| v == 0.0),
+                "escreveu depois do bloco (rope_dim={rope_dim}, n_tok={n_tok})"
+            );
+        }
+    }
+}

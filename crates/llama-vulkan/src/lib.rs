@@ -32,6 +32,8 @@ pub(crate) const NORM_P2_SPV: &[u8] = include_bytes!(concat!(env!("NORM_P2_SPV")
 #[allow(dead_code)]
 pub(crate) const ROPE_SPV: &[u8] = include_bytes!(concat!(env!("ROPE_SPV")));
 #[allow(dead_code)]
+pub(crate) const ROPE_KV_SPV: &[u8] = include_bytes!(concat!(env!("ROPE_KV_SPV")));
+#[allow(dead_code)]
 pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPV")));
 pub(crate) const ATTENTION_SPLIT_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPLIT_SPV")));
 pub(crate) const ATTN_REDUCE_SPV: &[u8] = include_bytes!(concat!(env!("ATTN_REDUCE_SPV")));
