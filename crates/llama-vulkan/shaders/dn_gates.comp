@@ -21,16 +21,20 @@
 // ja teve. NWAVE waves por cabeca dividem o laco sobre n_embd e se somam no fim — a
 // reducao e associativa, entao o unico efeito e a ordem do somatorio. As leituras em
 // `vec4` cortam a taxa de requests por 4, que foi o que valeu 2.5x no `rmsnorm`.
+//
+// O bloco de prefill entra por `gl_WorkGroupID.y` — um workgroup por (cabeca, token),
+// como a atencao ja faz. Nao ha recorrencia aqui: os tokens do bloco sao independentes, e
+// os `n_tok` dispatches de antes eram serializacao por simetria com o resto do caminho.
 
 layout(local_size_x = 256) in;
 const uint NWAVE = 4u;  // local_size_x / 64 (wave64 no MI50)
 
-layout(set = 0, binding = 0) readonly buffer XBuf { vec4 x[]; } x_buf;          // [n_embd/4]
+layout(set = 0, binding = 0) readonly buffer XBuf { vec4 x[]; } x_buf;          // [n_tok][n_embd/4]
 layout(set = 0, binding = 1) readonly buffer AlphaBuf { vec4 w[]; } alpha_buf;  // [n_heads][n_embd/4]
 layout(set = 0, binding = 2) readonly buffer BetaBuf { vec4 w[]; } beta_buf;    // [n_heads][n_embd/4]
 // (ssm_a, dt_bias) por cabeca.
 layout(set = 0, binding = 3) readonly buffer AdtBuf { vec2 adt[]; } adt_buf;     // [n_heads]
-layout(set = 0, binding = 4) writeonly buffer OutBuf { vec2 gb[]; } out_buf;     // [n_heads]
+layout(set = 0, binding = 4) writeonly buffer OutBuf { vec2 gb[]; } out_buf;     // [n_tok][n_heads]
 
 layout(push_constant) uniform PC {
     uint n_embd;
@@ -43,16 +47,18 @@ shared vec2 s_part[NWAVE];
 
 void main() {
     uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;   // token do bloco de prefill (0 no decode)
     uint lane = gl_LocalInvocationID.x;
     // Uniforme no workgroup — o `barrier()` abaixo nunca fica em fluxo divergente.
     if (h >= pc.n_heads) { return; }
 
     uint n4 = pc.n_embd / 4u;
     uint base4 = h * n4;
+    uint x0 = t * n4;
     vec4 pa4 = vec4(0.0);
     vec4 pb4 = vec4(0.0);
     for (uint i = lane; i < n4; i += gl_WorkGroupSize.x) {
-        vec4 xv = x_buf.x[i];
+        vec4 xv = x_buf.x[x0 + i];
         pa4 += alpha_buf.w[base4 + i] * xv;
         pb4 += beta_buf.w[base4 + i] * xv;
     }
@@ -71,6 +77,6 @@ void main() {
         float z = pa + adt.y;
         // softplus estavel: para z grande, ln(1+e^z) -> z.
         float sp = z > 20.0 ? z : log(1.0 + exp(z));
-        out_buf.gb[h] = vec2(adt.x * sp, 1.0 / (1.0 + exp(-pb)));
+        out_buf.gb[t * pc.n_heads + h] = vec2(adt.x * sp, 1.0 / (1.0 + exp(-pb)));
     }
 }

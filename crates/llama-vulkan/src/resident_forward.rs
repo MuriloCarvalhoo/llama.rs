@@ -1005,12 +1005,14 @@ impl<'ctx> ResidentForward<'ctx> {
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
         // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
         // (x, alpha, beta, a|dt, saída) e (x, w, z, saída).
-        let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 12, &[])?;
+        // O delta net leva ainda `n_tok` e o passo de `v` entre tokens: o laço do bloco
+        // roda dentro do kernel, com o estado em registrador.
+        let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 20, &[])?;
         let dn_conv = ComputePipeline::with(d, crate::DN_CONV_SPV, 4, 12, &[])?;
         let dn_gates = ComputePipeline::with(d, crate::DN_GATES_SPV, 5, 12, &[])?;
         let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 20, &[])?;
-        // (conv, qn, kn) + dim, n_heads, eps.
-        let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 12, &[])?;
+        // (conv, qn, kn) + dim, n_heads, eps, stride.
+        let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 16, &[])?;
         // (dst inout, gate, xq, xd) + n, head_dim.
         let gate_quant = ComputePipeline::with(d, crate::GATE_QUANT_SPV, 4, 8, &[])?;
 
@@ -1751,11 +1753,14 @@ impl<'ctx> ResidentForward<'ctx> {
     /// gated e projeção de saída. A ativação já foi quantizada em int8 pelo `QuantizeX`
     /// do começo da camada, então os três matvecs a consomem direto.
     ///
-    /// Com `n_tok > 1` as projeções batcham por `COLS` como no resto do plano, mas a
-    /// **recorrência** não: `dn_conv` e `delta_net` carregam estado, e os tokens do bloco
-    /// têm de ser aplicados em ordem. Viram `n_tok` dispatches com os bindings deslocados,
-    /// que `marcar_barreiras` serializa sozinho (cada um reescreve o estado que o anterior
-    /// leu). São 48 das 65 camadas do qwen35, mas a parte serial custa 1,35 ms de 42,44.
+    /// Com `n_tok > 1` **cada op vira um dispatch só**, como no resto do plano — inclusive
+    /// as duas com estado. `dn_conv` e `delta_net` não perdem a recorrência por isso: o
+    /// laço sobre os tokens do bloco mora dentro do kernel, com o estado em registrador
+    /// entre eles (ver os comentários dos dois `.comp`). Antes eram `n_tok` dispatches por
+    /// op, que `marcar_barreiras` serializava um a um — 4 × n_tok dispatches por camada
+    /// linear, 48 camadas: em batch 32 seriam 6 mil só de delta-net por bloco.
+    ///
+    /// `dn_gates` e `dn_l2_qk` batcham por `gl_WorkGroupID.y`, como as ops de atenção.
     #[allow(clippy::too_many_arguments)]
     fn plano_delta(
         plan: &mut Vec<PlannedOp>,
@@ -1785,7 +1790,10 @@ impl<'ctx> ResidentForward<'ctx> {
         let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
         let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
         let conv_dim = conv_dim_de(dn_cfg);
+        let nt = u32::try_from(n_tok).unwrap_or(1);
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        // Faixa de um buffer por token, cobrindo o bloco inteiro.
+        let nbt = |n: usize| ((n * n_tok) * 4) as vk::DeviceSize;
         let push3 = |a: u32, b: u32, c: u32| {
             let mut v = Vec::with_capacity(12);
             v.extend_from_slice(&a.to_le_bytes());
@@ -1808,21 +1816,17 @@ impl<'ctx> ResidentForward<'ctx> {
         plan.push(mv(w_gate, &b.z, c.n_embd, value_dim)?);
 
         // (g, beta) por cabeça — leem `b_normed` em f32, não a versão int8: são
-        // projeções f32 pequenas e o erro da quantização entraria num expoente. O peso é
-        // indexado pela cabeça, então o batch aqui é um dispatch por token.
-        for t in 0..n_tok {
-            plan.push(mk(
+        // projeções f32 pequenas e o erro da quantização entraria num expoente. Os tokens
+        // do bloco entram pela dimensão Y (um workgroup por cabeça e token).
+        plan.push(Self::com_y(
+            mk(
                 PipeId::DnGates,
                 &[
-                    (st.b_normed.buffer, nb(t * c.n_embd), nb(c.n_embd)),
+                    (st.b_normed.buffer, 0, nbt(c.n_embd)),
                     (da.alpha.buffer, 0, da.alpha.size),
                     (da.beta.buffer, 0, da.beta.size),
                     (da.adt.buffer, 0, da.adt.size),
-                    (
-                        b.gb.buffer,
-                        nb(t * dn_cfg.n_v_heads * 2),
-                        nb(dn_cfg.n_v_heads * 2),
-                    ),
+                    (b.gb.buffer, 0, nbt(dn_cfg.n_v_heads * 2)),
                 ],
                 u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                 PushSpec::Static(push3(
@@ -1830,45 +1834,44 @@ impl<'ctx> ResidentForward<'ctx> {
                     u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                     0,
                 )),
-            )?);
-        }
+            )?,
+            nt,
+        ));
 
-        // Convolução causal com estado, já saindo com SiLU. A janela é o estado: os tokens
-        // do bloco entram nela em ordem.
-        for t in 0..n_tok {
-            plan.push(mk(
-                PipeId::DnConv,
-                &[
-                    (da.janela.buffer, 0, da.janela.size),
-                    (b.qkv.buffer, nb(t * conv_dim), nb(conv_dim)),
-                    (da.conv1d.buffer, 0, da.conv1d.size),
-                    (b.conv.buffer, nb(t * conv_dim), nb(conv_dim)),
-                ],
-                Self::groups_for(conv_dim),
-                PushSpec::Static(push3(
-                    u32::try_from(conv_dim).unwrap_or(u32::MAX),
-                    u32::try_from(dn_cfg.d_conv).unwrap_or(u32::MAX),
-                    0,
-                )),
-            )?);
-        }
+        // Convolução causal com estado, já saindo com SiLU. A janela é o estado, e ela
+        // avança token a token **dentro** do dispatch — ver `dn_conv.comp`.
+        plan.push(mk(
+            PipeId::DnConv,
+            &[
+                (da.janela.buffer, 0, da.janela.size),
+                (b.qkv.buffer, 0, nbt(conv_dim)),
+                (da.conv1d.buffer, 0, da.conv1d.size),
+                (b.conv.buffer, 0, nbt(conv_dim)),
+            ],
+            Self::groups_for(conv_dim),
+            PushSpec::Static(push3(
+                u32::try_from(conv_dim).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.d_conv).unwrap_or(u32::MAX),
+                nt,
+            )),
+        )?);
 
         // L2 por cabeça em q e k, que estão nos dois primeiros terços de `conv` — e por
-        // isso não são contíguos entre tokens: um dispatch por token. Os dois tensores
+        // isso não são contíguos entre tokens: daí o `stride` do push. Os dois tensores
         // saem no mesmo dispatch (`dn_l2_qk`): são cabeças contíguas em `conv`, então o
-        // shader só precisa de `2 * n_k_heads` workgroups e dos dois destinos.
+        // shader só precisa de `2 * n_k_heads` workgroups (× n_tok em Y) e dos destinos.
         let eps = c.rms_eps;
-        for t in 0..n_tok {
-            plan.push(mk(
+        plan.push(Self::com_y(
+            mk(
                 PipeId::DnL2Qk,
                 &[
-                    (b.conv.buffer, nb(t * conv_dim), nb(2 * key_dim)),
-                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.conv.buffer, 0, nbt(conv_dim)),
+                    (b.qn.buffer, 0, nbt(key_dim)),
+                    (b.kn.buffer, 0, nbt(key_dim)),
                 ],
                 u32::try_from(dn_cfg.n_k_heads * 2).unwrap_or(u32::MAX),
                 PushSpec::Static({
-                    let mut v = Vec::with_capacity(12);
+                    let mut v = Vec::with_capacity(16);
                     v.extend_from_slice(
                         &u32::try_from(dn_cfg.d_state)
                             .unwrap_or(u32::MAX)
@@ -1880,35 +1883,42 @@ impl<'ctx> ResidentForward<'ctx> {
                             .to_le_bytes(),
                     );
                     v.extend_from_slice(&eps.to_le_bytes());
+                    v.extend_from_slice(&u32::try_from(conv_dim).unwrap_or(u32::MAX).to_le_bytes());
                     v
                 }),
-            )?);
-        }
+            )?,
+            nt,
+        ));
 
-        // Recorrência: lê e reescreve o estado da camada, um token de cada vez.
-        for t in 0..n_tok {
-            plan.push(mk(
-                PipeId::DeltaNet,
-                &[
-                    (da.estado.buffer, 0, da.estado.size),
-                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.conv.buffer, nb(t * conv_dim + 2 * key_dim), nb(value_dim)), // v
-                    (
-                        b.gb.buffer,
-                        nb(t * dn_cfg.n_v_heads * 2),
-                        nb(dn_cfg.n_v_heads * 2),
-                    ),
-                    (b.out.buffer, nb(t * value_dim), nb(value_dim)),
-                ],
-                u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
-                PushSpec::Static(push3(
+        // Recorrência: lê o estado da camada, aplica os `n_tok` tokens em ordem dentro do
+        // kernel e o reescreve uma vez. `v` é a última fatia de cada token em `conv`, daí
+        // o binding começar em `2 * key_dim` e o passo entre tokens ser `conv_dim`.
+        plan.push(mk(
+            PipeId::DeltaNet,
+            &[
+                (da.estado.buffer, 0, da.estado.size),
+                (b.qn.buffer, 0, nbt(key_dim)),
+                (b.kn.buffer, 0, nbt(key_dim)),
+                (
+                    b.conv.buffer,
+                    nb(2 * key_dim),
+                    nb(conv_dim * n_tok - 2 * key_dim),
+                ),
+                (b.gb.buffer, 0, nbt(dn_cfg.n_v_heads * 2)),
+                (b.out.buffer, 0, nbt(value_dim)),
+            ],
+            u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
+            PushSpec::Static({
+                let mut v = push3(
                     u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
                     u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                     u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
-                )),
-            )?);
-        }
+                );
+                v.extend_from_slice(&nt.to_le_bytes());
+                v.extend_from_slice(&u32::try_from(conv_dim).unwrap_or(u32::MAX).to_le_bytes());
+                v
+            }),
+        )?);
 
         // Norma gated: rmsnorm por cabeça vezes silu(z). As cabeças dos N tokens são
         // contíguas neste passo, então o batch é multiplicar a contagem (ver QK-norm).
