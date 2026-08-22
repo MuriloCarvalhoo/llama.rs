@@ -37,6 +37,11 @@ pub struct Resultado {
     pub ms_prefill: f64,
     pub ms_decode: f64,
     pub ms_amostragem: f64,
+    /// Tempo até o primeiro byte de stream, contado da chegada do pedido — é o que o
+    /// usuário sente antes de a resposta começar a aparecer, e o que o prefill decide.
+    /// Inclui render do template, tokenização, prefill e os tokens que o detokenizador
+    /// segurou até fechar o primeiro caractere. `None` quando nada foi emitido.
+    pub ms_ttft: Option<f64>,
 }
 
 pub struct Motor<'a> {
@@ -82,6 +87,9 @@ impl<'a> Motor<'a> {
         pedido: &Pedido,
         mut emitir: impl FnMut(&Evento) -> bool,
     ) -> Result<Resultado, MotorError> {
+        // O relógio do TTFT começa aqui: o cliente espera o render e a tokenização junto
+        // com o prefill.
+        let t_req = std::time::Instant::now();
         let prompt = render(
             &pedido.mensagens,
             &Opcoes {
@@ -97,7 +105,7 @@ impl<'a> Motor<'a> {
         if ids.len() >= self.ctx {
             return Err(MotorError::ContextoEstourado(ids.len(), self.ctx));
         }
-        let ja_no_cache = prefixo_comum(self.sessao.tokens(), &ids);
+        let ja_no_cache = prefixo_comum(self.sessao.tokens(), &ids, self.sessao.marca());
         let t0 = std::time::Instant::now();
         let mut logits = self
             .sessao
@@ -145,6 +153,9 @@ impl<'a> Motor<'a> {
 
             let texto = detok.empurrar(&self.tokenizer.decode_bytes(&[token]));
             for evento in saida.empurrar(&texto) {
+                if res.ms_ttft.is_none() {
+                    res.ms_ttft = Some(t_req.elapsed().as_secs_f64() * 1e3);
+                }
                 querem_mais &= registrar(&mut res, &evento, &mut emitir);
             }
             if parou_em_sequencia(&res.conteudo, &pedido.stop) {
@@ -188,10 +199,15 @@ impl<'a> Motor<'a> {
 }
 
 /// Quantos tokens iniciais de `ids` já estão no cache — o que o prefill vai poupar.
-fn prefixo_comum(cache: &[u32], ids: &[u32]) -> usize {
+///
+/// Espelha a decisão de `llama_model::planejar_reuso`: divergência no meio descarta o
+/// cache, **exceto** o que estiver antes do snapshot de fronteira de turno.
+fn prefixo_comum(cache: &[u32], ids: &[u32], marca: Option<usize>) -> usize {
     let comum = cache.iter().zip(ids).take_while(|(a, b)| a == b).count();
-    // Divergiu no meio: o cache inteiro será descartado (estado recorrente não volta).
-    if comum < cache.len() { 0 } else { comum }
+    if comum == cache.len() {
+        return comum;
+    }
+    marca.filter(|&m| m <= comum).unwrap_or(0)
 }
 
 fn erro_backend(e: ModelError) -> MotorError {

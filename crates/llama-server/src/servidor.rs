@@ -173,13 +173,17 @@ pub fn responder_chat<W: Write>(
 
 /// Log com prefill e decode separados: numa taxa só, um prompt longo faz o decode
 /// parecer lento, e é o decode que o usuário sente enquanto lê a resposta.
+///
+/// O TTFT vem junto porque é o número que o usuário de agente reclama: prompt de 27 mil
+/// tokens é minuto de espera antes de a resposta começar, e nenhuma taxa de decode
+/// compensa isso.
 #[allow(clippy::cast_precision_loss)]
 fn registrar(r: &crate::motor::Resultado) {
     let taxa = |n: usize, ms: f64| if ms > 0.0 { n as f64 / (ms / 1e3) } else { 0.0 };
     let reusados = r.tokens_prompt - r.tokens_prefill;
     eprintln!(
         "[gen] prompt {} tok ({} do cache, {} no prefill) {:.2}s ({:.1} tok/s) | \
-         decode {} tok {:.2}s ({:.1} tok/s) | amostragem {:.1}ms/tok",
+         decode {} tok {:.2}s ({:.1} tok/s) | amostragem {:.1}ms/tok | ttft {}",
         r.tokens_prompt,
         reusados,
         r.tokens_prefill,
@@ -193,6 +197,8 @@ fn registrar(r: &crate::motor::Resultado) {
         } else {
             0.0
         },
+        r.ms_ttft
+            .map_or_else(|| "—".to_owned(), |ms| format!("{:.2}s", ms / 1e3)),
     );
 }
 
