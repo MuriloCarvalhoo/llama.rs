@@ -161,6 +161,32 @@ impl MtpHead {
         h: &[f32],
         token: u32,
     ) -> Result<u32, ModelError> {
+        Ok(self
+            .propor_com_hidden(cfg, raw, aux, output, token_embd, freq, h, token)?
+            .0)
+    }
+
+    /// Como [`Self::propor`], devolvendo também o hidden do **próprio bloco** MTP.
+    ///
+    /// Esse hidden é o que permite encadear propostas: para o segundo token de uma
+    /// proposta de largura 2, a cabeça é realimentada com a própria previsão e com o seu
+    /// próprio hidden, não com o do modelo. É o que o llama.cpp faz com o `t_h_nextn` em
+    /// `common/speculative.cpp`.
+    ///
+    /// # Errors
+    /// Se algum peso tiver forma incompatível com a config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propor_com_hidden(
+        &mut self,
+        cfg: &LlamaConfig,
+        raw: &MtpRaw<'_>,
+        aux: &MtpAux,
+        output: &QTensor<'_>,
+        token_embd: &[f32],
+        freq: &[f32],
+        h: &[f32],
+        token: u32,
+    ) -> Result<(u32, Vec<f32>), ModelError> {
         let n_embd = cfg.n_embd;
         let head_dim = cfg.head_dim;
         let n_head = cfg.n_head;
@@ -277,8 +303,11 @@ impl MtpHead {
         }
 
         // 7. Norma final do bloco (faz o papel do `output_norm`) e projeção de vocabulário.
+        //    O `x` que sai daqui é o análogo do `b_x` do modelo: stream residual antes da
+        //    norma final. É ele que realimenta a cabeça quando se encadeia uma proposta.
         let final_h = ops::rmsnorm_and_scale(&x, &aux.shared_head_norm, n_embd, eps);
         let logits = matvec_q(output, n_embd, cfg.vocab, &final_h)?;
-        u32::try_from(ops::argmax(&logits)).map_err(|_| ModelError::Overflow)
+        let escolhido = u32::try_from(ops::argmax(&logits)).map_err(|_| ModelError::Overflow)?;
+        Ok((escolhido, x))
     }
 }
