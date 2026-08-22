@@ -81,16 +81,25 @@ O servidor mantém uma sessão só e reaproveita o prefixo comum entre o que est
 o prompt novo (`llama_model::Sessao`). O caso do agente — histórico inteiro de volta mais
 um turno — processa apenas o que cresceu.
 
-**Quando o prefixo diverge no meio, o cache inteiro é descartado.** Não é preguiça: 48 das
-65 camadas do qwen35 são delta-net, com estado recorrente. O KV de atenção poderia ser
-truncado (basta recuar o comprimento), mas o estado recorrente é o produto de todos os
-tokens processados, em ordem, e só voltaria atrás com um snapshot de 151 MB por ponto de
-retorno. Pelo mesmo motivo não dá para reprocessar um token que já entrou.
+**Divergência no meio custava o cache inteiro.** Não era preguiça: 48 das 65 camadas do
+qwen35 são delta-net, com estado recorrente. O KV de atenção volta atrás sozinho (basta
+recuar o comprimento e deixar os tokens novos reescreverem os slots), mas o estado
+recorrente é o produto de todos os tokens processados, em ordem. Pelo mesmo motivo não dá
+para reprocessar um token que já entrou.
 
-Consequência prática, coberta por teste: **se o cliente não devolver o `reasoning_content`
-no histórico**, o template reconstrói o turno do assistant diferente do que foi gerado, o
-prefixo diverge e o prompt inteiro é reprocessado. Com o raciocínio de volta, o texto
-re-renderizado bate byte a byte com o que o modelo gerou e o cache é aproveitado.
+**Snapshot de fronteira de turno.** No fim do prefill de cada requisição a sessão manda o
+backend copiar o estado recorrente, a janela da convolução e o comprimento do KV — ~155 MB
+de VRAM, um snapshot só. Divergência **depois** dessa posição recua até ela
+(`Reuso::RecuarPara`) em vez de reiniciar; divergência antes ainda custa tudo.
+
+A fronteira é o fim do prompt, não o fim da resposta, porque é a **resposta** que o turno
+seguinte re-renderiza: o cliente que não devolve o `reasoning_content` no histórico faz o
+template reconstruir o turno do assistant diferente do que foi gerado, e essa divergência
+começa depois da fronteira. Antes do snapshot isso reprocessava o prompt inteiro; agora
+reprocessa só a resposta e o turno novo. Com o raciocínio de volta o texto re-renderizado
+bate byte a byte e nem isso é preciso.
+
+*Pendente de medição no modelo real.*
 
 ## Custo de contexto em VRAM
 
@@ -122,6 +131,19 @@ cache e só os ~84 tokens novos foram processados. É o item de reuso pagando a 
 O tool call do turno 1 saiu como `finish_reason: tool_calls` com
 `{"path":"src/main.rs"}` — o XML do modelo convertido para o formato da API.
 
+### TTFT
+
+A linha `[gen]` do log traz o **tempo até o primeiro byte de stream**, contado da chegada
+do pedido (render do template e tokenização incluídos, porque o cliente espera por eles):
+
+```text
+[gen] prompt 9110 tok (0 do cache, 9110 no prefill) …s (… tok/s) | decode … | ttft …s
+```
+
+É o número que decide a experiência com prompt grande: a taxa de decode não compensa
+minutos de espera antes de a resposta começar. *Antes/depois desta frente: pendente de
+medição.*
+
 ## Uma requisição por vez
 
 O laço de conexões é sequencial. Os pesos são residentes e um único decode já satura a
@@ -130,9 +152,8 @@ ainda embaralharia a sessão do KV-cache.
 
 ## O que não está implementado
 
-- **Prefill mais rápido que 8 tokens por bloco.** O batch está limitado a 8
-  (`LLAMA_RS_BATCH`); acima disso é preciso o GEMM com tiling em LDS
-  (`docs/prefill-em-batch.md`, etapa 2). Um prompt inicial grande ainda custa minutos.
-- **Snapshot do estado recorrente**, que tornaria o reuso de prefixo tolerante a
-  divergência no meio.
+- **A largura de bloco ótima do prefill.** O teto subiu de 8 para 32 (`LLAMA_RS_BATCH`) e o
+  GEMM com tiling em LDS existe atrás de `LLAMA_RS_PREFILL_GEMM=1`, mas **qual das duas
+  ganha, e em que largura, é medição que ainda não foi feita** — ver
+  `docs/prefill-em-batch.md`.
 - Imagens (o runtime não tem visão), `logprobs`, `n > 1`, penalidades de repetição.
