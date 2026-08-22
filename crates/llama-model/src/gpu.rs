@@ -302,6 +302,41 @@ pub trait GpuResidentDecode {
         }
         Ok(logits)
     }
+
+    /// Se este backend foi construído com a cabeça de multi-token prediction.
+    ///
+    /// Só com ela os três métodos abaixo funcionam; sem ela o laço de geração segue o
+    /// caminho normal, um token por passo.
+    fn tem_mtp(&self) -> bool {
+        false
+    }
+
+    /// Propõe o token seguinte a `token` com a cabeça MTP.
+    ///
+    /// `hidden_idx` diz de qual hidden do último passo partir: 0 depois de um decode
+    /// simples ou de um verify rejeitado, 1 depois de um verify **aceito** — nesse caso o
+    /// token de partida veio dos logits do segundo token do bloco.
+    fn propor_mtp(&self, token: u32, hidden_idx: usize) -> Result<u32, ModelError> {
+        let _ = (token, hidden_idx);
+        Err(ModelError::Gpu("backend sem cabeça MTP".into()))
+    }
+
+    /// Processa os dois tokens de uma verificação nas posições `pos0` e `pos0 + 1` e
+    /// devolve os logits dos **dois**, concatenados (`2 × vocab`, o primeiro token
+    /// primeiro).
+    ///
+    /// `tokens[0]` é o token já amostrado e `tokens[1]` a proposta da cabeça. Ler os pesos
+    /// uma vez serve aos dois — é daí que vem o ganho do speculative decoding.
+    fn decode_verify(&self, tokens: &[u32; 2], pos0: usize) -> Result<Vec<f32>, ModelError> {
+        let _ = (tokens, pos0);
+        Err(ModelError::Gpu("backend sem plano de verify".into()))
+    }
+
+    /// Desfaz o segundo token do último `decode_verify`: restaura o estado recorrente e
+    /// recua o comprimento do KV em um. Chamado só quando a proposta é rejeitada.
+    fn rollback_verify(&self) -> Result<(), ModelError> {
+        Err(ModelError::Gpu("backend sem plano de verify".into()))
+    }
 }
 
 impl<'a> GpuAuxWeights<'a> {
@@ -449,26 +484,10 @@ pub fn gerar_streaming_residente(
         return Err(ModelError::Gpu("prompt vazio".into()));
     }
     gpu.reset();
-
-    // Prefill: blocos de `batch_size()` tokens, e o que sobrar token a token. Em batch
-    // cada peso do modelo sai da VRAM uma vez para N tokens em vez de uma por token — o
-    // decode é limitado por banda, então é aí que está o custo de um prompt longo.
-    let mut logits = Vec::new();
-    let nb = gpu.batch_size();
-    let mut pos = 0usize;
-    while nb > 1 && prompt_ids.len() - pos >= nb {
-        let Some(bloco) = prompt_ids.get(pos..pos + nb) else {
-            break;
-        };
-        logits = gpu.decode_batch(bloco, pos)?;
-        pos += nb;
-    }
-    for &t in prompt_ids.get(pos..).unwrap_or(&[]) {
-        logits = gpu.decode(t, pos)?;
-        pos += 1;
-    }
+    let (mut logits, mut pos, mut hidden) = prefill_residente(gpu, &prompt_ids)?;
     let first_idx = sampler.sample(&logits, rng);
     let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
+    let usar_mtp = gpu.tem_mtp();
 
     let mut count = 0usize;
     while count < n_tokens {
@@ -478,12 +497,118 @@ pub fn gerar_streaming_residente(
         let piece = tokenizer.decode(&[next]);
         on_token(&piece);
         count += 1;
-        let logits = gpu.decode(next, pos)?;
+
+        if usar_mtp {
+            let passo = passo_mtp(gpu, sampler, rng, next, hidden, pos, config.vocab)?;
+            pos = passo.pos;
+            hidden = passo.hidden;
+            if let Some(aceito) = passo.aceito {
+                if aceito == config.eos_id {
+                    return Ok(());
+                }
+                if count >= n_tokens {
+                    return Ok(());
+                }
+                on_token(&tokenizer.decode(&[aceito]));
+                count += 1;
+            }
+            next = passo.seguinte;
+            continue;
+        }
+
+        logits = gpu.decode(next, pos)?;
         pos += 1;
+        hidden = 0;
         let idx = sampler.sample(&logits, rng);
         next = u32::try_from(idx).map_err(|_| ModelError::Overflow)?;
     }
     Ok(())
+}
+
+/// Prefill de `ids`: blocos de `batch_size()` e o resto token a token.
+///
+/// Devolve os logits do último token, a posição seguinte e **o índice do token dentro do
+/// último bloco** que produziu esses logits. O terceiro só interessa ao MTP: é qual dos
+/// hidden que ficaram na GPU a cabeça deve consumir.
+fn prefill_residente(
+    gpu: &dyn GpuResidentDecode,
+    ids: &[u32],
+) -> Result<(Vec<f32>, usize, usize), ModelError> {
+    // Em batch cada peso do modelo sai da VRAM uma vez para N tokens em vez de uma por
+    // token — o decode é limitado por banda, e é aí que está o custo de um prompt longo.
+    let nb = gpu.batch_size();
+    let mut logits = Vec::new();
+    let mut pos = 0usize;
+    let mut hidden = 0usize;
+    while nb > 1 && ids.len() - pos >= nb {
+        let Some(bloco) = ids.get(pos..pos + nb) else {
+            break;
+        };
+        logits = gpu.decode_batch(bloco, pos)?;
+        pos += nb;
+        hidden = nb - 1;
+    }
+    for &t in ids.get(pos..).unwrap_or(&[]) {
+        logits = gpu.decode(t, pos)?;
+        pos += 1;
+        hidden = 0;
+    }
+    Ok((logits, pos, hidden))
+}
+
+/// O que um passo de speculative decoding produziu.
+struct PassoMtp {
+    /// O segundo token do passo, quando a proposta foi aceita.
+    aceito: Option<u32>,
+    /// O token a emitir no próximo passo (ainda não passou pelo modelo).
+    seguinte: u32,
+    /// Posição seguinte no KV-cache: avança 2 na aceitação, 1 na rejeição.
+    pos: usize,
+    /// Qual hidden do passo alimenta a próxima proposta.
+    hidden: usize,
+}
+
+/// Um passo de speculative decoding: propor → verificar → aceitar ou desfazer.
+///
+/// `token` já foi amostrado e emitido; a cabeça propõe o **seguinte** a ele e o verify
+/// processa os dois de uma vez, lendo os pesos uma única vez. A rejeição não desperdiça o
+/// forward: os logits do primeiro token do bloco **são** os do token correto seguinte, e
+/// por isso todo passo entrega pelo menos um token novo além de `token`.
+///
+/// Com amostragem (temp > 0) a proposta só é aceita se coincidir com o token que o sampler
+/// tira dos logits[0] — a distribuição continua exatamente a do caminho sem MTP, e a taxa
+/// de aceitação cai na proporção da entropia.
+fn passo_mtp(
+    gpu: &dyn GpuResidentDecode,
+    sampler: &llama_sampling::Sampler,
+    rng: &mut impl rand::Rng,
+    token: u32,
+    hidden: usize,
+    pos: usize,
+    vocab: usize,
+) -> Result<PassoMtp, ModelError> {
+    let proposta = gpu.propor_mtp(token, hidden)?;
+    let logits = gpu.decode_verify(&[token, proposta], pos)?;
+    let (l0, l1) = logits.split_at(vocab.min(logits.len()));
+    let t1 = u32::try_from(sampler.sample(l0, rng)).map_err(|_| ModelError::Overflow)?;
+    if t1 != proposta {
+        // Rejeitou: o token certo já veio nos logits[0]. Desfaz o segundo token do bloco.
+        gpu.rollback_verify()?;
+        return Ok(PassoMtp {
+            aceito: None,
+            seguinte: t1,
+            pos: pos + 1,
+            hidden: 0,
+        });
+    }
+    let seguinte = u32::try_from(sampler.sample(l1, rng)).map_err(|_| ModelError::Overflow)?;
+    Ok(PassoMtp {
+        aceito: Some(t1),
+        seguinte,
+        // O hidden que produziu `seguinte` é o do **segundo** token do bloco.
+        pos: pos + 2,
+        hidden: 1,
+    })
 }
 
 #[cfg(feature = "gpu")]

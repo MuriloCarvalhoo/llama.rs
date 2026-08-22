@@ -36,6 +36,39 @@ pub(crate) fn batch_size() -> usize {
         .clamp(1, 8)
 }
 
+/// Tokens do bloco de **verificação** do MTP: o token já amostrado e a proposta da cabeça.
+///
+/// É largura fixa, não configurável: o ganho do speculative decoding com esta cabeça é
+/// `1 + aceitação` e a cabeça propõe **um** token (`nextn_predict_layers = 1`). Uma largura
+/// maior exigiria realimentar a cabeça com a própria previsão, o que o experimento da
+/// tarefa 6 (`tests/mtp_aceitacao.rs`) mede antes de qualquer código de produção.
+pub(crate) const VERIFY_TOK: usize = 2;
+
+/// Qual dos três planos do shard executar.
+///
+/// Os três saem da mesma `build_plan`; o que muda é a largura do bloco e o que se faz no
+/// fim: o prefill calcula logits só do último token, o verify calcula os dois.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Modo {
+    /// Um token — o decode.
+    Decode,
+    /// `cfg.n_batch` tokens, logits só do último — o prefill.
+    Batch,
+    /// Dois tokens, logits dos **dois**, com snapshot do estado recorrente entre eles.
+    Verify,
+}
+
+impl Modo {
+    /// Tokens do bloco deste plano.
+    fn n_tok(self, c: &Cfg) -> usize {
+        match self {
+            Modo::Decode => 1,
+            Modo::Batch => c.n_batch,
+            Modo::Verify => VERIFY_TOK,
+        }
+    }
+}
+
 /// Geometria dos matvec do **bloco de prefill**, separada da do decode.
 ///
 /// O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane: no
@@ -364,6 +397,13 @@ pub(crate) struct DeltaBufs {
     pub estado: Buf,
     /// [conv_dim * (d_conv - 1)] — os tokens anteriores que a convolução ainda enxerga.
     pub janela: Buf,
+    /// Cópia de `estado` e `janela` **depois do primeiro** dos dois tokens do verify.
+    ///
+    /// É o que o rollback restaura quando a proposta da cabeça MTP é rejeitada: o token
+    /// já amostrado vale, o proposto não. `None` sem MTP — são 3,2 MB por camada, 155 MB
+    /// no Qwen3.8-27B, que não faz sentido reservar no caminho padrão.
+    pub estado_snap: Option<Buf>,
+    pub janela_snap: Option<Buf>,
 }
 
 /// Identifica qual pipeline um dispatch usa (resolvido em `pipe_of`).
@@ -378,6 +418,11 @@ pub(crate) enum PipeId {
     MatvecQ5KB,
     MatvecQ6KB,
     MatvecQ4KB,
+    /// As mesmas quatro com `COLS = 2`: só o plano de verify do MTP as usa.
+    MatvecV,
+    MatvecQ5KV,
+    MatvecQ6KV,
+    MatvecQ4KV,
     QuantizeX,
     /// Residual + parciais da RMSNorm — ver `norm_fused.comp`.
     NormFused,
@@ -413,6 +458,10 @@ impl PipeId {
             PipeId::MatvecQ5KB => "matvec_q5k_b",
             PipeId::MatvecQ6KB => "matvec_q6k_b",
             PipeId::MatvecQ4KB => "matvec_q4k_b",
+            PipeId::MatvecV => "matvec_v",
+            PipeId::MatvecQ5KV => "matvec_q5k_v",
+            PipeId::MatvecQ6KV => "matvec_q6k_v",
+            PipeId::MatvecQ4KV => "matvec_q4k_v",
             PipeId::QuantizeX => "quantize_x",
             PipeId::NormFused => "norm_fused",
             PipeId::NormP2 => "norm_p2",
@@ -450,7 +499,11 @@ impl PipeId {
             | PipeId::MatvecB
             | PipeId::MatvecQ5KB
             | PipeId::MatvecQ6KB
-            | PipeId::MatvecQ4KB => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MatvecQ4KB
+            | PipeId::MatvecV
+            | PipeId::MatvecQ5KV
+            | PipeId::MatvecQ6KV
+            | PipeId::MatvecQ4KV => (&[0, 1, 2, 4], &[3]),
             PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
@@ -537,12 +590,27 @@ pub(crate) enum PlannedOp {
     },
     /// Embedding lookup: copia a linha de cada token do bloco de `token_embd` para `b_x`.
     Embed,
+    /// Cópia device-to-device de um trecho fixo: o snapshot do estado recorrente entre os
+    /// dois tokens do verify, e o staging do embedding no plano da cabeça MTP.
+    Copia {
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        bytes: vk::DeviceSize,
+    },
     /// Append do K e do V da camada ao KV-cache a partir da posição do primeiro token do
     /// bloco. As posições do bloco são consecutivas, então é uma cópia só.
     ///
     /// `com_k` é falso quando o `rope_kv` já escreveu K no slot (ver [`rope_no_kv`]) e só
     /// resta copiar V.
     KvAppend { slot: usize, com_k: bool },
+    /// Append de K e V no KV-cache **próprio da cabeça MTP**, na posição corrente dela.
+    /// O bloco tem um cache só (não é dividido em slots por camada) e sempre copia os
+    /// dois: a cabeça usa o `rope` in-place, não o `rope_kv`, para não depender do knob.
+    KvAppendMtp,
+    /// Copia o hidden de um dos tokens do último passo (`b_x`) para o buffer da cabeça.
+    /// **Qual** token é escolhido na gravação: depois de um verify aceito é o segundo,
+    /// depois de um rejeitado (ou de um decode simples) é o primeiro.
+    CopiaHidden,
     /// Atenção com dois caminhos prontos: um workgroup por cabeça (contexto curto) ou o
     /// KV fatiado entre workgroups mais a redução dos parciais (contexto longo).
     ///
@@ -553,6 +621,19 @@ pub(crate) enum PlannedOp {
         split: Box<PlannedOp>,
         reduce: Box<PlannedOp>,
     },
+}
+
+impl PlannedOp {
+    /// Rótulo da op — o mesmo em `dbg_plano`, na timeline e na tabela do perfil.
+    fn label(&self) -> &'static str {
+        match self {
+            PlannedOp::Dispatch { pipe, .. } => pipe.label(),
+            PlannedOp::Embed => "embed",
+            PlannedOp::Copia { .. } | PlannedOp::CopiaHidden => "copia",
+            PlannedOp::KvAppend { .. } | PlannedOp::KvAppendMtp => "kv_append",
+            PlannedOp::Atencao { .. } => "attention",
+        }
+    }
 }
 
 /// Em quantas fatias dividir o KV. 1 mantém o caminho de um workgroup por cabeça.
@@ -592,6 +673,54 @@ fn splits_do_ambiente() {
 
 /// Teto de fatias do KV: o buffer de parciais é dimensionado por ele.
 pub(crate) const MAX_SPLITS: usize = 16;
+
+/// Pesos e buffers próprios do bloco de multi-token prediction (`blk.{n_layer}.*`).
+///
+/// O bloco **é de atenção**, mesmo ocupando uma posição que a regra `eh_linear` diria ser
+/// linear — o GGUF traz `attn_q/k/v/output` e nenhum `ssm_*`. Consequência prática: ele
+/// não tem estado recorrente, só um KV-cache próprio de `kv_dim` por posição (8 KB no
+/// Qwen3.8-27B), e por isso a cabeça não entra no rollback.
+///
+/// Quase todas as ativações são emprestadas do plano principal (`b_normed`, `b_q`, `b_k`,
+/// `b_v`, `b_attn`, `b_proj`, `b_gate`, `b_up`, `b_xq`, `b_xd`, `b_parciais`, `b_logits`):
+/// a cabeça roda **entre** dois passos do modelo, com a GPU ociosa e os logits do passo
+/// anterior já lidos. O que precisa ser próprio é o que sobrevive ao passo (`kcache`,
+/// `vcache`) ou o que seria destruído antes de ser lido (`b_h`, `b_eh`, `b_x`).
+pub(crate) struct MtpBufs {
+    pub eh_proj: QWeight,
+    pub attn_q: QWeight,
+    pub attn_k: QWeight,
+    pub attn_v: QWeight,
+    pub attn_output: QWeight,
+    pub ffn_gate: QWeight,
+    pub ffn_up: QWeight,
+    pub ffn_down: QWeight,
+    pub enorm: Buf,
+    pub hnorm: Buf,
+    pub shared_head_norm: Buf,
+    pub attn_norm: Buf,
+    pub ffn_norm: Buf,
+    pub q_norm: Option<Buf>,
+    pub k_norm: Option<Buf>,
+    /// Linha crua da tabela de embedding do token amostrado, vinda do host. [n_embd]
+    pub emb_stage: Buf,
+    pub b_emb: Buf,
+    /// Cópia do hidden do passo anterior. O plano principal deixa **os dois** hidden do
+    /// verify em `b_x`, e qual deles a cabeça consome depende de aceitação ou rejeição —
+    /// por isso a cópia entra no command buffer com o offset escolhido na gravação.
+    pub b_h: Buf,
+    /// `[enorm(emb) ; hnorm(h)]` — a concatenação é escrita nos offsets 0 e n_embd do
+    /// mesmo buffer, então não existe op de concatenar. [2 * n_embd]
+    pub b_eh: Buf,
+    /// Stream residual do bloco. Separada de `b_x` do modelo, que ainda guarda o hidden.
+    pub b_x: Buf,
+    pub b_ffn: Buf,
+    pub kcache: Buf,
+    pub vcache: Buf,
+    /// Posições já escritas no cache do bloco. Anda 1 por proposta, como a referência de
+    /// CPU (`MtpHead::propor`) — o cache da cabeça é dela, não acompanha o do modelo.
+    pub len: RefCell<usize>,
+}
 
 /// Todo o estado residente do modelo (pesos + aux + KV + ativações). `None` no
 /// construtor de micro-teste `new_pipelines_only`; `Some` após `new`.
@@ -649,6 +778,18 @@ pub(crate) struct ResidentState {
     /// `n_batch == 1`, e aí o prefill usa o plano de decode token a token.
     pub plan_batch: Vec<PlannedOp>,
     pub barreiras_batch: Vec<bool>,
+    /// O mesmo par para o bloco de dois tokens do verify. Vazio sem MTP.
+    pub plan_verify: Vec<PlannedOp>,
+    pub barreiras_verify: Vec<bool>,
+    /// Cabeça de multi-token prediction residente, quando o backend foi construído com
+    /// MTP ligado — ver [`ResidentForward::new_shard_com`].
+    pub mtp: Option<MtpBufs>,
+    pub mtp_plan: Vec<PlannedOp>,
+    pub mtp_barreiras: Vec<bool>,
+    /// Command buffer gravado **uma vez** com as cópias de volta dos snapshots. O
+    /// conteúdo é estático (origem, destino e tamanho não mudam), então a rejeição custa
+    /// só um submit. `None` sem MTP ou sem camada de atenção linear.
+    pub rollback_cmd: Option<vk::CommandBuffer>,
     pub token_cmd: vk::CommandBuffer,
     pub token_fence: vk::Fence,
     /// Perfilamento por op via timestamp queries. `Some` só com LLAMA_RS_PROFILE=1.
@@ -669,6 +810,9 @@ pub(crate) struct Prof {
     /// O mesmo para o plano do bloco de prefill, que tem outra lista de ops.
     pub accum_batch: RefCell<Vec<u64>>,
     pub blocos: std::cell::Cell<usize>,
+    /// E o mesmo para o bloco de verify do MTP — terceira lista de ops, terceiro acumulador.
+    pub accum_verify: RefCell<Vec<u64>>,
+    pub verifies: std::cell::Cell<usize>,
     /// Zonas absolutas para a timeline (`--trace`). Vazio quando não se pede trace.
     pub spans: RefCell<Vec<GpuSpan>>,
     /// Limite de tokens gravados, para o arquivo não crescer sem fim.
@@ -721,6 +865,11 @@ pub struct ResidentForward<'ctx> {
     pub(crate) matvec_q5k_b: ComputePipeline,
     pub(crate) matvec_q6k_b: ComputePipeline,
     pub(crate) matvec_q4k_b: ComputePipeline,
+    // As mesmas quatro com COLS = 2, para o plano de verify do MTP.
+    pub(crate) matvec_v: ComputePipeline,
+    pub(crate) matvec_q5k_v: ComputePipeline,
+    pub(crate) matvec_q6k_v: ComputePipeline,
+    pub(crate) matvec_q4k_v: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) norm_fused: ComputePipeline,
     pub(crate) norm_p2: ComputePipeline,
@@ -989,6 +1138,27 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec_q6k_b =
             ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[(0, cols)])?;
         let matvec_q4k_b = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
+        // Verify do MTP: `COLS = 2` fixo, com a geometria do **decode** e não a do prefill.
+        // O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane, e
+        // com duas colunas isso fica perto do decode (COLS=1) e longe das oito do bloco de
+        // prefill — ver `matvec_geom_batch`. Pendente de medição no modelo real.
+        let geom_v = [(0, mv_wg), (1, mv_rows), (2, VERIFY_TOK as u32)];
+        let matvec_v = ComputePipeline::with(
+            d,
+            crate::Q8_0_MATVEC_SPV,
+            5,
+            push_mv,
+            &[(0, MATVEC_WG), (1, MATVEC_NUM_ROWS), (2, VERIFY_TOK as u32)],
+        )?;
+        let matvec_q5k_v = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 5, push_mv, &geom_v)?;
+        let matvec_q6k_v = ComputePipeline::with(
+            d,
+            crate::Q6_K_MATVEC_SPV,
+            5,
+            push_mv,
+            &[(0, VERIFY_TOK as u32)],
+        )?;
+        let matvec_q4k_v = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_v)?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         // dim:u32 + tem_residual:u32
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
@@ -1043,6 +1213,10 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q5k_b,
             matvec_q6k_b,
             matvec_q4k_b,
+            matvec_v,
+            matvec_q5k_v,
+            matvec_q6k_v,
+            matvec_q4k_v,
             rmsnorm,
             norm_fused,
             norm_p2,
@@ -1077,18 +1251,55 @@ impl<'ctx> ResidentForward<'ctx> {
         Self::new_shard(ctx, config, raw, aux, Shard::whole(dev, config.n_layer))
     }
 
+    /// Como [`Self::new`], com o multi-token prediction ligado (ver [`Self::new_shard_com`]).
+    pub fn new_com(
+        ctx: &'ctx VulkanContext,
+        config: &LlamaConfig,
+        raw: &GpuRawWeights,
+        aux: &GpuAuxWeights<'_>,
+        mtp: bool,
+    ) -> Result<Self, MatmulError> {
+        let dev = Self::pick_device(ctx);
+        Self::new_shard_com(
+            ctx,
+            config,
+            raw,
+            aux,
+            Shard::whole(dev, config.n_layer),
+            mtp,
+        )
+    }
+
     /// Backend cobrindo apenas `shard.first_layer..shard.end_layer`, no device do shard.
     /// Só o primeiro shard faz embedding; só o último faz a norma final e os logits.
-    #[cfg_attr(
-        feature = "profiling",
-        tracing::instrument(skip_all, name = "subir_pesos")
-    )]
     pub fn new_shard(
         ctx: &'ctx VulkanContext,
         config: &LlamaConfig,
         raw: &GpuRawWeights,
         aux: &GpuAuxWeights<'_>,
         shard: Shard,
+    ) -> Result<Self, MatmulError> {
+        Self::new_shard_com(ctx, config, raw, aux, shard, false)
+    }
+
+    /// Como [`Self::new_shard`], com o **multi-token prediction** opcionalmente ligado.
+    ///
+    /// Ligar custa VRAM que o caminho padrão não deve pagar: os snapshots do estado
+    /// recorrente (3,2 MB por camada linear, ~155 MB no Qwen3.8-27B), o KV-cache próprio da
+    /// cabeça (8 KB por posição) e os 289 MB de pesos do bloco. Daí ser um construtor
+    /// separado, e não uma flag lida do ambiente: quem liga é a `--mtp` do CLI ou a config
+    /// do servidor, e o resto do repositório continua construindo o backend como antes.
+    #[cfg_attr(
+        feature = "profiling",
+        tracing::instrument(skip_all, name = "subir_pesos")
+    )]
+    pub fn new_shard_com(
+        ctx: &'ctx VulkanContext,
+        config: &LlamaConfig,
+        raw: &GpuRawWeights,
+        aux: &GpuAuxWeights<'_>,
+        shard: Shard,
+        mtp: bool,
     ) -> Result<Self, MatmulError> {
         if config.head_dim > 256 {
             // Shader de attention distribui head_dim entre 64 lanes com no máximo
@@ -1236,6 +1447,16 @@ impl<'ctx> ResidentForward<'ctx> {
                             let adt: Vec<f32> = (0..dn.n_v_heads)
                                 .flat_map(|h| [da.a[h], da.dt_bias[h]])
                                 .collect();
+                            let janela_len = conv_dim_de(dn) * (dn.d_conv - 1);
+                            // Os snapshots só existem com MTP: 3,2 MB por camada que o
+                            // caminho padrão nunca leria.
+                            let snap = |n: usize| -> Result<Option<Buf>, MatmulError> {
+                                if mtp {
+                                    Ok(Some(Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)?))
+                                } else {
+                                    Ok(None)
+                                }
+                            };
                             Some(DeltaBufs {
                                 conv1d: mk(&da.conv1d)?,
                                 adt: mk(&adt)?,
@@ -1245,7 +1466,9 @@ impl<'ctx> ResidentForward<'ctx> {
                                 // Estado recorrente e janela da convolução começam
                                 // zerados — é o "contexto vazio" desta arquitetura.
                                 estado: mk(&vec![0f32; dn.state_len()])?,
-                                janela: mk(&vec![0f32; conv_dim_de(dn) * (dn.d_conv - 1)])?,
+                                janela: mk(&vec![0f32; janela_len])?,
+                                estado_snap: snap(dn.state_len())?,
+                                janela_snap: snap(janela_len)?,
                             })
                         }
                         _ => None,
@@ -1254,8 +1477,11 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             let output_norm_buf = mk(&aux.output_norm)?;
             let freq_buf = mk(&aux.freq_table)?;
-            let embd_stage =
-                Buf::host(ctx, phys, d, (config.n_embd * nbatch * 4) as vk::DeviceSize)?;
+            // Largura máxima de bloco que as ativações precisam cobrir. Com MTP o plano de
+            // verify tem dois tokens, e `LLAMA_RS_BATCH=1` deixaria os buffers apertados
+            // para ele.
+            let nblk = if mtp { nbatch.max(VERIFY_TOK) } else { nbatch };
+            let embd_stage = Buf::host(ctx, phys, d, (config.n_embd * nblk * 4) as vk::DeviceSize)?;
 
             // Só as camadas de atenção têm KV-cache: no qwen35 as outras três de cada
             // quatro são delta-net, com estado recorrente de tamanho fixo. Reservar por
@@ -1280,10 +1506,62 @@ impl<'ctx> ResidentForward<'ctx> {
             // Ativações: `nf` para o que é por token (dimensionado para o bloco inteiro do
             // prefill) e `nf1` para o que é por sequência.
             let nf = |n: usize| -> Result<Buf, MatmulError> {
-                Buf::device(ctx, phys, d, (n * nbatch * 4) as vk::DeviceSize)
+                Buf::device(ctx, phys, d, (n * nblk * 4) as vk::DeviceSize)
             };
             let nf1 = |n: usize| -> Result<Buf, MatmulError> {
                 Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)
+            };
+            // Colunas de logits: 1 no decode e no prefill, 2 no verify (os dois tokens).
+            let cols_logits = if mtp { VERIFY_TOK } else { 1 };
+
+            // Cabeça MTP: só no shard que tem a norma final, porque é dele o hidden que ela
+            // combina com o embedding. Assim ela roda inteira numa GPU, sem tráfego extra.
+            let mtp_bufs = match (mtp && shard.is_last(), raw.mtp.as_ref(), aux.mtp.as_ref()) {
+                (true, Some(mraw), Some(maux)) => {
+                    let llama_model::MixerRaw::Attn {
+                        attn_q,
+                        attn_k,
+                        attn_v,
+                        attn_output,
+                    } = &mraw.layer.mixer
+                    else {
+                        // `MtpRaw` só é montado com mixer de atenção — ver `gpu.rs`.
+                        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+                    };
+                    let q_out = if config.delta_net.is_some() {
+                        attn_dim * 2
+                    } else {
+                        config.n_embd
+                    };
+                    let kv_pos = (config.ctx * kv_dim * 4) as vk::DeviceSize;
+                    Some(MtpBufs {
+                        eh_proj: up_q(&mraw.eh_proj, config.n_embd * 2, config.n_embd)?,
+                        attn_q: up_q(attn_q, config.n_embd, q_out)?,
+                        attn_k: up_q(attn_k, config.n_embd, kv_dim)?,
+                        attn_v: up_q(attn_v, config.n_embd, kv_dim)?,
+                        attn_output: up_q(attn_output, attn_dim, config.n_embd)?,
+                        ffn_gate: up_q(&mraw.layer.ffn_gate, config.n_embd, config.n_ff)?,
+                        ffn_up: up_q(&mraw.layer.ffn_up, config.n_embd, config.n_ff)?,
+                        ffn_down: up_q(&mraw.layer.ffn_down, config.n_ff, config.n_embd)?,
+                        enorm: mk(&maux.enorm)?,
+                        hnorm: mk(&maux.hnorm)?,
+                        shared_head_norm: mk(&maux.shared_head_norm)?,
+                        attn_norm: mk(&maux.layer.attn_norm)?,
+                        ffn_norm: mk(&maux.layer.ffn_norm)?,
+                        q_norm: mk_opt(&maux.layer.q_norm)?,
+                        k_norm: mk_opt(&maux.layer.k_norm)?,
+                        emb_stage: Buf::host(ctx, phys, d, (config.n_embd * 4) as vk::DeviceSize)?,
+                        b_emb: nf1(config.n_embd)?,
+                        b_h: nf1(config.n_embd)?,
+                        b_eh: nf1(config.n_embd * 2)?,
+                        b_x: nf1(config.n_embd)?,
+                        b_ffn: nf1(config.n_embd)?,
+                        kcache: Buf::device(ctx, phys, d, kv_pos)?,
+                        vcache: Buf::device(ctx, phys, d, kv_pos)?,
+                        len: RefCell::new(0),
+                    })
+                }
+                _ => None,
             };
 
             let cb_info = vk::CommandBufferAllocateInfo {
@@ -1305,9 +1583,9 @@ impl<'ctx> ResidentForward<'ctx> {
             // Nos shards intermediários a stream residual sai com um vetor por token do
             // bloco; no último só os logits do último token do bloco interessam.
             let saida_floats = if shard.is_last() {
-                config.vocab
+                config.vocab * cols_logits
             } else {
-                config.n_embd * nbatch
+                config.n_embd * nblk
             };
             let logits_host = Buf::host_read(ctx, phys, d, (saida_floats * 4) as vk::DeviceSize)?;
             // SAFETY: memória host-visible recém-criada com esse tamanho, ainda não mapeada.
@@ -1356,7 +1634,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 b_up: nf(config.n_ff)?,
                 b_act: nf(config.n_ff)?,
                 // Só o último token do bloco chega à projeção de logits — ver `build_plan`.
-                b_logits: nf1(config.vocab)?,
+                // Com MTP são duas colunas: o verify precisa dos logits dos dois tokens.
+                b_logits: nf1(config.vocab * cols_logits)?,
                 b_ffn: nf(config.n_embd)?,
                 b_xq: nf(config.n_embd.max(config.n_ff) / 32 * 8)?,
                 b_xd: nf(config.n_embd.max(config.n_ff) / 32)?,
@@ -1388,6 +1667,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 barreiras: Vec::new(),
                 plan_batch: Vec::new(),
                 barreiras_batch: Vec::new(),
+                plan_verify: Vec::new(),
+                barreiras_verify: Vec::new(),
+                mtp: mtp_bufs,
+                mtp_plan: Vec::new(),
+                mtp_barreiras: Vec::new(),
+                rollback_cmd: None,
                 token_cmd,
                 token_fence,
                 prof: None,
@@ -1395,23 +1680,32 @@ impl<'ctx> ResidentForward<'ctx> {
         };
 
         me.state = Some(state);
-        let plan = me.build_plan(1)?;
+        let plan = me.build_plan(Modo::Decode)?;
         // Plano do bloco de prefill. Mesmo código, `n_tok` colunas: os matvec passam a ler
         // cada peso uma vez para os N tokens, que é o ganho do batch.
         let nbatch = batch_size();
         let plan_batch = if nbatch > 1 {
-            me.build_plan(nbatch)?
+            me.build_plan(Modo::Batch)?
         } else {
             Vec::new()
         };
+        // Plano da verificação do MTP: dois tokens, logits dos dois, snapshot do estado
+        // recorrente entre eles.
+        let plan_verify = if mtp {
+            me.build_plan(Modo::Verify)?
+        } else {
+            Vec::new()
+        };
+        let plan_mtp = me.build_plan_mtp()?;
         // Perfilamento opcional: 1 timestamp antes do plano + 1 depois de cada op, então
-        // o pool é dimensionado pelo **maior** dos dois planos — o do bloco de prefill tem
+        // o pool é dimensionado pelo **maior** dos planos — o do bloco de prefill tem
         // mais ops que o do decode, porque a recorrência do delta-net vira um dispatch por
         // token do bloco.
         let prof = if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
+            let maior = plan.len().max(plan_batch.len()).max(plan_verify.len());
             let info = vk::QueryPoolCreateInfo {
                 query_type: vk::QueryType::TIMESTAMP,
-                query_count: u32::try_from(plan.len().max(plan_batch.len()) + 1)
+                query_count: u32::try_from(maior + 1)
                     .map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?,
                 ..Default::default()
             };
@@ -1430,6 +1724,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 tokens: std::cell::Cell::new(0),
                 accum_batch: RefCell::new(Vec::new()),
                 blocos: std::cell::Cell::new(0),
+                accum_verify: RefCell::new(Vec::new()),
+                verifies: std::cell::Cell::new(0),
                 spans: RefCell::new(Vec::new()),
                 max_trace_tokens: std::env::var("LLAMA_RS_TRACE_TOKENS")
                     .ok()
@@ -1443,6 +1739,10 @@ impl<'ctx> ResidentForward<'ctx> {
             st.barreiras = Self::marcar_barreiras(&plan, st);
             st.barreiras_batch = Self::marcar_barreiras(&plan_batch, st);
             st.plan_batch = plan_batch;
+            st.barreiras_verify = Self::marcar_barreiras(&plan_verify, st);
+            st.plan_verify = plan_verify;
+            st.mtp_barreiras = Self::marcar_barreiras(&plan_mtp, st);
+            st.mtp_plan = plan_mtp;
             if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
                 let n = st.barreiras.iter().filter(|b| **b).count();
                 eprintln!(
@@ -1454,7 +1754,65 @@ impl<'ctx> ResidentForward<'ctx> {
             st.plan = plan;
             st.prof = prof;
         }
+        me.gravar_rollback()?;
         Ok(me)
+    }
+
+    /// Grava, uma vez, o command buffer que restaura os snapshots do estado recorrente.
+    ///
+    /// O conteúdo é estático — origem, destino e tamanho de cada cópia são conhecidos na
+    /// construção —, então a rejeição de uma proposta custa só um submit, sem gravação.
+    fn gravar_rollback(&mut self) -> Result<(), MatmulError> {
+        let d = &self.dev.device;
+        let cmd_pool = self.dev.cmd_pool;
+        let Some(st) = self.state.as_ref() else {
+            return Ok(());
+        };
+        // As cópias existem só onde há snapshot, ou seja, com MTP e camada linear.
+        let copias: Vec<(vk::Buffer, vk::Buffer, vk::DeviceSize)> = st
+            .aux
+            .iter()
+            .filter_map(|la| la.delta.as_ref())
+            .flat_map(|dn| {
+                dn.estado_snap
+                    .iter()
+                    .map(|s| (s.buffer, dn.estado.buffer, dn.estado.size))
+                    .chain(
+                        dn.janela_snap
+                            .iter()
+                            .map(|s| (s.buffer, dn.janela.buffer, dn.janela.size)),
+                    )
+            })
+            .collect();
+        if copias.is_empty() {
+            return Ok(());
+        }
+        let info = vk::CommandBufferAllocateInfo {
+            command_pool: cmd_pool,
+            level: vk::CommandBufferLevel::PRIMARY,
+            command_buffer_count: 1,
+            ..Default::default()
+        };
+        // SAFETY: device e pool válidos; o buffer é gravado agora e só resubmetido depois.
+        let cmd = unsafe { d.allocate_command_buffers(&info)? }[0];
+        let begin = vk::CommandBufferBeginInfo::default();
+        // SAFETY: cmd recém-alocado; as cópias apontam para buffers vivos no state.
+        unsafe {
+            d.begin_command_buffer(cmd, &begin)?;
+            for (src, dst, size) in &copias {
+                let region = vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: *size,
+                };
+                d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
+            }
+            d.end_command_buffer(cmd)?;
+        }
+        if let Some(st) = self.state.as_mut() {
+            st.rollback_cmd = Some(cmd);
+        }
+        Ok(())
     }
 
     /// Diagnóstico: roda o shader attention GQA sobre q/k_cache/v_cache e devolve o resultado.
@@ -1953,6 +2311,199 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(())
     }
 
+    /// A mesma camada de atenção linear, para o bloco de **dois** tokens do verify.
+    ///
+    /// Duplica `plano_delta` de propósito, e não por descuido: o verify precisa que a
+    /// recorrência seja exatamente `n_tok` dispatches em ordem, com um ponto de parada
+    /// entre eles onde o estado do primeiro token pode ser copiado. O caminho de batch vai
+    /// migrar para um kernel multi-token (uma passada só para os N tokens do bloco), e aí
+    /// esse ponto de parada deixa de existir — o verify não pode herdar essa mudança sem
+    /// perder o rollback.
+    ///
+    /// O snapshot entra em dois lugares, sempre **depois do token 0 e antes do token 1**:
+    /// a janela da convolução (120 KB) e o estado recorrente (3,1 MB). Juntos são 3,2 MB
+    /// por camada; nas 48 camadas lineares do Qwen3.8-27B, ~155 MB — 0,45 ms a 717 GB/s.
+    #[allow(clippy::too_many_arguments)]
+    fn plano_delta_verify(
+        plan: &mut Vec<PlannedOp>,
+        st: &ResidentState,
+        la: &LayerAux,
+        c: &Cfg,
+        pesos: (&QWeight, &QWeight, &QWeight),
+        mk: &MkDispatch<'_>,
+        mv: &MkMatvec<'_>,
+        mv_com: &MkMatvecCom<'_>,
+    ) -> Result<(), MatmulError> {
+        let (w_qkv, w_gate, w_out) = pesos;
+        let n_tok = VERIFY_TOK;
+        let faltando = || MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        let dn_cfg = c.delta_net.as_ref().ok_or_else(faltando)?;
+        let b = st.dn.as_ref().ok_or_else(faltando)?;
+        let da = la.delta.as_ref().ok_or_else(faltando)?;
+        // Sem os buffers de snapshot não há rollback possível, e um verify sem rollback
+        // corrompe o estado na primeira rejeição — melhor falhar na construção do plano.
+        let estado_snap = da.estado_snap.as_ref().ok_or_else(faltando)?;
+        let janela_snap = da.janela_snap.as_ref().ok_or_else(faltando)?;
+
+        let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
+        let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
+        let conv_dim = conv_dim_de(dn_cfg);
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let u = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let push3 = |a: u32, b: u32, c: u32| {
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&a.to_le_bytes());
+            v.extend_from_slice(&b.to_le_bytes());
+            v.extend_from_slice(&c.to_le_bytes());
+            v
+        };
+        let eps = c.rms_eps;
+
+        // Projeções da entrada já quantizada — batcham por COLS como no resto do plano.
+        plan.push(mv(w_qkv, &b.qkv, c.n_embd, conv_dim)?);
+        plan.push(mv(w_gate, &b.z, c.n_embd, value_dim)?);
+
+        // (g, beta) por cabeça: o peso é indexado pela cabeça, então um dispatch por token.
+        for t in 0..n_tok {
+            plan.push(mk(
+                PipeId::DnGates,
+                &[
+                    (st.b_normed.buffer, nb(t * c.n_embd), nb(c.n_embd)),
+                    (da.alpha.buffer, 0, da.alpha.size),
+                    (da.beta.buffer, 0, da.beta.size),
+                    (da.adt.buffer, 0, da.adt.size),
+                    (
+                        b.gb.buffer,
+                        nb(t * dn_cfg.n_v_heads * 2),
+                        nb(dn_cfg.n_v_heads * 2),
+                    ),
+                ],
+                u(dn_cfg.n_v_heads),
+                PushSpec::Static(push3(u(c.n_embd), u(dn_cfg.n_v_heads), 0)),
+            )?);
+        }
+
+        // Convolução causal: a janela é estado, então os tokens entram em ordem e o
+        // snapshot dela fica entre os dois.
+        for t in 0..n_tok {
+            if t == 1 {
+                plan.push(PlannedOp::Copia {
+                    src: da.janela.buffer,
+                    dst: janela_snap.buffer,
+                    bytes: da.janela.size,
+                });
+            }
+            plan.push(mk(
+                PipeId::DnConv,
+                &[
+                    (da.janela.buffer, 0, da.janela.size),
+                    (b.qkv.buffer, nb(t * conv_dim), nb(conv_dim)),
+                    (da.conv1d.buffer, 0, da.conv1d.size),
+                    (b.conv.buffer, nb(t * conv_dim), nb(conv_dim)),
+                ],
+                Self::groups_for(conv_dim),
+                PushSpec::Static(push3(u(conv_dim), u(dn_cfg.d_conv), 0)),
+            )?);
+        }
+
+        // L2 por cabeça em q e k, que ocupam os dois primeiros terços de `conv` e por isso
+        // não são contíguos entre tokens: um dispatch por token, os dois tensores juntos.
+        for t in 0..n_tok {
+            plan.push(mk(
+                PipeId::DnL2Qk,
+                &[
+                    (b.conv.buffer, nb(t * conv_dim), nb(2 * key_dim)),
+                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
+                ],
+                u(dn_cfg.n_k_heads * 2),
+                PushSpec::Static({
+                    let mut v = Vec::with_capacity(12);
+                    v.extend_from_slice(&u(dn_cfg.d_state).to_le_bytes());
+                    v.extend_from_slice(&u(dn_cfg.n_k_heads).to_le_bytes());
+                    v.extend_from_slice(&eps.to_le_bytes());
+                    v
+                }),
+            )?);
+        }
+
+        // Recorrência, um token de cada vez, com o snapshot do estado entre eles.
+        for t in 0..n_tok {
+            if t == 1 {
+                plan.push(PlannedOp::Copia {
+                    src: da.estado.buffer,
+                    dst: estado_snap.buffer,
+                    bytes: da.estado.size,
+                });
+            }
+            plan.push(mk(
+                PipeId::DeltaNet,
+                &[
+                    (da.estado.buffer, 0, da.estado.size),
+                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.conv.buffer, nb(t * conv_dim + 2 * key_dim), nb(value_dim)), // v
+                    (
+                        b.gb.buffer,
+                        nb(t * dn_cfg.n_v_heads * 2),
+                        nb(dn_cfg.n_v_heads * 2),
+                    ),
+                    (b.out.buffer, nb(t * value_dim), nb(value_dim)),
+                ],
+                u(dn_cfg.n_v_heads * dn_cfg.d_state / 4),
+                PushSpec::Static(push3(
+                    u(dn_cfg.d_state),
+                    u(dn_cfg.n_v_heads),
+                    u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
+                )),
+            )?);
+        }
+
+        // Norma gated: as cabeças dos dois tokens são contíguas, então o batch é só
+        // multiplicar a contagem de cabeças.
+        let heads_v = dn_cfg.n_v_heads * n_tok;
+        plan.push(mk(
+            PipeId::DnNorm,
+            &[
+                (b.out.buffer, 0, nb(value_dim * n_tok)),
+                (da.norm.buffer, 0, da.norm.size),
+                (b.z.buffer, 0, nb(value_dim * n_tok)),
+                (b.normed.buffer, 0, nb(value_dim * n_tok)),
+            ],
+            u(heads_v),
+            PushSpec::Static({
+                let mut v = Vec::with_capacity(20);
+                v.extend_from_slice(&u(dn_cfg.head_v_dim()).to_le_bytes());
+                v.extend_from_slice(&u(heads_v).to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes()); // modo: norma gated
+                v.extend_from_slice(&eps.to_le_bytes());
+                v.extend_from_slice(&u(dn_cfg.head_v_dim()).to_le_bytes()); // stride
+                v
+            }),
+        )?);
+
+        // A saída da recorrência precisa ser requantizada antes do matvec final.
+        let vd_n = value_dim * n_tok;
+        plan.push(mk(
+            PipeId::QuantizeX,
+            &[
+                (b.normed.buffer, 0, nb(vd_n)),
+                (b.xq.buffer, 0, b.xq.size),
+                (b.xd.buffer, 0, b.xd.size),
+            ],
+            u((vd_n / 32).div_ceil(64)),
+            PushSpec::Static(push3(u(vd_n), 0, 0)),
+        )?);
+        plan.push(mv_com(
+            w_out,
+            &st.b_proj,
+            (&b.xq, &b.xd),
+            value_dim,
+            c.n_embd,
+        )?);
+        Ok(())
+    }
+
     /// nº de workgroups para cobrir `n` elementos com local_size_x=64.
     pub(crate) fn groups_for(n: usize) -> u32 {
         n.div_ceil(64) as u32
@@ -2211,6 +2762,9 @@ impl<'ctx> ResidentForward<'ctx> {
             let (le, esc): (Vec<Faixa>, Vec<Faixa>) = match op {
                 PlannedOp::Dispatch { le, esc, .. } => (le.clone(), esc.clone()),
                 PlannedOp::Embed => (vec![tudo(&st.embd_stage)], vec![tudo(&st.b_x)]),
+                PlannedOp::Copia { src, dst, bytes } => {
+                    (vec![(*src, 0, *bytes)], vec![(*dst, 0, *bytes)])
+                }
                 // Sem K (o `rope_kv` já o escreveu) a op não toca `b_k` nem o `kcache`, e
                 // aí ela cabe no mesmo grupo do RoPE em vez de exigir barreira.
                 PlannedOp::KvAppend { com_k: true, .. } => (
@@ -2220,6 +2774,19 @@ impl<'ctx> ResidentForward<'ctx> {
                 PlannedOp::KvAppend { com_k: false, .. } => {
                     (vec![tudo(&st.b_v)], vec![tudo(&st.vcache)])
                 }
+                // O cache da cabeça é outro buffer: sem declará-lo aqui, a atenção do
+                // bloco leria o que a cópia ainda não terminou de escrever.
+                PlannedOp::KvAppendMtp => match st.mtp.as_ref() {
+                    Some(m) => (
+                        vec![tudo(&st.b_k), tudo(&st.b_v)],
+                        vec![tudo(&m.kcache), tudo(&m.vcache)],
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                },
+                PlannedOp::CopiaHidden => match st.mtp.as_ref() {
+                    Some(m) => (vec![tudo(&st.b_x)], vec![tudo(&m.b_h)]),
+                    None => (Vec::new(), Vec::new()),
+                },
                 // A op declara as faixas dos **dois** caminhos, inclusive o buffer de
                 // parciais: ele é reusado por todas as camadas de atenção, e sem
                 // declará-lo o planejador deixa a fatia de uma camada sobrescrever o que
@@ -2423,6 +2990,7 @@ impl<'ctx> ResidentForward<'ctx> {
         tokens: &[u32],
         pos: usize,
         x_in: Option<&[f32]>,
+        modo: Modo,
     ) {
         let d = &self.dev.device;
         let st = self
@@ -2432,10 +3000,10 @@ impl<'ctx> ResidentForward<'ctx> {
         let c = &st.cfg;
         let n_tok = tokens.len();
         let total_len = (pos + 1) as u32;
-        let (plan, barreiras) = if n_tok > 1 {
-            (&st.plan_batch, &st.barreiras_batch)
-        } else {
-            (&st.plan, &st.barreiras)
+        let (plan, barreiras) = match modo {
+            Modo::Decode => (&st.plan, &st.barreiras),
+            Modo::Batch => (&st.plan_batch, &st.barreiras_batch),
+            Modo::Verify => (&st.plan_verify, &st.barreiras_verify),
         };
         // Os dois planos são medidos: cada um tem o seu acumulador, porque as listas de
         // ops não se correspondem (`collect_prof` escolhe pelo `n_tok`).
@@ -2512,6 +3080,16 @@ impl<'ctx> ResidentForward<'ctx> {
                         d.cmd_copy_buffer(cmd, st.embd_stage.buffer, st.b_x.buffer, &[region]);
                     }
                 }
+                PlannedOp::Copia { src, dst, bytes } => {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: *bytes,
+                    };
+                    // SAFETY: cmd em gravação; os dois buffers vivem no state, e `bytes`
+                    // é o tamanho do menor deles (fixado na construção do plano).
+                    unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
+                }
                 PlannedOp::KvAppend { slot, com_k } => {
                     // As posições do bloco são consecutivas no cache e `b_k`/`b_v` estão
                     // token-major, então uma cópia cobre os N tokens.
@@ -2532,6 +3110,8 @@ impl<'ctx> ResidentForward<'ctx> {
                         d.cmd_copy_buffer(cmd, st.b_v.buffer, st.vcache.buffer, &[rk]);
                     }
                 }
+                // Só o plano da cabeça MTP as usa — ver `record_mtp`.
+                PlannedOp::KvAppendMtp | PlannedOp::CopiaHidden => {}
                 PlannedOp::Dispatch { .. } => {
                     self.gravar_dispatch(cmd, op, c, pos, total_len, 1, 1);
                 }
@@ -2574,8 +3154,16 @@ impl<'ctx> ResidentForward<'ctx> {
         // próxima GPU.
         // No último shard só o último token do bloco tem logits (ver `build_plan`); nos
         // demais a stream residual sai com um vetor por token.
+        // No verify os dois tokens têm logits: `vocab × 2`, o do primeiro token primeiro.
         let (src, n_out) = if c.shard.is_last() {
-            (&st.b_logits, c.vocab)
+            (
+                &st.b_logits,
+                if modo == Modo::Verify {
+                    c.vocab * VERIFY_TOK
+                } else {
+                    c.vocab
+                },
+            )
         } else {
             (&st.b_x, c.n_embd * n_tok)
         };
@@ -2590,6 +3178,170 @@ impl<'ctx> ResidentForward<'ctx> {
         }
     }
 
+    /// Grava o plano da cabeça MTP em `cmd` (já em `begin`).
+    ///
+    /// `hidden_idx` é qual dos hidden do último passo alimenta a cabeça: 0 depois de um
+    /// decode simples ou de um verify rejeitado, 1 depois de um verify aceito — porque aí
+    /// o token de que se parte veio dos logits do **segundo** token do bloco.
+    fn record_mtp(&self, cmd: vk::CommandBuffer, hidden_idx: usize) {
+        let d = &self.dev.device;
+        let st = self.state.as_ref().expect("record_mtp requer state");
+        let c = &st.cfg;
+        let Some(m) = st.mtp.as_ref() else { return };
+        let pos = *m.len.borrow();
+        let total_len = (pos + 1) as u32;
+
+        for (i, op) in st.mtp_plan.iter().enumerate() {
+            if st.mtp_barreiras.get(i).copied().unwrap_or(true) {
+                self.full_barrier(cmd);
+            }
+            match op {
+                PlannedOp::Dispatch { .. } => {
+                    self.gravar_dispatch(cmd, op, c, pos, total_len, 1, 1);
+                }
+                PlannedOp::Copia { src, dst, bytes } => {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: *bytes,
+                    };
+                    // SAFETY: cmd em gravação; buffers vivos no state.
+                    unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
+                }
+                PlannedOp::CopiaHidden => {
+                    let region = vk::BufferCopy {
+                        src_offset: (hidden_idx * c.n_embd * 4) as vk::DeviceSize,
+                        dst_offset: 0,
+                        size: (c.n_embd * 4) as vk::DeviceSize,
+                    };
+                    // SAFETY: `b_x` cobre `n_embd * n_batch` floats e `hidden_idx` é 0 ou 1.
+                    unsafe { d.cmd_copy_buffer(cmd, st.b_x.buffer, m.b_h.buffer, &[region]) };
+                }
+                PlannedOp::KvAppendMtp => {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: (pos * c.kv_dim * 4) as vk::DeviceSize,
+                        size: (c.kv_dim * 4) as vk::DeviceSize,
+                    };
+                    // SAFETY: o cache do bloco tem `ctx` posições e `pos < ctx` (conferido
+                    // em `propor_mtp`).
+                    unsafe {
+                        d.cmd_copy_buffer(cmd, st.b_k.buffer, m.kcache.buffer, &[region]);
+                        d.cmd_copy_buffer(cmd, st.b_v.buffer, m.vcache.buffer, &[region]);
+                    }
+                }
+                PlannedOp::Atencao {
+                    curto,
+                    split,
+                    reduce,
+                } => {
+                    let n_split = splits_do_kv(total_len);
+                    if n_split <= 1 {
+                        self.gravar_dispatch(cmd, curto, c, pos, total_len, 1, 1);
+                    } else {
+                        self.gravar_dispatch(cmd, split, c, pos, total_len, n_split, n_split);
+                        self.full_barrier(cmd);
+                        self.gravar_dispatch(cmd, reduce, c, pos, total_len, 1, n_split);
+                    }
+                }
+                // O plano da cabeça não faz embedding lookup nem toca no KV do modelo.
+                PlannedOp::Embed | PlannedOp::KvAppend { .. } => {}
+            }
+        }
+        self.full_barrier(cmd);
+        let region = vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: (c.vocab * 4) as vk::DeviceSize,
+        };
+        // SAFETY: cmd em gravação; `logits_host` tem pelo menos `vocab` floats.
+        unsafe {
+            d.cmd_copy_buffer(cmd, st.b_logits.buffer, st.logits_host.buffer, &[region]);
+        }
+    }
+
+    /// A linha de embedding de `token`, quando este shard carrega a tabela (o primeiro).
+    pub fn linha_embd(&self, token: u32) -> Option<&[f32]> {
+        let st = self.state.as_ref()?;
+        let row = token as usize * st.cfg.n_embd;
+        st.token_embd.get(row..row + st.cfg.n_embd)
+    }
+
+    /// Propõe o token seguinte com a cabeça MTP residente.
+    ///
+    /// `emb` é a linha crua da tabela de embedding do token já amostrado (o shard que tem
+    /// a tabela é o primeiro, e a cabeça mora no último — daí ela vir de fora, 20 KB por
+    /// passo). `hidden_idx` escolhe qual hidden do último passo alimenta a cabeça.
+    ///
+    /// O contador de posições do bloco anda **um por proposta**, como a referência de CPU
+    /// `MtpHead::propor`: o KV-cache da cabeça é dela, não acompanha o do modelo.
+    pub fn propor_mtp(&self, emb: &[f32], hidden_idx: usize) -> Result<u32, MatmulError> {
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let faltando = || MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        let m = st.mtp.as_ref().ok_or_else(faltando)?;
+        if st.mtp_plan.is_empty() || emb.len() != st.cfg.n_embd || *m.len.borrow() >= st.cfg.ctx {
+            return Err(faltando());
+        }
+        let d = &self.dev.device;
+        let bytes = (st.cfg.n_embd * 4) as vk::DeviceSize;
+        // SAFETY: `emb_stage` é host-visible/coherent com `n_embd` floats.
+        unsafe {
+            let ptr = d.map_memory(m.emb_stage.mem, 0, bytes, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(emb.as_ptr(), ptr.cast::<f32>(), st.cfg.n_embd);
+            d.unmap_memory(m.emb_stage.mem);
+        }
+
+        let cmd = st.token_cmd;
+        // SAFETY: pool com RESET_COMMAND_BUFFER; o fence do passo anterior já foi aguardado.
+        unsafe {
+            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            d.begin_command_buffer(cmd, &begin)?;
+        }
+        self.record_mtp(cmd, hidden_idx);
+        let submit = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        // SAFETY: cmd em gravação, fence resetado antes do submit.
+        unsafe {
+            d.end_command_buffer(cmd)?;
+            d.reset_fences(&[st.token_fence])?;
+            d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
+        }
+        self.espera_fence(st)?;
+        *m.len.borrow_mut() += 1;
+
+        // Argmax no host, sobre o mapa persistente de `logits_host`. A cabeça é greedy por
+        // construção: ela propõe um candidato, e quem decide é a verificação.
+        // SAFETY: host-coherent, a cópia terminou (fence aguardado) e o mapa cobre `vocab`.
+        let logits =
+            unsafe { std::slice::from_raw_parts(st.logits_ptr.cast::<f32>(), st.cfg.vocab) };
+        let mut melhor = 0usize;
+        let mut valor = f32::NEG_INFINITY;
+        for (i, &x) in logits.iter().enumerate() {
+            if x > valor {
+                valor = x;
+                melhor = i;
+            }
+        }
+        u32::try_from(melhor).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))
+    }
+
+    /// Se este shard carrega a cabeça MTP residente.
+    pub fn tem_mtp(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|st| !st.mtp_plan.is_empty())
+    }
+
     pub(crate) fn pipe_of(&self, id: PipeId) -> &ComputePipeline {
         match id {
             PipeId::Matvec => &self.matvec,
@@ -2600,6 +3352,10 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MatvecQ5KB => &self.matvec_q5k_b,
             PipeId::MatvecQ6KB => &self.matvec_q6k_b,
             PipeId::MatvecQ4KB => &self.matvec_q4k_b,
+            PipeId::MatvecV => &self.matvec_v,
+            PipeId::MatvecQ5KV => &self.matvec_q5k_v,
+            PipeId::MatvecQ6KV => &self.matvec_q6k_v,
+            PipeId::MatvecQ4KV => &self.matvec_q4k_v,
             PipeId::DeltaNet => &self.delta_net,
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
@@ -2662,15 +3418,84 @@ impl<'ctx> ResidentForward<'ctx> {
     /// O que sobra são as ops com estado (`dn_conv`, `delta_net`) e as que indexam peso
     /// pela cabeça (`dn_gates`): essas viram N dispatches com os bindings deslocados,
     /// executados em ordem.
-    fn build_plan(&self, n_tok: usize) -> Result<Vec<PlannedOp>, MatmulError> {
+    /// Fecha um dispatch do plano: aloca e escreve o descriptor set (os bindings são fixos
+    /// entre passos) e deriva de `PipeId::acessos` as faixas que `marcar_barreiras` lê.
+    fn mk_op(
+        &self,
+        pipe: PipeId,
+        binds: &[(vk::Buffer, vk::DeviceSize, vk::DeviceSize)],
+        groups: u32,
+        push: PushSpec,
+    ) -> Result<PlannedOp, MatmulError> {
+        let d = &self.dev.device;
+        let set = self.alloc_set(self.pipe_of(pipe))?;
+        let buf_infos: Vec<vk::DescriptorBufferInfo> = binds
+            .iter()
+            .map(|&(buffer, offset, range)| vk::DescriptorBufferInfo {
+                buffer,
+                offset,
+                range,
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = buf_infos
+            .iter()
+            .enumerate()
+            .map(|(b, bi)| vk::WriteDescriptorSet {
+                dst_set: set,
+                dst_binding: b as u32,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                p_buffer_info: bi,
+                ..Default::default()
+            })
+            .collect();
+        // SAFETY: d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
+        unsafe { d.update_descriptor_sets(&writes, &[]) };
+        let (le_idx, esc_idx) = pipe.acessos();
+        let faixas = |idx: &[usize]| -> Vec<Faixa> {
+            idx.iter().filter_map(|&i| binds.get(i).copied()).collect()
+        };
+        let le = faixas(le_idx);
+        // Bytes lidos por dispatch, para a coluna `GB/s` do perfil: a soma das faixas de
+        // leitura, descontando o mesmo binding ligado duas vezes (o matvec repete `xd`
+        // nos bindings 2 e 4). É aproximação **por cima** — a faixa é o binding inteiro,
+        // não o que o shader de fato toca —, e por isso a atenção fica de fora: ela liga
+        // o KV-cache inteiro e lê só `total_len` posições, número que só existe na
+        // gravação do command buffer. Nos matvec, que são 77% do token, o peso domina a
+        // soma e o erro da ativação fica abaixo de 0,1%.
+        let bytes = match pipe {
+            PipeId::Attention | PipeId::AttentionSplit | PipeId::AttnReduce => 0,
+            _ => {
+                let mut vistas: Vec<Faixa> = Vec::with_capacity(le.len());
+                for f in &le {
+                    if !vistas.contains(f) {
+                        vistas.push(*f);
+                    }
+                }
+                vistas.iter().map(|f| f.2).sum()
+            }
+        };
+        Ok(PlannedOp::Dispatch {
+            pipe,
+            set,
+            groups,
+            groups_y: 1,
+            push,
+            le,
+            esc: faixas(esc_idx),
+            bytes,
+        })
+    }
+
+    fn build_plan(&self, modo: Modo) -> Result<Vec<PlannedOp>, MatmulError> {
         use crate::pipeline::PushConstants;
-        let nt = u32::try_from(n_tok).unwrap_or(1);
         let st = self
             .state
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
         let c = &st.cfg;
-        let d = &self.dev.device;
+        let n_tok = modo.n_tok(c);
+        let nt = u32::try_from(n_tok).unwrap_or(1);
         let mut plan = Vec::new();
 
         let n_push = |n: usize| -> Vec<u8> {
@@ -2704,7 +3529,7 @@ impl<'ctx> ResidentForward<'ctx> {
         // dispatch cobrindo uma fração das linhas: o kernel ficava mais rápido por não
         // fazer o trabalho (erro de 85% nos logits, pego pelo teste do prefill).
         let rows_q5k = {
-            let (wg, rows) = if n_tok > 1 {
+            let (wg, rows) = if modo == Modo::Batch && n_tok > 1 {
                 matvec_geom_batch()
             } else {
                 matvec_geom()
@@ -2740,63 +3565,7 @@ impl<'ctx> ResidentForward<'ctx> {
                   groups: u32,
                   push: PushSpec|
          -> Result<PlannedOp, MatmulError> {
-            let set = self.alloc_set(self.pipe_of(pipe))?;
-            let buf_infos: Vec<vk::DescriptorBufferInfo> = binds
-                .iter()
-                .map(|&(buffer, offset, range)| vk::DescriptorBufferInfo {
-                    buffer,
-                    offset,
-                    range,
-                })
-                .collect();
-            let writes: Vec<vk::WriteDescriptorSet> = buf_infos
-                .iter()
-                .enumerate()
-                .map(|(b, bi)| vk::WriteDescriptorSet {
-                    dst_set: set,
-                    dst_binding: b as u32,
-                    descriptor_count: 1,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                    p_buffer_info: bi,
-                    ..Default::default()
-                })
-                .collect();
-            // SAFETY: d válido; writes apontam para buf_infos vivos; set nunca em uso durante o build.
-            unsafe { d.update_descriptor_sets(&writes, &[]) };
-            let (le_idx, esc_idx) = pipe.acessos();
-            let faixas = |idx: &[usize]| -> Vec<Faixa> {
-                idx.iter().filter_map(|&i| binds.get(i).copied()).collect()
-            };
-            let le = faixas(le_idx);
-            // Bytes lidos por dispatch, para a coluna `GB/s` do perfil: a soma das faixas de
-            // leitura, descontando o mesmo binding ligado duas vezes (o matvec repete `xd`
-            // nos bindings 2 e 4). É aproximação **por cima** — a faixa é o binding inteiro,
-            // não o que o shader de fato toca —, e por isso a atenção fica de fora: ela liga
-            // o KV-cache inteiro e lê só `total_len` posições, número que só existe na
-            // gravação do command buffer. Nos matvec, que são 77% do token, o peso domina a
-            // soma e o erro da ativação fica abaixo de 0,1%.
-            let bytes = match pipe {
-                PipeId::Attention | PipeId::AttentionSplit | PipeId::AttnReduce => 0,
-                _ => {
-                    let mut vistas: Vec<Faixa> = Vec::with_capacity(le.len());
-                    for f in &le {
-                        if !vistas.contains(f) {
-                            vistas.push(*f);
-                        }
-                    }
-                    vistas.iter().map(|f| f.2).sum()
-                }
-            };
-            Ok(PlannedOp::Dispatch {
-                pipe,
-                set,
-                groups,
-                groups_y: 1,
-                push,
-                le,
-                esc: faixas(esc_idx),
-                bytes,
-            })
+            self.mk_op(pipe, binds, groups, push)
         };
 
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
@@ -2820,40 +3589,49 @@ impl<'ctx> ResidentForward<'ctx> {
                       n_out: usize|
          -> Result<PlannedOp, MatmulError> {
             let (xq, xd) = ativ;
-            let batch = cols > 1;
+            // `COLS` é specialization constant, então cada largura é um trio de pipelines
+            // próprio. A escolha é pelo **modo do plano**, não por `cols`: com
+            // `LLAMA_RS_BATCH=2` as larguras do prefill e do verify coincidem mas as
+            // geometrias não, e usar a pipeline errada faz o dispatch cobrir uma fração
+            // das linhas de saída — em silêncio.
+            let largura = match modo {
+                _ if cols <= 1 => Modo::Decode,
+                Modo::Verify => Modo::Verify,
+                _ => Modo::Batch,
+            };
             // A ativação é lida uma vez para todas as linhas do wave; quantas linhas cada
             // workgroup cobre sai de `matvec_geom` (Q5_K/Q4_K) ou da geometria fixa dos
             // shaders Q8_0 e Q6_K.
             let (pipe, rows_por_wg) = match w.ty {
                 gguf::GgmlType::Q8_0 => (
-                    if batch {
-                        PipeId::MatvecB
-                    } else {
-                        PipeId::Matvec
+                    match largura {
+                        Modo::Decode => PipeId::Matvec,
+                        Modo::Batch => PipeId::MatvecB,
+                        Modo::Verify => PipeId::MatvecV,
                     },
                     MATVEC_NUM_ROWS as usize,
                 ),
                 gguf::GgmlType::Q5_K => (
-                    if batch {
-                        PipeId::MatvecQ5KB
-                    } else {
-                        PipeId::MatvecQ5K
+                    match largura {
+                        Modo::Decode => PipeId::MatvecQ5K,
+                        Modo::Batch => PipeId::MatvecQ5KB,
+                        Modo::Verify => PipeId::MatvecQ5KV,
                     },
                     rows_q5k,
                 ),
                 gguf::GgmlType::Q4_K => (
-                    if batch {
-                        PipeId::MatvecQ4KB
-                    } else {
-                        PipeId::MatvecQ4K
+                    match largura {
+                        Modo::Decode => PipeId::MatvecQ4K,
+                        Modo::Batch => PipeId::MatvecQ4KB,
+                        Modo::Verify => PipeId::MatvecQ4KV,
                     },
                     rows_q5k,
                 ),
                 _ => (
-                    if batch {
-                        PipeId::MatvecQ6KB
-                    } else {
-                        PipeId::MatvecQ6K
+                    match largura {
+                        Modo::Decode => PipeId::MatvecQ6K,
+                        Modo::Batch => PipeId::MatvecQ6KB,
+                        Modo::Verify => PipeId::MatvecQ6KV,
                     },
                     8,
                 ),
@@ -2968,17 +3746,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 ssm_out,
             } = &lq.mixer
             {
-                Self::plano_delta(
-                    &mut plan,
-                    st,
-                    la,
-                    c,
-                    n_tok,
-                    (attn_qkv, attn_gate, ssm_out),
-                    &mk,
-                    &mv,
-                    &mv_com,
-                )?;
+                let pesos = (attn_qkv, attn_gate, ssm_out);
+                if modo == Modo::Verify {
+                    Self::plano_delta_verify(&mut plan, st, la, c, pesos, &mk, &mv, &mv_com)?;
+                } else {
+                    Self::plano_delta(&mut plan, st, la, c, n_tok, pesos, &mk, &mv, &mv_com)?;
+                }
             }
             if !eh_delta {
                 let (w_q, w_k, w_v, w_o) = match &lq.mixer {
@@ -3243,6 +4016,23 @@ impl<'ctx> ResidentForward<'ctx> {
             // prefill só o **último** token do bloco tem logits que interessam: os outros
             // já estão no KV-cache. Então requantiza esse token no início de `b_xq`/`b_xd`
             // e roda a projeção com COLS=1 — vocab × (n_tok-1) linhas de saída a menos.
+            //
+            // O verify é o oposto: precisa dos logits dos **dois** tokens (do primeiro sai
+            // a decisão de aceitar, do segundo o token seguinte). E não precisa
+            // requantizar nada — o `norm_p2` já deixou os dois em `b_xq`/`b_xd` no layout
+            // que o matvec de COLS=2 lê (`t * n_blk + b`). O custo é uma leitura do peso
+            // Q6_K de 0,63 GB para as duas colunas, não duas leituras.
+            if modo == Modo::Verify {
+                plan.push(mv_gen(
+                    &st.output_w,
+                    &st.b_logits,
+                    (&st.b_xq, &st.b_xd),
+                    VERIFY_TOK,
+                    c.n_embd,
+                    c.vocab,
+                )?);
+                return Ok(plan);
+            }
             if n_tok > 1 {
                 plan.push(mk(
                     PipeId::QuantizeX,
@@ -3280,10 +4070,392 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(plan)
     }
 
+    /// Plano da cabeça de multi-token prediction. Vazio quando o shard não tem o bloco.
+    ///
+    /// Não há op nova aqui: é o prólogo (`enorm`/`hnorm`/`eh_proj`) mais **uma camada de
+    /// atenção do qwen35 inteira**, a norma final do bloco e a projeção de vocabulário
+    /// compartilhada. A concatenação `[enorm(emb) ; hnorm(h)]` é só binding com offset —
+    /// as duas normas escrevem nos offsets 0 e `n_embd` do mesmo buffer.
+    ///
+    /// Quase tudo é emprestado do plano principal, porque a cabeça roda **entre** dois
+    /// passos: a GPU está ociosa e os logits do passo anterior já voltaram ao host.
+    #[allow(clippy::too_many_lines)]
+    fn build_plan_mtp(&self) -> Result<Vec<PlannedOp>, MatmulError> {
+        use crate::pipeline::PushConstants;
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let Some(m) = st.mtp.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let c = &st.cfg;
+        let hib = c.delta_net.is_some();
+        let attn_dim = if hib { c.head_dim * c.n_head } else { c.n_embd };
+        let q_out = if hib { attn_dim * 2 } else { c.n_embd };
+        let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let u = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let rows_kq = {
+            let (wg, rows) = matvec_geom();
+            (wg / 64 * rows) as usize
+        };
+        let mut plan = Vec::new();
+
+        // Matvec de uma coluna, com o destino podendo cair no meio do buffer (é assim que
+        // a concatenação do prólogo se resolve).
+        let mv = |w: &QWeight,
+                  ativ: (&Buf, &Buf),
+                  dst: &Buf,
+                  dst_off: usize,
+                  n_in: usize,
+                  n_out: usize|
+         -> Result<PlannedOp, MatmulError> {
+            let (xq, xd) = ativ;
+            let (pipe, rows_por_wg) = match w.ty {
+                gguf::GgmlType::Q8_0 => (PipeId::Matvec, MATVEC_NUM_ROWS as usize),
+                gguf::GgmlType::Q5_K => (PipeId::MatvecQ5K, rows_kq),
+                gguf::GgmlType::Q4_K => (PipeId::MatvecQ4K, rows_kq),
+                _ => (PipeId::MatvecQ6K, 8),
+            };
+            let p = PushConstants {
+                n_in: u(n_in),
+                n_out: u(n_out),
+                row_offset: 0,
+                tem_bias: 0,
+            };
+            // SAFETY: PushConstants é #[repr(C)] de 4 u32; lemos exatamente o seu tamanho.
+            let push = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::from_ref(&p).cast::<u8>(),
+                    std::mem::size_of::<PushConstants>(),
+                )
+            }
+            .to_vec();
+            self.mk_op(
+                pipe,
+                &[
+                    (w.gpu.buffer, 0, w.gpu.size_bytes),
+                    (xq.buffer, 0, xq.size),
+                    (xd.buffer, 0, xd.size),
+                    (dst.buffer, nb(dst_off), nb(n_out)),
+                    (xd.buffer, 0, xd.size),
+                ],
+                u(n_out.div_ceil(rows_por_wg)),
+                PushSpec::Static(push),
+            )
+        };
+
+        let np1_wg = ((c.n_embd as u32).div_ceil(256)).clamp(1, NORM_P1_WG);
+        // As duas ops da norma, com origem e destino escolhidos pelo chamador: no prólogo
+        // a saída cai num offset de `b_eh`, no resto da camada é `b_normed` do modelo.
+        let norma = |x: &Buf,
+                     r: &Buf,
+                     w: &Buf,
+                     tem_residual: bool,
+                     out: &Buf,
+                     out_off: usize|
+         -> Result<[PlannedOp; 2], MatmulError> {
+            let mut p1 = Vec::with_capacity(8);
+            p1.extend_from_slice(&u(c.n_embd).to_le_bytes());
+            p1.extend_from_slice(&u32::from(tem_residual).to_le_bytes());
+            let mut p2 = Vec::with_capacity(12);
+            p2.extend_from_slice(&u(c.n_embd).to_le_bytes());
+            p2.extend_from_slice(&c.rms_eps.to_le_bytes());
+            p2.extend_from_slice(&np1_wg.to_le_bytes());
+            Ok([
+                self.mk_op(
+                    PipeId::NormFused,
+                    &[
+                        (x.buffer, 0, nb(c.n_embd)),
+                        (r.buffer, 0, nb(c.n_embd)),
+                        (st.b_parciais.buffer, 0, st.b_parciais.size),
+                    ],
+                    np1_wg,
+                    PushSpec::Static(p1),
+                )?,
+                self.mk_op(
+                    PipeId::NormP2,
+                    &[
+                        (x.buffer, 0, nb(c.n_embd)),
+                        (w.buffer, 0, w.size),
+                        (st.b_parciais.buffer, 0, st.b_parciais.size),
+                        (out.buffer, nb(out_off), nb(c.n_embd)),
+                        (st.b_xq.buffer, 0, st.b_xq.size),
+                        (st.b_xd.buffer, 0, st.b_xd.size),
+                    ],
+                    ((c.n_embd / 32) as u32).div_ceil(64),
+                    PushSpec::Static(p2),
+                )?,
+            ])
+        };
+        let quantiza = |src: &Buf, n: usize| -> Result<PlannedOp, MatmulError> {
+            let p: [u32; 3] = [u(n), 0, 0];
+            // SAFETY: três u32 contíguos; 12 bytes é o push range da pipeline.
+            let push = unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), 12) }.to_vec();
+            self.mk_op(
+                PipeId::QuantizeX,
+                &[
+                    (src.buffer, 0, nb(n)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                ((n / 32) as u32).div_ceil(64),
+                PushSpec::Static(push),
+            )
+        };
+
+        // 1. Prólogo: as duas normas escrevendo nas duas metades de `b_eh`.
+        plan.push(PlannedOp::Copia {
+            src: m.emb_stage.buffer,
+            dst: m.b_emb.buffer,
+            bytes: nb(c.n_embd),
+        });
+        plan.push(PlannedOp::CopiaHidden);
+        plan.extend(norma(&m.b_emb, &m.b_emb, &m.enorm, false, &m.b_eh, 0)?);
+        plan.extend(norma(&m.b_h, &m.b_h, &m.hnorm, false, &m.b_eh, c.n_embd)?);
+        // A quantização do `norm_p2` valeu só para metade do vetor de cada vez; o
+        // `eh_proj` consome os `2 * n_embd` de uma vez.
+        plan.push(quantiza(&m.b_eh, c.n_embd * 2)?);
+        plan.push(mv(
+            &m.eh_proj,
+            (&st.b_xq, &st.b_xd),
+            &m.b_x,
+            0,
+            c.n_embd * 2,
+            c.n_embd,
+        )?);
+
+        // 2. A camada de decoder do bloco — atenção, não delta-net (ver `MtpBufs`).
+        plan.extend(norma(
+            &m.b_x,
+            &m.b_ffn,
+            &m.attn_norm,
+            false,
+            &st.b_normed,
+            0,
+        )?);
+        plan.push(mv(
+            &m.attn_q,
+            (&st.b_xq, &st.b_xd),
+            &st.b_q,
+            0,
+            c.n_embd,
+            q_out,
+        )?);
+        plan.push(mv(
+            &m.attn_k,
+            (&st.b_xq, &st.b_xd),
+            &st.b_k,
+            0,
+            c.n_embd,
+            c.kv_dim,
+        )?);
+        plan.push(mv(
+            &m.attn_v,
+            (&st.b_xq, &st.b_xd),
+            &st.b_v,
+            0,
+            c.n_embd,
+            c.kv_dim,
+        )?);
+        if let (Some(qn), Some(kn)) = (&m.q_norm, &m.k_norm) {
+            let push_qk = |n_heads: usize, stride: usize| {
+                let mut v = Vec::with_capacity(20);
+                v.extend_from_slice(&u(c.head_dim).to_le_bytes());
+                v.extend_from_slice(&u(n_heads).to_le_bytes());
+                v.extend_from_slice(&2u32.to_le_bytes()); // modo QK-norm
+                v.extend_from_slice(&c.rms_eps.to_le_bytes());
+                v.extend_from_slice(&u(stride).to_le_bytes());
+                v
+            };
+            // No Q as cabeças estão espaçadas de 2 × head_dim: o portão mora ao lado.
+            plan.push(self.mk_op(
+                PipeId::DnNorm,
+                &[
+                    (st.b_q.buffer, 0, nb(q_out)),
+                    (qn.buffer, 0, qn.size),
+                    (st.b_q.buffer, 0, nb(q_out)),
+                    (st.b_q.buffer, 0, nb(q_out)),
+                ],
+                u(c.n_head),
+                PushSpec::Static(push_qk(c.n_head, c.head_dim * 2)),
+            )?);
+            plan.push(self.mk_op(
+                PipeId::DnNorm,
+                &[
+                    (st.b_k.buffer, 0, nb(c.kv_dim)),
+                    (kn.buffer, 0, kn.size),
+                    (st.b_k.buffer, 0, nb(c.kv_dim)),
+                    (st.b_k.buffer, 0, nb(c.kv_dim)),
+                ],
+                u(c.n_head_kv),
+                PushSpec::Static(push_qk(c.n_head_kv, c.head_dim)),
+            )?);
+        }
+        // RoPE in-place nos dois, e a cópia para o cache do bloco logo depois. A cabeça
+        // não usa o `rope_kv`: são 4 KB por proposta, e assim o plano não depende do knob.
+        plan.push(self.mk_op(
+            PipeId::Rope,
+            &[
+                (st.b_q.buffer, 0, nb(q_out)),
+                (st.freq_buf.buffer, 0, st.freq_buf.size),
+            ],
+            Self::groups_for(c.n_head * (c.rope_dim / 2)),
+            PushSpec::Rope {
+                n_head: u(c.n_head),
+                stride: u(if hib { c.head_dim * 2 } else { c.head_dim }),
+            },
+        )?);
+        plan.push(self.mk_op(
+            PipeId::Rope,
+            &[
+                (st.b_k.buffer, 0, nb(c.kv_dim)),
+                (st.freq_buf.buffer, 0, st.freq_buf.size),
+            ],
+            Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
+            PushSpec::Rope {
+                n_head: u(c.n_head_kv),
+                stride: u(c.head_dim),
+            },
+        )?);
+        plan.push(PlannedOp::KvAppendMtp);
+        let attn_push = PushSpec::Attention { kv_layer_off: 0 };
+        plan.push(PlannedOp::Atencao {
+            curto: Box::new(self.mk_op(
+                PipeId::Attention,
+                &[
+                    (st.b_q.buffer, 0, nb(q_out)),
+                    (m.kcache.buffer, 0, m.kcache.size),
+                    (m.vcache.buffer, 0, m.vcache.size),
+                    (st.b_attn.buffer, 0, nb(attn_dim)),
+                ],
+                u(c.n_head),
+                attn_push,
+            )?),
+            split: Box::new(self.mk_op(
+                PipeId::AttentionSplit,
+                &[
+                    (st.b_q.buffer, 0, nb(q_out)),
+                    (m.kcache.buffer, 0, m.kcache.size),
+                    (m.vcache.buffer, 0, m.vcache.size),
+                    (st.b_attn_split.buffer, 0, st.b_attn_split.size),
+                ],
+                u(c.n_head),
+                PushSpec::Attention { kv_layer_off: 0 },
+            )?),
+            reduce: Box::new(self.mk_op(
+                PipeId::AttnReduce,
+                &[
+                    (st.b_attn_split.buffer, 0, st.b_attn_split.size),
+                    (st.b_attn.buffer, 0, nb(attn_dim)),
+                ],
+                u(c.n_head),
+                PushSpec::AttnReduce,
+            )?),
+        });
+        if hib {
+            let mut pg = Vec::with_capacity(8);
+            pg.extend_from_slice(&u(attn_dim).to_le_bytes());
+            pg.extend_from_slice(&u(c.head_dim).to_le_bytes());
+            plan.push(self.mk_op(
+                PipeId::GateQuant,
+                &[
+                    (st.b_attn.buffer, 0, nb(attn_dim)),
+                    (st.b_q.buffer, 0, nb(q_out)),
+                    (st.b_xq.buffer, 0, st.b_xq.size),
+                    (st.b_xd.buffer, 0, st.b_xd.size),
+                ],
+                ((attn_dim / 32) as u32).div_ceil(64),
+                PushSpec::Static(pg),
+            )?);
+        } else {
+            plan.push(quantiza(&st.b_attn, attn_dim)?);
+        }
+        plan.push(mv(
+            &m.attn_output,
+            (&st.b_xq, &st.b_xd),
+            &st.b_proj,
+            0,
+            attn_dim,
+            c.n_embd,
+        )?);
+
+        // 3. FFN, com o residual do mixer absorvido pela norma (como no plano principal).
+        plan.extend(norma(
+            &m.b_x,
+            &st.b_proj,
+            &m.ffn_norm,
+            true,
+            &st.b_normed,
+            0,
+        )?);
+        plan.push(mv(
+            &m.ffn_gate,
+            (&st.b_xq, &st.b_xd),
+            &st.b_gate,
+            0,
+            c.n_embd,
+            c.n_ff,
+        )?);
+        plan.push(mv(
+            &m.ffn_up,
+            (&st.b_xq, &st.b_xd),
+            &st.b_up,
+            0,
+            c.n_embd,
+            c.n_ff,
+        )?);
+        plan.push(self.mk_op(
+            PipeId::SwigluQuant,
+            &[
+                (st.b_gate.buffer, 0, nb(c.n_ff)),
+                (st.b_up.buffer, 0, nb(c.n_ff)),
+                (st.b_act.buffer, 0, nb(c.n_ff)),
+                (st.b_xq.buffer, 0, st.b_xq.size),
+                (st.b_xd.buffer, 0, st.b_xd.size),
+            ],
+            ((c.n_ff / 32) as u32).div_ceil(64),
+            PushSpec::Static(u(c.n_ff).to_le_bytes().to_vec()),
+        )?);
+        plan.push(mv(
+            &m.ffn_down,
+            (&st.b_xq, &st.b_xd),
+            &m.b_ffn,
+            0,
+            c.n_ff,
+            c.n_embd,
+        )?);
+
+        // 4. Norma final do bloco (faz o papel do `output_norm`) e projeção de vocabulário.
+        //    O GGUF do 27B não traz `nextn.shared_head.head`: a projeção é a `output.weight`
+        //    do modelo, compartilhada — é o mesmo fallback do llama.cpp.
+        plan.extend(norma(
+            &m.b_x,
+            &m.b_ffn,
+            &m.shared_head_norm,
+            true,
+            &st.b_normed,
+            0,
+        )?);
+        plan.push(mv(
+            &st.output_w,
+            (&st.b_xq, &st.b_xd),
+            &st.b_logits,
+            0,
+            c.n_embd,
+            c.vocab,
+        )?);
+        Ok(plan)
+    }
+
     /// Lê os timestamps do token e acumula o tempo de GPU por op. No-op sem profiling.
-    fn collect_prof(&self, st: &ResidentState, n_tok: usize) -> Result<(), MatmulError> {
+    fn collect_prof(&self, st: &ResidentState, modo: Modo) -> Result<(), MatmulError> {
         let Some(pf) = &st.prof else { return Ok(()) };
-        let plano = if n_tok > 1 { &st.plan_batch } else { &st.plan };
+        let plano = match modo {
+            Modo::Decode => &st.plan,
+            Modo::Batch => &st.plan_batch,
+            Modo::Verify => &st.plan_verify,
+        };
         let n = plano.len() + 1;
         let mut ticks = vec![0u64; n];
         // SAFETY: pool tem >= n slots, todos escritos neste command buffer já concluído.
@@ -3295,10 +4467,10 @@ impl<'ctx> ResidentForward<'ctx> {
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )?;
         }
-        let mut accum = if n_tok > 1 {
-            pf.accum_batch.borrow_mut()
-        } else {
-            pf.accum.borrow_mut()
+        let mut accum = match modo {
+            Modo::Decode => pf.accum.borrow_mut(),
+            Modo::Batch => pf.accum_batch.borrow_mut(),
+            Modo::Verify => pf.accum_verify.borrow_mut(),
         };
         if accum.len() < n - 1 {
             accum.resize(n - 1, 0);
@@ -3310,16 +4482,16 @@ impl<'ctx> ResidentForward<'ctx> {
             accum[i] += ns;
         }
         drop(accum);
-        if n_tok > 1 {
-            pf.blocos.set(pf.blocos.get() + 1);
-        } else {
-            pf.tokens.set(pf.tokens.get() + 1);
+        match modo {
+            Modo::Decode => pf.tokens.set(pf.tokens.get() + 1),
+            Modo::Batch => pf.blocos.set(pf.blocos.get() + 1),
+            Modo::Verify => pf.verifies.set(pf.verifies.get() + 1),
         }
 
         // Zonas absolutas para a timeline. O fence acabou de ser aguardado, então `agora`
         // é o instante do ÚLTIMO timestamp — dá para ancorar o token inteiro sem submit
         // extra nem VK_EXT_calibrated_timestamps, e sem drift acumulado entre tokens.
-        if n_tok == 1 && pf.tokens.get() <= pf.max_trace_tokens {
+        if modo == Modo::Decode && pf.tokens.get() <= pf.max_trace_tokens {
             let now = std::time::Instant::now();
             let last = ticks[n - 1];
             let at = |tick: u64| -> std::time::Instant {
@@ -3329,12 +4501,8 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             let mut spans = pf.spans.borrow_mut();
             for i in 0..n - 1 {
-                let name = match plano.get(i) {
-                    Some(PlannedOp::Dispatch { pipe, .. }) => pipe.label(),
-                    Some(PlannedOp::Embed) => "embed",
-                    Some(PlannedOp::KvAppend { .. }) => "kv_append",
-                    Some(PlannedOp::Atencao { .. }) => "attention",
-                    None => continue,
+                let Some(name) = plano.get(i).map(PlannedOp::label) else {
+                    continue;
                 };
                 spans.push(GpuSpan {
                     name,
@@ -3367,18 +4535,19 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(st) = self.state.as_ref() else {
             return;
         };
-        self.perfil_de(st, false);
-        self.perfil_de(st, true);
+        self.perfil_de(st, Modo::Decode);
+        self.perfil_de(st, Modo::Batch);
+        self.perfil_de(st, Modo::Verify);
     }
 
-    /// Uma tabela do perfil: `bloco` escolhe entre o plano do prefill e o do decode.
+    /// Uma tabela do perfil, uma por plano. Não imprime nada se o plano nunca rodou.
     #[allow(clippy::cast_precision_loss)]
-    fn perfil_de(&self, st: &ResidentState, bloco: bool) {
+    fn perfil_de(&self, st: &ResidentState, modo: Modo) {
         let Some(pf) = &st.prof else { return };
-        let (plano, accum, passos) = if bloco {
-            (&st.plan_batch, pf.accum_batch.borrow(), pf.blocos.get())
-        } else {
-            (&st.plan, pf.accum.borrow(), pf.tokens.get())
+        let (plano, accum, passos) = match modo {
+            Modo::Decode => (&st.plan, pf.accum.borrow(), pf.tokens.get()),
+            Modo::Batch => (&st.plan_batch, pf.accum_batch.borrow(), pf.blocos.get()),
+            Modo::Verify => (&st.plan_verify, pf.accum_verify.borrow(), pf.verifies.get()),
         };
         if passos == 0 || accum.is_empty() {
             return;
@@ -3389,15 +4558,14 @@ impl<'ctx> ResidentForward<'ctx> {
         let mut por_tipo: std::collections::BTreeMap<&'static str, (u64, usize, u64)> =
             std::collections::BTreeMap::new();
         for (i, &ns) in accum.iter().enumerate() {
-            let (label, bytes) = match plano.get(i) {
-                Some(PlannedOp::Dispatch { pipe, bytes, .. }) => (pipe.label(), *bytes),
-                // As cópias e a atenção não trazem contagem de bytes — ver `bytes` em
-                // `build_plan`.
-                Some(PlannedOp::Embed) => ("embed", 0),
-                Some(PlannedOp::KvAppend { .. }) => ("kv_append", 0),
-                Some(PlannedOp::Atencao { .. }) => ("attention", 0),
-                None => continue,
+            let Some(op) = plano.get(i) else { continue };
+            // As cópias e a atenção não trazem contagem de bytes — ver `bytes` em
+            // `build_plan`.
+            let bytes = match op {
+                PlannedOp::Dispatch { bytes, .. } => *bytes,
+                _ => 0,
             };
+            let label = op.label();
             let e = por_tipo.entry(label).or_insert((0, 0, 0));
             e.0 += ns;
             e.1 += 1;
@@ -3409,14 +4577,16 @@ impl<'ctx> ResidentForward<'ctx> {
         let ms = |ns: u64| ns as f64 / 1e6 / tokens as f64;
         // 1 byte/ns == 1 GB/s: os bytes são por passo e `ns` é a soma de `tokens` passos.
         let gbs = |bytes: u64, ns: u64| bytes as f64 * tokens as f64 / ns.max(1) as f64;
-        let unidade = if bloco { "blocos" } else { "tokens" };
-        let por = if bloco { "ms/bloco" } else { "ms/token" };
+        let (unidade, por, nome) = match modo {
+            Modo::Decode => ("tokens", "ms/token", "decode"),
+            Modo::Batch => ("blocos", "ms/bloco", "prefill em batch"),
+            Modo::Verify => ("verifies", "ms/verify", "verify do MTP (2 tokens)"),
+        };
         let sh = st.cfg.shard;
         eprintln!(
-            "\n=== PERFIL GPU{} {} — {} ({tokens} {unidade}, {} ops, camadas {}..{}) ===",
+            "\n=== PERFIL GPU{} {} — {nome} ({tokens} {unidade}, {} ops, camadas {}..{}) ===",
             sh.device,
             self.device_name(),
-            if bloco { "prefill em batch" } else { "decode" },
             accum.len(),
             sh.first_layer,
             sh.end_layer
@@ -3456,7 +4626,7 @@ impl<'ctx> ResidentForward<'ctx> {
                  conhecido só na gravação — o agregado exclui esses bytes e inclui o tempo)"
             );
         }
-        if bloco {
+        if modo != Modo::Decode {
             return;
         }
         let h = pf.host.borrow();
@@ -3479,6 +4649,65 @@ impl<'ctx> ResidentForward<'ctx> {
         self.decode_shard_batch(&[token], pos, x_in)
     }
 
+    /// Verifica dois tokens em posições consecutivas a partir de `pos0` e devolve os
+    /// logits dos **dois** (`2 × vocab`, o primeiro token primeiro) no último shard, ou a
+    /// stream residual dos dois nos demais.
+    ///
+    /// É um passo de speculative decoding: `tokens[0]` é o token já amostrado e
+    /// `tokens[1]` a proposta da cabeça MTP. Ler os pesos uma vez serve aos dois, que é o
+    /// ganho todo. Em caso de rejeição, [`Self::rollback_verify`] desfaz o segundo.
+    pub fn verify_shard(
+        &self,
+        tokens: &[u32; VERIFY_TOK],
+        pos0: usize,
+        x_in: Option<&[f32]>,
+    ) -> Result<Vec<f32>, MatmulError> {
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        if st.plan_verify.is_empty() || pos0 + VERIFY_TOK > st.cfg.ctx {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
+        let pos = pos0 + VERIFY_TOK - 1;
+        let out = self.record_and_submit(tokens, pos, x_in, Modo::Verify)?;
+        *st.len.borrow_mut() = pos + 1;
+        Ok(out)
+    }
+
+    /// Desfaz o **segundo** token do último verify: restaura os snapshots do estado
+    /// recorrente e da janela da convolução e recua o comprimento do KV em um.
+    ///
+    /// O KV-cache não precisa de snapshot: as duas posições do verify são consecutivas e
+    /// o próximo append sobrescreve a segunda. Com o `rope_kv` ligado o K já entrou no
+    /// slot girado, e isso também não muda nada — recuar é só o contador.
+    pub fn rollback_verify(&self) -> Result<(), MatmulError> {
+        let st = self
+            .state
+            .as_ref()
+            .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
+        let mut len = st.len.borrow_mut();
+        *len = len.saturating_sub(1);
+        drop(len);
+        let Some(cmd) = st.rollback_cmd else {
+            // Modelo sem camada de atenção linear: não há estado recorrente a restaurar.
+            return Ok(());
+        };
+        let d = &self.dev.device;
+        let submit = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        // SAFETY: o command buffer foi gravado uma vez na construção e não usa
+        // ONE_TIME_SUBMIT; o fence do token já foi aguardado antes desta chamada.
+        unsafe {
+            d.reset_fences(&[st.token_fence])?;
+            d.queue_submit(self.dev.queue, &[submit], st.token_fence)?;
+        }
+        self.espera_fence(st)
+    }
+
     /// Como `decode_shard`, para um bloco de tokens em posições consecutivas a partir de
     /// `pos0`. `tokens.len()` tem de ser `cfg.n_batch` — é a largura para a qual o plano de
     /// prefill foi montado (`COLS` é specialization constant).
@@ -3497,7 +4726,8 @@ impl<'ctx> ResidentForward<'ctx> {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
         let pos = pos0 + n_tok - 1;
-        let out = self.record_and_submit(tokens, pos, x_in)?;
+        let modo = if n_tok > 1 { Modo::Batch } else { Modo::Decode };
+        let out = self.record_and_submit(tokens, pos, x_in, modo)?;
         *st.len.borrow_mut() = pos + 1;
         Ok(out)
     }
@@ -3506,17 +4736,15 @@ impl<'ctx> ResidentForward<'ctx> {
     pub fn dbg_plano(&self) -> Vec<&'static str> {
         self.state
             .as_ref()
-            .map(|st| {
-                st.plan
-                    .iter()
-                    .map(|op| match op {
-                        PlannedOp::Dispatch { pipe, .. } => pipe.label(),
-                        PlannedOp::Embed => "embed",
-                        PlannedOp::KvAppend { .. } => "kv_append",
-                        PlannedOp::Atencao { .. } => "attention",
-                    })
-                    .collect()
-            })
+            .map(|st| st.plan.iter().map(PlannedOp::label).collect())
+            .unwrap_or_default()
+    }
+
+    /// O mesmo para o plano de verify do MTP — vazio quando o backend não tem MTP.
+    pub fn dbg_plano_verify(&self) -> Vec<&'static str> {
+        self.state
+            .as_ref()
+            .map(|st| st.plan_verify.iter().map(PlannedOp::label).collect())
             .unwrap_or_default()
     }
 
@@ -3580,6 +4808,11 @@ impl<'ctx> ResidentForward<'ctx> {
     pub fn reset_len(&self) {
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = 0;
+            // O KV-cache da cabeça MTP é dela: o conteúdo não precisa ser zerado (o
+            // `total_len` da atenção limita o que se lê), só o contador.
+            if let Some(m) = st.mtp.as_ref() {
+                *m.len.borrow_mut() = 0;
+            }
             // Nas camadas de atenção linear não há comprimento de KV-cache para zerar: o
             // histórico está no estado recorrente e na janela da convolução, que precisam
             // voltar a zero — é o que representa "contexto vazio" nesta arquitetura.
@@ -3662,6 +4895,7 @@ impl<'ctx> ResidentForward<'ctx> {
         tokens: &[u32],
         pos: usize,
         x_in: Option<&[f32]>,
+        modo: Modo,
     ) -> Result<Vec<f32>, MatmulError> {
         let st = self
             .state
@@ -3681,7 +4915,7 @@ impl<'ctx> ResidentForward<'ctx> {
             d.begin_command_buffer(cmd, &begin)?;
         }
         let t0 = std::time::Instant::now();
-        self.record_token(cmd, tokens, pos, x_in);
+        self.record_token(cmd, tokens, pos, x_in, modo);
         // SAFETY: cmd em gravação.
         unsafe {
             d.end_command_buffer(cmd)?;
@@ -3702,10 +4936,14 @@ impl<'ctx> ResidentForward<'ctx> {
         self.espera_fence(st)?;
         let t_sub = t1.elapsed();
         let t2 = std::time::Instant::now();
-        self.collect_prof(st, tokens.len())?;
+        self.collect_prof(st, modo)?;
 
         let len = if st.cfg.shard.is_last() {
-            st.cfg.vocab
+            if modo == Modo::Verify {
+                st.cfg.vocab * VERIFY_TOK
+            } else {
+                st.cfg.vocab
+            }
         } else {
             st.cfg.n_embd * tokens.len()
         };
@@ -3736,7 +4974,7 @@ impl<'ctx> ResidentForward<'ctx> {
 impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     fn decode(&self, token: u32, pos: usize) -> Result<Vec<f32>, llama_model::ModelError> {
         let logits = self
-            .record_and_submit(&[token], pos, None)
+            .record_and_submit(&[token], pos, None, Modo::Decode)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = pos + 1;
@@ -3752,6 +4990,30 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
         pos0: usize,
     ) -> Result<Vec<f32>, llama_model::ModelError> {
         self.decode_shard_batch(tokens, pos0, None)
+            .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
+    }
+    fn tem_mtp(&self) -> bool {
+        ResidentForward::tem_mtp(self)
+    }
+    fn propor_mtp(&self, token: u32, hidden_idx: usize) -> Result<u32, llama_model::ModelError> {
+        // Shard único: a tabela de embedding e a cabeça moram na mesma GPU.
+        let emb = self
+            .linha_embd(token)
+            .ok_or_else(|| llama_model::ModelError::Gpu(format!("token {token} fora da tabela")))?
+            .to_vec();
+        ResidentForward::propor_mtp(self, &emb, hidden_idx)
+            .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
+    }
+    fn decode_verify(
+        &self,
+        tokens: &[u32; 2],
+        pos0: usize,
+    ) -> Result<Vec<f32>, llama_model::ModelError> {
+        self.verify_shard(tokens, pos0, None)
+            .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
+    }
+    fn rollback_verify(&self) -> Result<(), llama_model::ModelError> {
+        ResidentForward::rollback_verify(self)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
     }
     fn reset(&self) {
@@ -3816,6 +5078,9 @@ impl Drop for ResidentForward<'_> {
                     ] {
                         b.destroy(d);
                     }
+                    for b in dn.estado_snap.iter().chain(dn.janela_snap.iter()) {
+                        b.destroy(d);
+                    }
                 }
                 if let Some(b) = la.q_bias {
                     b.destroy(d);
@@ -3848,9 +5113,46 @@ impl Drop for ResidentForward<'_> {
             ] {
                 b.destroy(d);
             }
+            if let Some(m) = st.mtp {
+                for w in [
+                    m.eh_proj,
+                    m.attn_q,
+                    m.attn_k,
+                    m.attn_v,
+                    m.attn_output,
+                    m.ffn_gate,
+                    m.ffn_up,
+                    m.ffn_down,
+                ] {
+                    w.gpu.destroy(d);
+                }
+                for b in [
+                    &m.enorm,
+                    &m.hnorm,
+                    &m.shared_head_norm,
+                    &m.attn_norm,
+                    &m.ffn_norm,
+                    &m.emb_stage,
+                    &m.b_emb,
+                    &m.b_h,
+                    &m.b_eh,
+                    &m.b_x,
+                    &m.b_ffn,
+                    &m.kcache,
+                    &m.vcache,
+                ] {
+                    b.destroy(d);
+                }
+                for b in m.q_norm.iter().chain(m.k_norm.iter()) {
+                    b.destroy(d);
+                }
+            }
             // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
             unsafe {
                 d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
+                if let Some(cmd) = st.rollback_cmd {
+                    d.free_command_buffers(self.dev.cmd_pool, &[cmd]);
+                }
                 d.destroy_fence(st.token_fence, None);
             }
         }
