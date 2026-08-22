@@ -15,26 +15,34 @@
 // Fórmula idêntica à do `dn_norm` modo 0: x / sqrt(sum(x^2) + eps). É L2, **não** RMS — a
 // diferença é o `1/dim`, e trocar uma pela outra aqui muda a escala do produto interno do
 // delta rule e o modelo passa a gerar lixo.
+//
+// O bloco de prefill entra por `gl_WorkGroupID.y` — um workgroup por (cabeça, token). Não
+// há recorrência aqui; os `n_tok` dispatches de antes existiam só porque q e k de um token
+// não são contíguos com os do token seguinte: eles vivem no buffer da convolução, que traz
+// q | k | v por token. Daí o `stride`, que é o passo entre tokens **na entrada** — a saída
+// tem q e k próprios e contíguos, com passo `n_heads * dim`.
 
 layout(local_size_x = 64) in;
 
-// [2 * n_heads][dim]: as cabeças de q seguidas das de k, como saem da convolução.
+// [n_tok][2 * n_heads][dim]: as cabeças de q seguidas das de k, como saem da convolução.
 layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; } x_buf;
-layout(set = 0, binding = 1) writeonly buffer QBuf { float q[]; } q_buf;   // [n_heads][dim]
-layout(set = 0, binding = 2) writeonly buffer KBuf { float k[]; } k_buf;   // [n_heads][dim]
+layout(set = 0, binding = 1) writeonly buffer QBuf { float q[]; } q_buf;   // [n_tok][n_heads][dim]
+layout(set = 0, binding = 2) writeonly buffer KBuf { float k[]; } k_buf;   // [n_tok][n_heads][dim]
 
 layout(push_constant) uniform PC {
     uint dim;       // d_state
     uint n_heads;   // n_k_heads (cabeças de q; k tem as mesmas)
     float eps;
+    uint stride;    // distância entre tokens na entrada (conv_dim no plano)
 } pc;
 
 void main() {
     uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;   // token do bloco de prefill (0 no decode)
     uint lane = gl_LocalInvocationID.x;
     if (h >= 2u * pc.n_heads) { return; }
 
-    uint base = h * pc.dim;
+    uint base = t * pc.stride + h * pc.dim;
     float ss = 0.0;
     for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
         float v = x_buf.x[base + i];
@@ -46,7 +54,7 @@ void main() {
     float escala = inversesqrt(ss + pc.eps);
     // `h` não depende de lane: o ramo é uniforme no workgroup, sem divergência.
     bool eh_k = h >= pc.n_heads;
-    uint saida = (eh_k ? h - pc.n_heads : h) * pc.dim;
+    uint saida = (t * pc.n_heads + (eh_k ? h - pc.n_heads : h)) * pc.dim;
 
     for (uint i = lane; i < pc.dim; i += gl_WorkGroupSize.x) {
         float v = x_buf.x[base + i] * escala;

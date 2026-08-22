@@ -40,7 +40,6 @@ layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint COLS = 1u;
 const uint WAVES_PER_WG = 4u;
 const uint ROWS_PER_WAVE = 2u;
-const uint MAX_COLS = 8u;   // teto de colunas por dispatch
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uint w[]; } weight_buf;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
@@ -118,9 +117,13 @@ void main() {
     uint ql_u0 = (half_i * 64u + (quarter & 1u) * 32u + idx16) >> 2u;
     uint qh_u0 = (128u + half_i * 32u + idx16) >> 2u;
 
-    float acc[MAX_COLS];
-    float acc_b[MAX_COLS];
-    for (uint c = 0u; c < MAX_COLS; c++) { acc[c] = 0.0; acc_b[c] = 0.0; }
+    // Dimensionados por `COLS`, que e specialization constant: o array so fica em
+    // registrador se o compilador souber o tamanho e conseguir desenrolar os lacos abaixo.
+    // Com um teto fixo maior que `COLS` sobravam acumuladores mortos ocupando VGPR, e o
+    // teto era tambem o teto do batch — era ele o `MAX_COLS = 8` que prendia o prefill.
+    float acc[COLS];
+    float acc_b[COLS];
+    for (uint c = 0u; c < COLS; c++) { acc[c] = 0.0; acc_b[c] = 0.0; }
     for (uint sb0 = 0u; sb0 < n_sb; sb0 += 4u) {
         uint sbi = sb0 + sb_in_grp;
         if (sbi >= n_sb) { continue; }

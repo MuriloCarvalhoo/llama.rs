@@ -1,0 +1,213 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+
+// GEMM Q4_K com tiling em LDS: `Y[n_out x COLS] = W[n_out x n_in] * X[n_in x COLS]`.
+//
+// **Experimental, desligado por padrao** (`LLAMA_RS_PREFILL_GEMM=1` liga). Ver o criterio
+// de adocao em `docs/planos/2026-08-21-prefill-e-respostas.md`: so vale se vencer o
+// matvec-COLS no mesmo bloco por uma margem que pague manter dois caminhos, e essa
+// comparacao e uma medicao que ainda nao foi feita neste hardware.
+//
+// ## Por que um GEMM, e por que so no prefill
+//
+// O matvec de N colunas (`q4_k_matvec.comp` com `COLS=N`) le o peso da VRAM uma vez para
+// as N ativacoes, mas cada lane guarda `ROWS_PER_WAVE * COLS` acumuladores: subir N
+// derruba a ocupancia, e em algum ponto isso custa mais do que o reuso rende. O GEMM troca
+// o reuso em registrador pelo reuso em LDS — o tile de peso e lido uma vez da VRAM,
+// escrito em LDS e consumido por todas as colunas do tile, com cada thread guardando
+// TM x TN acumuladores em vez de ROWS x COLS.
+//
+// No decode isso nao serve para nada: com uma coluna o kernel e limitado por banda e o
+// tile em LDS e custo puro. E o prefill que passa a ser compute-bound, e ai a MI50 tem
+// folga — ~52 TOPS de int8 (`V_DOT4_I32_I8`) contra 717 GB/s.
+//
+// ## Geometria
+//
+// Workgroup de 256 threads (4 waves), tile **BM=128 linhas x BN=COLS colunas x BK=32**.
+// As 256 threads sao uma grade 32 x 8: cada uma calcula TM=4 linhas por TN=COLS/8 colunas.
+// Por passo de K, a thread le TM*8 uints de peso e TN*8 de ativacao da LDS e faz TM*TN*8
+// dots — intensidade TM*TN/(TM+TN) = 2 com COLS=32, que e o ponto do exercicio.
+//
+// BK=32 nao e escolha livre: e o sub-bloco de quantizacao do Q4_K **e** o bloco do
+// `quantize_x`, entao cada passo de K tem exatamente uma escala de peso e uma de ativacao.
+//
+// ## Formato
+//
+// So Q4_K. E 53% do tempo de matvec no Qwen3.8-27B (`docs/decode-por-configuracao.md`),
+// contra 18,6% do Q6_K e 5,3% do Q5_K — os outros tipos seguem no matvec-COLS, que o
+// plano escolhe por tipo de peso. O layout do superbloco e o mesmo lido em
+// `q4_k_matvec.comp`, que documenta a extracao de escala e minimo de 6 bits.
+//
+// O termo afim do Q4_K (`- dmin * m * soma(x)`) sobrevive ao tiling porque `soma(x)` so
+// depende da coluna: e calculada uma vez por (coluna, passo de K) e guardada na LDS junto
+// com a escala da ativacao.
+
+layout(local_size_x = 256) in;
+// Colunas do tile = tokens do bloco de prefill. Multiplo de 8 (a grade de threads tem 8
+// grupos de coluna) e no maximo 64 (acima disso TN passa de 8 e os acumuladores estouram).
+layout(constant_id = 0) const uint COLS = 32u;
+
+const uint BM = 128u;          // linhas de saida por workgroup
+const uint BK = 32u;           // elementos de K por passo — o sub-bloco do Q4_K
+const uint THREADS = 256u;
+const uint COL_GRUPOS = 8u;
+const uint LINHA_GRUPOS = THREADS / COL_GRUPOS;  // 32
+const uint TM = BM / LINHA_GRUPOS;               // 4 linhas por thread
+const uint TN = COLS / COL_GRUPOS;               // colunas por thread
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
+// Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
+layout(set = 0, binding = 1) readonly buffer XqBuf { int xq[]; } xq_buf;
+layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float y[]; } out_buf;
+layout(set = 0, binding = 4) readonly buffer BiasBuf { float b[]; } bias_buf;
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint row_offset;  // vestigial (saida indexada por linha absoluta)
+    uint tem_bias;
+} pc;
+
+const uint UVEC4_PER_SB = 9u;   // 144 bytes por superbloco Q4_K
+
+// Tile de peso: BM linhas x 32 int8, empacotados 4 por uint.
+shared uint lw[BM * 8u];
+shared float lwsc[BM];    // d * sc do sub-bloco
+shared float lwoff[BM];   // -dmin * m do sub-bloco
+// Tile de ativacao: COLS colunas x 32 int8, mais escala e soma dos int8 por coluna.
+shared int lx[COLS * 8u];
+shared float lxd[COLS];
+shared float lxs[COLS];
+
+// Byte `i` (0..11) de scales[], nos bytes 4..15 do superbloco — ver `q4_k_matvec.comp`.
+uint scale_byte(uvec4 hdr, uint i) {
+    uint word = i < 4u ? hdr.y : (i < 8u ? hdr.z : hdr.w);
+    return (word >> (8u * (i & 3u))) & 0xFFu;
+}
+
+void scale_min(uvec4 hdr, uint j, out uint sc, out uint m) {
+    if (j < 4u) {
+        sc = scale_byte(hdr, j) & 63u;
+        m  = scale_byte(hdr, j + 4u) & 63u;
+    } else {
+        uint a = scale_byte(hdr, j + 4u);
+        uint b = scale_byte(hdr, j - 4u);
+        uint c = scale_byte(hdr, j);
+        sc = (a & 0xFu) | ((b >> 6u) << 4u);
+        m  = (a >> 4u)  | ((c >> 6u) << 4u);
+    }
+}
+
+uint wpack(uint qsw, bool hi) {
+    return (hi ? (qsw >> 4u) : qsw) & 0x0F0F0F0Fu;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint linha0 = gl_WorkGroupID.x * BM;
+
+    uint n_sb = pc.n_in / 256u;
+    uint linha4 = n_sb * UVEC4_PER_SB;   // uvec4 por linha de peso
+    uint n_blk = pc.n_in / 32u;          // blocos de ativacao por coluna
+
+    // Carga do tile de peso: duas threads por linha, uma para cada metade dos 32 elementos.
+    uint w_linha = t >> 1u;
+    bool w_alta = (t & 1u) != 0u;
+    // Carga do tile de ativacao: uma thread por (coluna, uint). COLS <= 32 garante
+    // COLS * 8 <= 256, entao cabe numa passada.
+    uint x_col = t >> 3u;
+    uint x_u = t & 7u;
+
+    // Grade de calculo: 32 grupos de linha x 8 de coluna.
+    uint ti = t >> 3u;
+    uint tj = t & 7u;
+
+    float acc[TM * TN];
+    for (uint i = 0u; i < TM * TN; i++) { acc[i] = 0.0; }
+
+    for (uint k0 = 0u; k0 < pc.n_in; k0 += BK) {
+        uint sb = k0 >> 8u;          // superbloco
+        uint j = (k0 >> 5u) & 7u;    // sub-bloco de 32 dentro dele
+        uint blk = k0 >> 5u;         // bloco da ativacao
+
+        // Fecha as leituras do passo anterior antes de sobrescrever a LDS.
+        barrier();
+
+        uint lg = linha0 + w_linha;
+        if (lg < pc.n_out) {
+            uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
+            uvec4 hdr = weight_buf.w4[b4];
+            uvec4 qs = weight_buf.w4[b4 + 1u + (j >> 1u) * 2u + (w_alta ? 1u : 0u)];
+            bool hi = (j & 1u) != 0u;
+            uint dst = w_linha * 8u + (w_alta ? 4u : 0u);
+            lw[dst + 0u] = wpack(qs.x, hi);
+            lw[dst + 1u] = wpack(qs.y, hi);
+            lw[dst + 2u] = wpack(qs.z, hi);
+            lw[dst + 3u] = wpack(qs.w, hi);
+            if (!w_alta) {
+                vec2 dm = unpackHalf2x16(hdr.x);   // .x = d, .y = dmin
+                uint sc, m;
+                scale_min(hdr, j, sc, m);
+                lwsc[w_linha] = dm.x * float(sc);
+                lwoff[w_linha] = -dm.y * float(m);
+            }
+        } else if (!w_alta) {
+            // Linha fora da matriz: zera a escala para o resultado dela ser inofensivo.
+            lwsc[w_linha] = 0.0;
+            lwoff[w_linha] = 0.0;
+        }
+
+        if (x_col < COLS) {
+            uint cb = x_col * n_blk + blk;
+            lx[x_col * 8u + x_u] = xq_buf.xq[cb * 8u + x_u];
+        }
+        if (t < COLS) {
+            uint cb = t * n_blk + blk;
+            lxd[t] = xd_buf.xd[cb];
+            // Soma dos int8 do bloco, para o termo do `dmin`. So depende da coluna.
+            int isx = 0;
+            for (uint u = 0u; u < 8u; u++) {
+                isx = dotPacked4x8AccSatEXT(0x01010101, xq_buf.xq[cb * 8u + u], isx);
+            }
+            lxs[t] = float(isx);
+        }
+
+        barrier();
+
+        // As colunas desta thread saem da LDS uma vez e servem as TM linhas.
+        int xr[TN * 8u];
+        float xd_c[TN];
+        float xs_c[TN];
+        for (uint c = 0u; c < TN; c++) {
+            uint col = tj * TN + c;
+            for (uint u = 0u; u < 8u; u++) { xr[c * 8u + u] = lx[col * 8u + u]; }
+            xd_c[c] = lxd[col];
+            xs_c[c] = lxs[col];
+        }
+
+        for (uint r = 0u; r < TM; r++) {
+            uint rr = ti * TM + r;
+            float sc = lwsc[rr];
+            float off = lwoff[rr];
+            int w[8];
+            for (uint u = 0u; u < 8u; u++) { w[u] = int(lw[rr * 8u + u]); }
+            for (uint c = 0u; c < TN; c++) {
+                int isum = 0;
+                for (uint u = 0u; u < 8u; u++) {
+                    isum = dotPacked4x8AccSatEXT(w[u], xr[c * 8u + u], isum);
+                }
+                acc[r * TN + c] += xd_c[c] * (sc * float(isum) + off * xs_c[c]);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < TM; r++) {
+        uint rr = linha0 + ti * TM + r;
+        if (rr >= pc.n_out) { continue; }
+        float bias = pc.tem_bias != 0u ? bias_buf.b[rr] : 0.0;
+        for (uint c = 0u; c < TN; c++) {
+            out_buf.y[(tj * TN + c) * pc.n_out + rr] = acc[r * TN + c] + bias;
+        }
+    }
+}

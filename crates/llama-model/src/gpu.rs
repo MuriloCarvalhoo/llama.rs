@@ -395,6 +395,18 @@ pub trait GpuResidentDecode {
         }
         Ok(logits)
     }
+    /// Guarda o estado que não volta atrás sozinho (o recorrente das camadas lineares) e o
+    /// comprimento do KV, para que uma divergência de prompt **depois** desta posição não
+    /// custe reprocessar tudo. Um snapshot só: o novo sobrescreve o anterior.
+    ///
+    /// `false` quando o backend não guarda snapshot — e aí a sessão nunca pede recuo.
+    fn marcar(&self) -> bool {
+        false
+    }
+    /// Volta ao último [`GpuResidentDecode::marcar`]. `false` quando não há snapshot.
+    fn restaurar(&self) -> bool {
+        false
+    }
 }
 
 impl<'a> GpuAuxWeights<'a> {

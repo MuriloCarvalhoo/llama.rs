@@ -1,11 +1,21 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 
-// Convolucao causal de largura `d_conv` sobre um token, com estado — a etapa que vem
-// antes do delta net nas camadas lineares do qwen35.
+// Convolucao causal de largura `d_conv` sobre um bloco de `n_tok` tokens, com estado — a
+// etapa que vem antes do delta net nas camadas lineares do qwen35.
 //
 // `state` guarda os `d_conv - 1` valores anteriores de cada canal em layout
-// `[canal][passo]`, e e deslizado aqui mesmo: o valor novo entra no fim, o mais antigo
-// sai. Uma thread por canal; os canais nao se falam.
+// `[canal][passo]`. Uma thread por canal; os canais nao se falam.
+//
+// **A janela avanca dentro do dispatch.** Ela e carregada para registrador na entrada, os
+// `n_tok` tokens do bloco entram nela um a um (o mais antigo sai, o atual entra no fim) e
+// so o resultado final volta a memoria. Antes eram `n_tok` dispatches, cada um relendo e
+// regravando a janela inteira com uma barreira de pipeline no meio — pura serializacao
+// para um kernel de microssegundo. `n_tok = 1` reproduz o decode.
+//
+// A janela mora num array de tamanho `MAX_PASSOS` (compile-time) percorrido por lacos
+// desenrolados com guarda de runtime: indice constante depois do unroll e o que mantem o
+// array em VGPR em vez de scratch.
 //
 // A saida ja sai com SiLU aplicada, que e o que a camada faz em seguida — evita um
 // dispatch inteiro de 10240 elementos so para isso.
@@ -13,15 +23,17 @@
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) buffer StateBuf { float s[]; } state_buf;      // inout [canais][d_conv-1]
-layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; } x_buf;     // [canais]
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; } x_buf;     // [n_tok][canais]
 layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; } w_buf;     // [canais][d_conv]
-layout(set = 0, binding = 3) writeonly buffer OutBuf { float o[]; } out_buf; // [canais]
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float o[]; } out_buf; // [n_tok][canais]
 
 layout(push_constant) uniform PC {
     uint canais;
     uint d_conv;
-    uint pad;
+    uint n_tok;   // tokens do bloco processados neste dispatch (1 no decode)
 } pc;
+
+const uint MAX_PASSOS = 4u;   // cobre d_conv ate 5 (o qwen35 usa 4)
 
 void main() {
     uint c = gl_GlobalInvocationID.x;
@@ -31,20 +43,30 @@ void main() {
     uint base_s = c * passos;
     uint base_w = c * pc.d_conv;
 
-    float acc = 0.0;
-    for (uint t = 0u; t < passos; t++) {
-        acc += state_buf.s[base_s + t] * w_buf.w[base_w + t];
+    float jan[MAX_PASSOS];
+    [[unroll]] for (uint j = 0u; j < MAX_PASSOS; j++) {
+        jan[j] = 0.0;
+        if (j < passos) { jan[j] = state_buf.s[base_s + j]; }
     }
-    float atual = x_buf.x[c];
-    acc += atual * w_buf.w[base_w + passos];
+    float w_atual = w_buf.w[base_w + passos];
 
-    // Desliza a janela e guarda o token atual no fim.
-    for (uint t = 0u; t + 1u < passos; t++) {
-        state_buf.s[base_s + t] = state_buf.s[base_s + t + 1u];
-    }
-    if (passos > 0u) {
-        state_buf.s[base_s + passos - 1u] = atual;
+    for (uint t = 0u; t < pc.n_tok; t++) {
+        float acc = 0.0;
+        [[unroll]] for (uint j = 0u; j < MAX_PASSOS; j++) {
+            if (j < passos) { acc += jan[j] * w_buf.w[base_w + j]; }
+        }
+        float atual = x_buf.x[t * pc.canais + c];
+        acc += atual * w_atual;
+        out_buf.o[t * pc.canais + c] = acc / (1.0 + exp(-acc));  // SiLU
+
+        // Desliza a janela em registrador: o mais antigo sai, o token atual entra no fim.
+        [[unroll]] for (uint j = 0u; j + 1u < MAX_PASSOS; j++) { jan[j] = jan[j + 1u]; }
+        [[unroll]] for (uint j = 0u; j < MAX_PASSOS; j++) {
+            if (j + 1u == passos) { jan[j] = atual; }
+        }
     }
 
-    out_buf.o[c] = acc / (1.0 + exp(-acc)) ; // SiLU
+    [[unroll]] for (uint j = 0u; j < MAX_PASSOS; j++) {
+        if (j < passos) { state_buf.s[base_s + j] = jan[j]; }
+    }
 }

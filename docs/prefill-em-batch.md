@@ -51,10 +51,33 @@ varredura de `scripts/tune-matvec.sh` mede, e por isso as duas constantes moram 
 
 O llama.cpp pré-compila as variantes 1..8 exatamente assim (`{wg_size, rm_kq, i+1}`).
 
+O teto de N foi 8 por um bom tempo, e não por medição: o `q6_k_matvec.comp` era o único
+que dimensionava os acumuladores por uma constante fixa (`MAX_COLS = 8`) em vez de por
+`COLS`, e com 16 colunas escrevia fora do array. Com isso resolvido o teto de
+`LLAMA_RS_BATCH` é 32, e **onde a curva vira é empírico**: `ROWS_PER_WAVE × COLS`
+acumuladores vivos por lane, e em algum ponto a ocupância cai mais do que o reuso do peso
+rende. O padrão continua 8, que é o valor medido.
+
 ### Etapa 2 — GEMM com tiling em LDS
 
-Só compensa acima de ~32 tokens por batch, quando o peso lido cabe num tile reusado por
-muitas colunas. É o `mul_mm.comp` deles. Fica para depois de a etapa 1 estar medida.
+Implementado em `shaders/mul_mm.comp`, **desligado por padrão**
+(`LLAMA_RS_PREFILL_GEMM=1` liga). Só Q4_K, que é 53% do tempo de matvec no Qwen3.8-27B; os
+demais tipos seguem na etapa 1.
+
+O que muda em relação ao matvec-COLS: o reuso sai do registrador e vai para a LDS. Tile de
+**128 linhas × COLS colunas × 32 elementos de K**, workgroup de 256 threads como grade
+32×8, cada thread com 4 linhas × COLS/8 colunas — intensidade `TM·TN/(TM+TN)` = 2 com
+COLS=32. `dotPacked4x8AccSatEXT` no laço interno, que é onde a MI50 tem folga no prefill
+(~52 TOPS de int8 contra 717 GB/s).
+
+`BK = 32` não é escolha livre: é o sub-bloco de quantização do Q4_K **e** o bloco do
+`quantize_x`, então cada passo de K tem exatamente uma escala de cada lado. O termo afim do
+Q4_K (`-dmin·m·soma(x)`) sobrevive ao tiling porque `soma(x)` só depende da coluna — sai
+uma vez por (coluna, passo de K) para a LDS.
+
+**Critério de adoção, ainda não medido:** o GEMM tem de vencer o matvec-COLS no mesmo bloco
+por uma margem que pague manter dois caminhos. Enquanto isso não for medido, o knob fica
+desligado.
 
 ## O que mais precisa virar batch
 
@@ -69,12 +92,21 @@ dimensão de batch, em ordem de dificuldade:
 | `rope` | posição por token, não uma só |
 | `kv_append` | N posições contíguas — uma cópia só |
 | `attention` | **máscara causal**: o token i só vê 0..i |
-| `delta_net` (qwen35) | recorrência: é serial por construção, não paraleliza em batch |
+| `delta_net`, `dn_conv` (qwen35) | recorrência: o laço sobre os tokens vai **para dentro** do kernel |
 
-A atenção é a única com trabalho real de algoritmo, e o `delta_net` é o único que **não**
-tem versão em batch — a recorrência do token i depende do estado depois do token i-1. Para
-o qwen35 o prefill teria de rodar as camadas lineares em sequência mesmo em batch, o que
-ainda vale a pena porque as projeções (que são a maior parte dos bytes) continuam em batch.
+A atenção é a única com trabalho real de algoritmo. O `delta_net` e a convolução causal são
+os únicos com recorrência de verdade — o token i depende do estado depois do i-1 —, e a
+saída não é rodá-los em sequência de dispatches: é pôr o laço sobre os tokens do bloco
+dentro do kernel, com o estado em registrador entre eles. Assim o estado toca a memória
+global uma vez na entrada e uma na saída do dispatch, em vez de 2×N vezes com uma barreira
+de pipeline entre cada par. É o desenho do `gated_delta_net.comp` do llama.cpp, e é o que
+torna o batch grande viável: em batch 32, o desenho de um dispatch por token daria 4 × 32
+dispatches por camada linear × 48 camadas = 6 mil por bloco só de delta-net.
+
+`dn_gates` e `dn_l2_qk` não têm recorrência nenhuma e batcham por `gl_WorkGroupID.y`, como
+as ops de atenção. O `dn_l2_qk` precisa de um `stride` no push porque a entrada dele é o
+buffer da convolução, que traz `q | k | v` por token: o passo entre tokens na entrada é
+`conv_dim`, na saída é `n_k_heads × d_state`. O `delta_net` precisa do mesmo pelo `v`.
 
 ## O que não precisa
 

@@ -25,7 +25,14 @@ pub(crate) const NORM_P1_WG: u32 = 32;
 /// Vira a specialization constant `COLS` dos matvec, então é fixa na criação das
 /// pipelines — daí ser uma constante de processo e não um parâmetro. Com N tokens o peso
 /// sai da VRAM uma vez para N ativações, que é o ganho todo: o decode é limitado por
-/// banda, não por ALU. 8 é o teto do `q6_k_matvec.comp` (`MAX_COLS`).
+/// banda, não por ALU.
+///
+/// O teto era 8 pelo `MAX_COLS` do `q6_k_matvec.comp` — o único shader que dimensionava os
+/// acumuladores por uma constante fixa em vez de por `COLS`. Com ele resolvido, o teto
+/// passa a ser a pressão de registrador: são `ROWS_PER_WAVE * COLS` acumuladores vivos por
+/// lane, e em algum ponto a ocupância cai mais do que o reuso do peso rende. **Onde fica
+/// esse ponto é empírico e ainda não foi medido neste hardware**; 32 é o limite superior
+/// da varredura, não um ótimo conhecido. O padrão segue 8, que é o valor medido.
 ///
 /// `LLAMA_RS_BATCH=n` sobrescreve; `1` desliga o batch (prefill volta a ser token a token).
 pub(crate) fn batch_size() -> usize {
@@ -33,7 +40,7 @@ pub(crate) fn batch_size() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(8)
-        .clamp(1, 8)
+        .clamp(1, 32)
 }
 
 /// Geometria dos matvec do **bloco de prefill**, separada da do decode.
@@ -63,6 +70,32 @@ pub(crate) fn matvec_geom_batch() -> (u32, u32) {
             wg % 64 == 0 && (64..=1024).contains(&wg) && (1..=4).contains(&rows)
         })
         .unwrap_or((64, 1))
+}
+
+/// Linhas de saída que um workgroup do GEMM cobre — o `BM` do tile de `mul_mm.comp`.
+pub(crate) const GEMM_LINHAS_POR_WG: u32 = 128;
+
+/// Se o prefill usa o GEMM com tiling em LDS (`mul_mm.comp`) nos pesos Q4_K.
+///
+/// **Desligado por padrão, e experimental.** O critério de adoção do plano é uma medição
+/// que ainda não foi feita: o GEMM tem de vencer o matvec-COLS no mesmo bloco por uma
+/// margem que pague manter dois caminhos. `LLAMA_RS_PREFILL_GEMM=1` liga para o A/B.
+///
+/// Só vale para Q4_K (53% do tempo de matvec no Qwen3.8-27B) e só com `n_batch` múltiplo
+/// de 8 — é a largura do tile. Os demais tipos e larguras seguem no matvec-COLS.
+fn gemm_prefill() -> bool {
+    std::env::var("LLAMA_RS_PREFILL_GEMM").is_ok_and(|v| v == "1")
+}
+
+/// Larguras de bloco que o tile do `mul_mm.comp` cobre: múltiplas de 8 (a grade de threads
+/// tem 8 grupos de coluna) e no máximo 64 (acima disso os acumuladores por thread estouram).
+fn gemm_largura_ok(cols: usize) -> bool {
+    (8..=64).contains(&cols) && cols.is_multiple_of(8)
+}
+
+/// Se este matvec vai pelo GEMM em vez do matvec-COLS.
+fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
+    gemm_prefill() && matches!(ty, gguf::GgmlType::Q4_K) && gemm_largura_ok(cols)
 }
 
 /// Slot de KV-cache de cada camada local e o total de slots.
@@ -378,6 +411,8 @@ pub(crate) enum PipeId {
     MatvecQ5KB,
     MatvecQ6KB,
     MatvecQ4KB,
+    /// GEMM Q4_K com tiling em LDS — experimental, ver [`gemm_prefill`].
+    MulMmQ4K,
     QuantizeX,
     /// Residual + parciais da RMSNorm — ver `norm_fused.comp`.
     NormFused,
@@ -413,6 +448,7 @@ impl PipeId {
             PipeId::MatvecQ5KB => "matvec_q5k_b",
             PipeId::MatvecQ6KB => "matvec_q6k_b",
             PipeId::MatvecQ4KB => "matvec_q4k_b",
+            PipeId::MulMmQ4K => "mul_mm_q4k",
             PipeId::QuantizeX => "quantize_x",
             PipeId::NormFused => "norm_fused",
             PipeId::NormP2 => "norm_p2",
@@ -450,7 +486,8 @@ impl PipeId {
             | PipeId::MatvecB
             | PipeId::MatvecQ5KB
             | PipeId::MatvecQ6KB
-            | PipeId::MatvecQ4KB => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MatvecQ4KB
+            | PipeId::MulMmQ4K => (&[0, 1, 2, 4], &[3]),
             PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
@@ -645,6 +682,15 @@ pub(crate) struct ResidentState<'w> {
     /// caminho crítico. Válido enquanto o `State` viver (unmap no Drop).
     pub logits_ptr: *mut std::ffi::c_void,
     pub len: RefCell<usize>,
+    /// Cópia do `estado` e da `janela` de cada camada linear numa fronteira de turno, para
+    /// que uma divergência depois dela não custe reprocessar o prompt inteiro — ver
+    /// `marcar_snapshot`. Alocada no primeiro snapshot, não na carga: são ~155 MB de VRAM
+    /// que só quem serve várias requisições sobre a mesma sessão usa. Fica vazia nas
+    /// arquiteturas densas, onde não há nada recorrente e o snapshot é só o comprimento
+    /// do KV.
+    pub snap: RefCell<Vec<(Buf, Buf)>>,
+    /// Comprimento do KV-cache no snapshot. `None` = nenhum snapshot válido.
+    pub snap_len: std::cell::Cell<Option<usize>>,
     pub plan: Vec<PlannedOp>,
     /// Paralelo a `plan`: se a op precisa de uma barreira de memória **antes** dela.
     /// Calculado uma vez em `marcar_barreiras`.
@@ -725,6 +771,9 @@ pub struct ResidentForward<'ctx> {
     pub(crate) matvec_q5k_b: ComputePipeline,
     pub(crate) matvec_q6k_b: ComputePipeline,
     pub(crate) matvec_q4k_b: ComputePipeline,
+    /// GEMM Q4_K com tiling em LDS, para o prefill. Criada sempre; só entra no plano com
+    /// `LLAMA_RS_PREFILL_GEMM=1` — ver [`gemm_prefill`].
+    pub(crate) mul_mm_q4k: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) norm_fused: ComputePipeline,
     pub(crate) norm_p2: ComputePipeline,
@@ -993,6 +1042,16 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec_q6k_b =
             ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[(0, cols)])?;
         let matvec_q4k_b = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
+        // `COLS` do GEMM é a largura do bloco quando ele está ligado; com o knob desligado
+        // (ou a largura fora do tile) vale 8, a menor válida, só para a pipeline compilar.
+        // O plano só emite `MulMmQ4K` quando `gemm_para` aceita — ver `mv_gen`.
+        let gemm_cols = if gemm_prefill() && gemm_largura_ok(cols as usize) {
+            cols
+        } else {
+            8
+        };
+        let mul_mm_q4k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols)])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         // dim:u32 + tem_residual:u32
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
@@ -1009,12 +1068,14 @@ impl<'ctx> ResidentForward<'ctx> {
         let add = ComputePipeline::with(d, crate::ADD_SPV, 2, 4, &[])?;
         // Atenção linear: (estado, q, k, v, g|beta, saída), (estado, x, w, saída),
         // (x, alpha, beta, a|dt, saída) e (x, w, z, saída).
-        let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 12, &[])?;
+        // O delta net leva ainda `n_tok` e o passo de `v` entre tokens: o laço do bloco
+        // roda dentro do kernel, com o estado em registrador.
+        let delta_net = ComputePipeline::with(d, crate::DELTA_NET_SPV, 6, 20, &[])?;
         let dn_conv = ComputePipeline::with(d, crate::DN_CONV_SPV, 4, 12, &[])?;
         let dn_gates = ComputePipeline::with(d, crate::DN_GATES_SPV, 5, 12, &[])?;
         let dn_norm = ComputePipeline::with(d, crate::DN_NORM_SPV, 4, 20, &[])?;
-        // (conv, qn, kn) + dim, n_heads, eps.
-        let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 12, &[])?;
+        // (conv, qn, kn) + dim, n_heads, eps, stride.
+        let dn_l2_qk = ComputePipeline::with(d, crate::DN_L2_QK_SPV, 3, 16, &[])?;
         // (dst inout, gate, xq, xd) + n, head_dim.
         let gate_quant = ComputePipeline::with(d, crate::GATE_QUANT_SPV, 4, 8, &[])?;
 
@@ -1047,6 +1108,7 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q5k_b,
             matvec_q6k_b,
             matvec_q4k_b,
+            mul_mm_q4k,
             rmsnorm,
             norm_fused,
             norm_p2,
@@ -1401,6 +1463,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 logits_host,
                 logits_ptr,
                 len: RefCell::new(0),
+                snap: RefCell::new(Vec::new()),
+                snap_len: std::cell::Cell::new(None),
                 plan: Vec::new(),
                 barreiras: Vec::new(),
                 plan_batch: Vec::new(),
@@ -1768,11 +1832,14 @@ impl<'ctx> ResidentForward<'ctx> {
     /// gated e projeção de saída. A ativação já foi quantizada em int8 pelo `QuantizeX`
     /// do começo da camada, então os três matvecs a consomem direto.
     ///
-    /// Com `n_tok > 1` as projeções batcham por `COLS` como no resto do plano, mas a
-    /// **recorrência** não: `dn_conv` e `delta_net` carregam estado, e os tokens do bloco
-    /// têm de ser aplicados em ordem. Viram `n_tok` dispatches com os bindings deslocados,
-    /// que `marcar_barreiras` serializa sozinho (cada um reescreve o estado que o anterior
-    /// leu). São 48 das 65 camadas do qwen35, mas a parte serial custa 1,35 ms de 42,44.
+    /// Com `n_tok > 1` **cada op vira um dispatch só**, como no resto do plano — inclusive
+    /// as duas com estado. `dn_conv` e `delta_net` não perdem a recorrência por isso: o
+    /// laço sobre os tokens do bloco mora dentro do kernel, com o estado em registrador
+    /// entre eles (ver os comentários dos dois `.comp`). Antes eram `n_tok` dispatches por
+    /// op, que `marcar_barreiras` serializava um a um — 4 × n_tok dispatches por camada
+    /// linear, 48 camadas: em batch 32 seriam 6 mil só de delta-net por bloco.
+    ///
+    /// `dn_gates` e `dn_l2_qk` batcham por `gl_WorkGroupID.y`, como as ops de atenção.
     #[allow(clippy::too_many_arguments)]
     fn plano_delta(
         plan: &mut Vec<PlannedOp>,
@@ -1798,11 +1865,20 @@ impl<'ctx> ResidentForward<'ctx> {
             .delta
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        // A janela da convolução vive em registrador dentro do `dn_conv.comp`, num array de
+        // `MAX_PASSOS = 4`. Acima disso o shader calcularia com uma janela curta demais e o
+        // erro só apareceria na qualidade da saída — falhar aqui é o que impede isso.
+        if dn_cfg.d_conv > 5 {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
 
         let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
         let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
         let conv_dim = conv_dim_de(dn_cfg);
+        let nt = u32::try_from(n_tok).unwrap_or(1);
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        // Faixa de um buffer por token, cobrindo o bloco inteiro.
+        let nbt = |n: usize| ((n * n_tok) * 4) as vk::DeviceSize;
         let push3 = |a: u32, b: u32, c: u32| {
             let mut v = Vec::with_capacity(12);
             v.extend_from_slice(&a.to_le_bytes());
@@ -1825,21 +1901,17 @@ impl<'ctx> ResidentForward<'ctx> {
         plan.push(mv(w_gate, &b.z, c.n_embd, value_dim)?);
 
         // (g, beta) por cabeça — leem `b_normed` em f32, não a versão int8: são
-        // projeções f32 pequenas e o erro da quantização entraria num expoente. O peso é
-        // indexado pela cabeça, então o batch aqui é um dispatch por token.
-        for t in 0..n_tok {
-            plan.push(mk(
+        // projeções f32 pequenas e o erro da quantização entraria num expoente. Os tokens
+        // do bloco entram pela dimensão Y (um workgroup por cabeça e token).
+        plan.push(Self::com_y(
+            mk(
                 PipeId::DnGates,
                 &[
-                    (st.b_normed.buffer, nb(t * c.n_embd), nb(c.n_embd)),
+                    (st.b_normed.buffer, 0, nbt(c.n_embd)),
                     (da.alpha.buffer, 0, da.alpha.size),
                     (da.beta.buffer, 0, da.beta.size),
                     (da.adt.buffer, 0, da.adt.size),
-                    (
-                        b.gb.buffer,
-                        nb(t * dn_cfg.n_v_heads * 2),
-                        nb(dn_cfg.n_v_heads * 2),
-                    ),
+                    (b.gb.buffer, 0, nbt(dn_cfg.n_v_heads * 2)),
                 ],
                 u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                 PushSpec::Static(push3(
@@ -1847,45 +1919,44 @@ impl<'ctx> ResidentForward<'ctx> {
                     u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                     0,
                 )),
-            )?);
-        }
+            )?,
+            nt,
+        ));
 
-        // Convolução causal com estado, já saindo com SiLU. A janela é o estado: os tokens
-        // do bloco entram nela em ordem.
-        for t in 0..n_tok {
-            plan.push(mk(
-                PipeId::DnConv,
-                &[
-                    (da.janela.buffer, 0, da.janela.size),
-                    (b.qkv.buffer, nb(t * conv_dim), nb(conv_dim)),
-                    (da.conv1d.buffer, 0, da.conv1d.size),
-                    (b.conv.buffer, nb(t * conv_dim), nb(conv_dim)),
-                ],
-                Self::groups_for(conv_dim),
-                PushSpec::Static(push3(
-                    u32::try_from(conv_dim).unwrap_or(u32::MAX),
-                    u32::try_from(dn_cfg.d_conv).unwrap_or(u32::MAX),
-                    0,
-                )),
-            )?);
-        }
+        // Convolução causal com estado, já saindo com SiLU. A janela é o estado, e ela
+        // avança token a token **dentro** do dispatch — ver `dn_conv.comp`.
+        plan.push(mk(
+            PipeId::DnConv,
+            &[
+                (da.janela.buffer, 0, da.janela.size),
+                (b.qkv.buffer, 0, nbt(conv_dim)),
+                (da.conv1d.buffer, 0, da.conv1d.size),
+                (b.conv.buffer, 0, nbt(conv_dim)),
+            ],
+            Self::groups_for(conv_dim),
+            PushSpec::Static(push3(
+                u32::try_from(conv_dim).unwrap_or(u32::MAX),
+                u32::try_from(dn_cfg.d_conv).unwrap_or(u32::MAX),
+                nt,
+            )),
+        )?);
 
         // L2 por cabeça em q e k, que estão nos dois primeiros terços de `conv` — e por
-        // isso não são contíguos entre tokens: um dispatch por token. Os dois tensores
+        // isso não são contíguos entre tokens: daí o `stride` do push. Os dois tensores
         // saem no mesmo dispatch (`dn_l2_qk`): são cabeças contíguas em `conv`, então o
-        // shader só precisa de `2 * n_k_heads` workgroups e dos dois destinos.
+        // shader só precisa de `2 * n_k_heads` workgroups (× n_tok em Y) e dos destinos.
         let eps = c.rms_eps;
-        for t in 0..n_tok {
-            plan.push(mk(
+        plan.push(Self::com_y(
+            mk(
                 PipeId::DnL2Qk,
                 &[
-                    (b.conv.buffer, nb(t * conv_dim), nb(2 * key_dim)),
-                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
+                    (b.conv.buffer, 0, nbt(conv_dim)),
+                    (b.qn.buffer, 0, nbt(key_dim)),
+                    (b.kn.buffer, 0, nbt(key_dim)),
                 ],
                 u32::try_from(dn_cfg.n_k_heads * 2).unwrap_or(u32::MAX),
                 PushSpec::Static({
-                    let mut v = Vec::with_capacity(12);
+                    let mut v = Vec::with_capacity(16);
                     v.extend_from_slice(
                         &u32::try_from(dn_cfg.d_state)
                             .unwrap_or(u32::MAX)
@@ -1897,35 +1968,42 @@ impl<'ctx> ResidentForward<'ctx> {
                             .to_le_bytes(),
                     );
                     v.extend_from_slice(&eps.to_le_bytes());
+                    v.extend_from_slice(&u32::try_from(conv_dim).unwrap_or(u32::MAX).to_le_bytes());
                     v
                 }),
-            )?);
-        }
+            )?,
+            nt,
+        ));
 
-        // Recorrência: lê e reescreve o estado da camada, um token de cada vez.
-        for t in 0..n_tok {
-            plan.push(mk(
-                PipeId::DeltaNet,
-                &[
-                    (da.estado.buffer, 0, da.estado.size),
-                    (b.qn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.kn.buffer, nb(t * key_dim), nb(key_dim)),
-                    (b.conv.buffer, nb(t * conv_dim + 2 * key_dim), nb(value_dim)), // v
-                    (
-                        b.gb.buffer,
-                        nb(t * dn_cfg.n_v_heads * 2),
-                        nb(dn_cfg.n_v_heads * 2),
-                    ),
-                    (b.out.buffer, nb(t * value_dim), nb(value_dim)),
-                ],
-                u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
-                PushSpec::Static(push3(
+        // Recorrência: lê o estado da camada, aplica os `n_tok` tokens em ordem dentro do
+        // kernel e o reescreve uma vez. `v` é a última fatia de cada token em `conv`, daí
+        // o binding começar em `2 * key_dim` e o passo entre tokens ser `conv_dim`.
+        plan.push(mk(
+            PipeId::DeltaNet,
+            &[
+                (da.estado.buffer, 0, da.estado.size),
+                (b.qn.buffer, 0, nbt(key_dim)),
+                (b.kn.buffer, 0, nbt(key_dim)),
+                (
+                    b.conv.buffer,
+                    nb(2 * key_dim),
+                    nb(conv_dim * n_tok - 2 * key_dim),
+                ),
+                (b.gb.buffer, 0, nbt(dn_cfg.n_v_heads * 2)),
+                (b.out.buffer, 0, nbt(value_dim)),
+            ],
+            u32::try_from(dn_cfg.n_v_heads * dn_cfg.d_state / 4).unwrap_or(u32::MAX),
+            PushSpec::Static({
+                let mut v = push3(
                     u32::try_from(dn_cfg.d_state).unwrap_or(u32::MAX),
                     u32::try_from(dn_cfg.n_v_heads).unwrap_or(u32::MAX),
                     u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
-                )),
-            )?);
-        }
+                );
+                v.extend_from_slice(&nt.to_le_bytes());
+                v.extend_from_slice(&u32::try_from(conv_dim).unwrap_or(u32::MAX).to_le_bytes());
+                v
+            }),
+        )?);
 
         // Norma gated: rmsnorm por cabeça vezes silu(z). As cabeças dos N tokens são
         // contíguas neste passo, então o batch é multiplicar a contagem (ver QK-norm).
@@ -2603,6 +2681,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MatvecQ5KB => &self.matvec_q5k_b,
             PipeId::MatvecQ6KB => &self.matvec_q6k_b,
             PipeId::MatvecQ4KB => &self.matvec_q4k_b,
+            PipeId::MulMmQ4K => &self.mul_mm_q4k,
             PipeId::DeltaNet => &self.delta_net,
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
@@ -2826,40 +2905,44 @@ impl<'ctx> ResidentForward<'ctx> {
             let batch = cols > 1;
             // A ativação é lida uma vez para todas as linhas do wave; quantas linhas cada
             // workgroup cobre sai de `matvec_geom` (Q5_K/Q4_K) ou da geometria fixa dos
-            // shaders Q8_0 e Q6_K.
-            let (pipe, rows_por_wg) = match w.ty {
-                gguf::GgmlType::Q8_0 => (
-                    if batch {
-                        PipeId::MatvecB
-                    } else {
-                        PipeId::Matvec
-                    },
-                    MATVEC_NUM_ROWS as usize,
-                ),
-                gguf::GgmlType::Q5_K => (
-                    if batch {
-                        PipeId::MatvecQ5KB
-                    } else {
-                        PipeId::MatvecQ5K
-                    },
-                    rows_q5k,
-                ),
-                gguf::GgmlType::Q4_K => (
-                    if batch {
-                        PipeId::MatvecQ4KB
-                    } else {
-                        PipeId::MatvecQ4K
-                    },
-                    rows_q5k,
-                ),
-                _ => (
-                    if batch {
-                        PipeId::MatvecQ6KB
-                    } else {
-                        PipeId::MatvecQ6K
-                    },
-                    8,
-                ),
+            // shaders Q8_0 e Q6_K. O GEMM, quando ligado, cobre `BM` linhas por workgroup.
+            let (pipe, rows_por_wg) = if gemm_para(cols, w.ty) {
+                (PipeId::MulMmQ4K, GEMM_LINHAS_POR_WG as usize)
+            } else {
+                match w.ty {
+                    gguf::GgmlType::Q8_0 => (
+                        if batch {
+                            PipeId::MatvecB
+                        } else {
+                            PipeId::Matvec
+                        },
+                        MATVEC_NUM_ROWS as usize,
+                    ),
+                    gguf::GgmlType::Q5_K => (
+                        if batch {
+                            PipeId::MatvecQ5KB
+                        } else {
+                            PipeId::MatvecQ5K
+                        },
+                        rows_q5k,
+                    ),
+                    gguf::GgmlType::Q4_K => (
+                        if batch {
+                            PipeId::MatvecQ4KB
+                        } else {
+                            PipeId::MatvecQ4K
+                        },
+                        rows_q5k,
+                    ),
+                    _ => (
+                        if batch {
+                            PipeId::MatvecQ6KB
+                        } else {
+                            PipeId::MatvecQ6K
+                        },
+                        8,
+                    ),
+                }
             };
             mk(
                 pipe,
@@ -3579,10 +3662,149 @@ impl<'ctx> ResidentForward<'ctx> {
             .map_or(Shard::whole(0, 0), |st| st.cfg.shard)
     }
 
+    /// Guarda estado recorrente, janela da convolução e comprimento do KV como estão agora.
+    ///
+    /// É o que torna barata a divergência de prompt entre dois turnos. O KV-cache de
+    /// atenção volta atrás sozinho — basta recuar o comprimento e reescrever os slots —,
+    /// mas o estado recorrente das camadas delta-net é o produto de todos os tokens em
+    /// ordem, e sem uma cópia dele a divergência custa reprocessar o prompt inteiro.
+    ///
+    /// Um snapshot só: o novo sobrescreve o anterior. A fronteira que interessa é o fim do
+    /// prefill de cada requisição, porque o que diverge no turno seguinte é o **re-render**
+    /// da resposta que veio depois dela (bloco de raciocínio removido, chamada de
+    /// ferramenta reformatada); guardar o fim da resposta deixaria a divergência antes do
+    /// snapshot, que é justamente o caso que ele não cobre.
+    pub fn marcar_snapshot(&self) -> bool {
+        let Some(st) = self.state.as_ref() else {
+            return false;
+        };
+        if !self.alocar_snapshot(st) {
+            return false;
+        }
+        let snap = st.snap.borrow();
+        let pares: Vec<(&Buf, &Buf)> = st
+            .aux
+            .iter()
+            .filter_map(|la| la.delta.as_ref())
+            .zip(snap.iter())
+            .flat_map(|(dn, (e, j))| [(&dn.estado, e), (&dn.janela, j)])
+            .collect();
+        if !self.copiar_bufs(&pares) {
+            return false;
+        }
+        st.snap_len.set(Some(*st.len.borrow()));
+        true
+    }
+
+    /// Aloca os buffers do snapshot na primeira chamada. `false` se a VRAM não deu — e aí
+    /// a sessão segue sem snapshot, reprocessando na divergência como antes.
+    fn alocar_snapshot(&self, st: &ResidentState) -> bool {
+        let mut snap = st.snap.borrow_mut();
+        if !snap.is_empty() {
+            return true;
+        }
+        let d = &self.dev.device;
+        for la in &st.aux {
+            let Some(dn) = la.delta.as_ref() else {
+                continue;
+            };
+            let (Ok(e), Ok(j)) = (
+                Buf::device(self.ctx, self.phys(), d, dn.estado.size),
+                Buf::device(self.ctx, self.phys(), d, dn.janela.size),
+            ) else {
+                for (e, j) in snap.drain(..) {
+                    e.destroy(d);
+                    j.destroy(d);
+                }
+                return false;
+            };
+            snap.push((e, j));
+        }
+        true
+    }
+
+    /// Volta ao último [`marcar_snapshot`]. `false` quando não há snapshot válido — e aí o
+    /// chamador não tem alternativa senão reprocessar do zero.
+    pub fn restaurar_snapshot(&self) -> bool {
+        let Some(st) = self.state.as_ref() else {
+            return false;
+        };
+        let Some(len) = st.snap_len.get() else {
+            return false;
+        };
+        let snap = st.snap.borrow();
+        let pares: Vec<(&Buf, &Buf)> = st
+            .aux
+            .iter()
+            .filter_map(|la| la.delta.as_ref())
+            .zip(snap.iter())
+            .flat_map(|(dn, (e, j))| [(e, &dn.estado), (j, &dn.janela)])
+            .collect();
+        if !self.copiar_bufs(&pares) {
+            return false;
+        }
+        // O KV-cache não precisa ser limpo: as posições a partir daqui serão reescritas
+        // pelos tokens novos, e a atenção só olha `total_len` posições.
+        *st.len.borrow_mut() = len;
+        true
+    }
+
+    /// Copia `(origem, destino)` em um command buffer só e espera. Acontece entre
+    /// requisições, com a GPU ociosa — é o mesmo caminho de `reset_len`.
+    fn copiar_bufs(&self, pares: &[(&Buf, &Buf)]) -> bool {
+        if pares.is_empty() {
+            return true;
+        }
+        let d = &self.dev.device;
+        // SAFETY: GPU ociosa entre sequências; buffers criados por nós, com tamanhos iguais.
+        unsafe {
+            let _ = d.device_wait_idle();
+            let cb_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.dev.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
+                return false;
+            };
+            let cmd = cbs[0];
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            let mut ok = false;
+            if d.begin_command_buffer(cmd, &begin).is_ok() {
+                for (src, dst) in pares {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: src.size.min(dst.size),
+                    };
+                    d.cmd_copy_buffer(cmd, src.buffer, dst.buffer, &[region]);
+                }
+                ok = d.end_command_buffer(cmd).is_ok();
+                let submit = vk::SubmitInfo {
+                    command_buffer_count: 1,
+                    p_command_buffers: &cmd,
+                    ..Default::default()
+                };
+                ok &= d
+                    .queue_submit(self.dev.queue, &[submit], vk::Fence::null())
+                    .is_ok();
+                ok &= d.queue_wait_idle(self.dev.queue).is_ok();
+            }
+            d.free_command_buffers(self.dev.cmd_pool, &cbs);
+            ok
+        }
+    }
+
     /// Zera o comprimento do KV-cache (início de nova sequência).
     pub fn reset_len(&self) {
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = 0;
+            // O snapshot pertence à sequência que acabou de ser descartada.
+            st.snap_len.set(None);
             // Nas camadas de atenção linear não há comprimento de KV-cache para zerar: o
             // histórico está no estado recorrente e na janela da convolução, que precisam
             // voltar a zero — é o que representa "contexto vazio" nesta arquitetura.
@@ -3757,10 +3979,20 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
         self.decode_shard_batch(tokens, pos0, None)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
     }
+    /// Zera o comprimento do KV-cache **e** o estado recorrente das camadas lineares.
+    ///
+    /// Recuar só o comprimento bastava enquanto todas as camadas eram de atenção: os slots
+    /// do cache são reescritos pelos tokens novos. No qwen35 o histórico das 48 camadas
+    /// delta-net está num estado que ninguém sobrescreve, e uma sequência nova começando
+    /// sobre o estado da anterior gera texto influenciado por ela.
     fn reset(&self) {
-        if let Some(st) = self.state.as_ref() {
-            *st.len.borrow_mut() = 0;
-        }
+        self.reset_len();
+    }
+    fn marcar(&self) -> bool {
+        self.marcar_snapshot()
+    }
+    fn restaurar(&self) -> bool {
+        self.restaurar_snapshot()
     }
 }
 
@@ -3807,6 +4039,10 @@ impl Drop for ResidentForward<'_> {
                 lq.ffn_down.gpu.destroy(d);
             }
             st.output_w.gpu.destroy(d);
+            for (estado, janela) in st.snap.borrow().iter() {
+                estado.destroy(d);
+                janela.destroy(d);
+            }
             for la in st.aux {
                 la.attn_norm.destroy(d);
                 la.ffn_norm.destroy(d);
@@ -3911,5 +4147,23 @@ mod tests {
 
         assert_eq!(total, 3);
         assert_eq!(slots, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    /// A largura que o tile do GEMM cobre. O mesmo predicado decide o `COLS` com que a
+    /// pipeline é compilada e se o plano emite `MulMmQ4K`; se os dois discordassem, o
+    /// dispatch rodaria com um tile de outra largura. O decode (`cols = 1`) e a projeção de
+    /// logits têm de ficar de fora sempre.
+    #[test]
+    fn largura_do_tile_do_gemm() {
+        use super::gemm_largura_ok;
+        for cols in [8usize, 16, 24, 32, 64] {
+            assert!(
+                gemm_largura_ok(cols),
+                "{cols} é múltiplo de 8 e cabe no tile"
+            );
+        }
+        for cols in [0usize, 1, 4, 12, 72] {
+            assert!(!gemm_largura_ok(cols), "{cols} não cabe no tile");
+        }
     }
 }

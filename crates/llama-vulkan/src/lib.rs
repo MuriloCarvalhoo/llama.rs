@@ -52,4 +52,6 @@ pub(crate) const DN_L2_QK_SPV: &[u8] = include_bytes!(concat!(env!("DN_L2_QK_SPV
 #[allow(dead_code)]
 pub(crate) const GATE_QUANT_SPV: &[u8] = include_bytes!(concat!(env!("GATE_QUANT_SPV")));
 #[allow(dead_code)]
+pub(crate) const MUL_MM_SPV: &[u8] = include_bytes!(concat!(env!("MUL_MM_SPV")));
+#[allow(dead_code)]
 pub(crate) const ADD_SPV: &[u8] = include_bytes!(concat!(env!("ADD_SPV")));

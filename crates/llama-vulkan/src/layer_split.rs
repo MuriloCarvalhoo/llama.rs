@@ -235,6 +235,20 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
             shard.reset_len();
         }
     }
+
+    /// O snapshot é por shard: cada GPU guarda o estado das camadas que ela executa. Só
+    /// vale se **todos** aceitarem — meia sequência recuada é pior que reprocessar. Daí o
+    /// `&` no lugar de `&&`: todos os shards têm de ser visitados de qualquer jeito.
+    fn marcar(&self) -> bool {
+        self.shards
+            .iter()
+            .fold(true, |ok, s| ok & s.marcar_snapshot())
+    }
+    fn restaurar(&self) -> bool {
+        self.shards
+            .iter()
+            .fold(true, |ok, s| ok & s.restaurar_snapshot())
+    }
 }
 
 use ash::vk;
