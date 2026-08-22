@@ -35,6 +35,8 @@ LLAMA_RS_SPLIT=31 numactl --interleave=all target/release/llama-cli \
 | MTP ligado (merge das frentes, pós-fix dos push constants) | **31,4** | 47,8 (passo de 2 tok) | 3 execuções: 32,6 30,6 30,9; greedy; verify = 23,8 + 24,0 ms |
 | MTP desligado (mesma build) | 21,8 | 40,7 | 3 execuções: 21,1 22,3 22,1; decode = 19,8 + 20,9 ms |
 | MTP ligado, contexto 9,3k | 22,1 | 59,5 (passo de 2 tok) | 1 execução; a atenção de contexto longo domina |
+| **MTP n=2 encadeado (2026-08-22)** | **34,5** | 56,2 (passo de 3 tok) | 3 execuções: 31,4 36,2 36,0; greedy; verify = 27,5 + 28,5 ms |
+| MTP n=2 pelo servidor (motor propor→verificar) | 36,2 | — | `[gen] decode 80 tok (36.2 tok/s)`, greedy; temp 0,8 dá 32,6 |
 | `LLAMA_RS_ROPE_KV=0` (agora padrão) | — | 40,2 | 3 execuções; a fusão rope→KV custava ~0,4 ms/token |
 | `LLAMA_RS_MATVEC_LDS_PAD=13` | — | 41,6 | 1 execução; pior, knob fica 0 |
 | `LLAMA_RS_MATVEC_LDS_PAD=22` | — | 51,2 | 1 execução; muito pior (−26 % de ocupância útil) |

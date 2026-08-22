@@ -173,12 +173,15 @@ token condicionados ao 1º ter acertado.
       O 2º token só é cobrado quando o 1º acertou, que é a condicional que interessa.
       O teste imprime `a₁`, `a₂` e os tokens/passo dos dois desenhos, e **não falha** por
       `a₂` baixo: ele existe para produzir o número.
-- [ ] **`a₂` ainda não foi medido.** Rodar e então decidir:
-      - `a₂ ≥ 40%` → `tokens/passo = 1 + a₁ + a₁·a₂ ≥ 1,85`, e um `plan_verify` com
-        `n_tok=3` e dois pontos de snapshot vira a forma mais barata de chegar a 50
-        (orçamento de passo sobe de 32 para ~37 ms);
-      - `a₂ < 40%` → ficar em n=1 e fechar os 50 pela frente 1 (base ≥33).
-- [x] n=2 **não** foi implementado no runtime, por decisão do plano: só o experimento.
+- [x] **`a₂` medido em 2026-08-21**: 41,7 % (5/12, condicionado ao 1º) → o critério
+      dos 40 % passou e o n=2 foi implementado em 2026-08-22: `VERIFY_TOK = 3`, dois
+      pontos de snapshot, `rollback_verify(manter)` e a proposta encadeada reusando o
+      plano da cabeça (`HIDDEN_CABECA` lê o residual do próprio bloco). Em geração
+      real greedy: **2,20 tokens/passo** (140/117) e 34,5 tok/s de média (36 nas
+      execuções quentes) contra 31,4 do n=1. Ver
+      `docs/planos/2026-08-22-decisoes-autonomas.md`.
+- [x] n=2 implementado também no motor do servidor (`Sessao::passo_mtp` + fila de
+      pendentes no `motor.rs`): 36,2 tok/s greedy ponta a ponta, 32,6 com temp 0,8.
 
 ## Critério de aceite da frente
 

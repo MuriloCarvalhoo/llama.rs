@@ -138,13 +138,22 @@ impl<'a> Motor<'a> {
         let mut detok = Detok::novo();
         let mut saida = Saida::nova(pedido.pensar, pedido.ferramentas.clone());
         let mut querem_mais = true;
+        let usar_mtp = self.gpu.tem_mtp();
+        // Tokens que um passo de MTP já validou (aceitos + o `seguinte` amostrado dentro
+        // do passo), esperando emissão. O último da fila é sempre o `seguinte`, que ainda
+        // não passou pelo modelo — quando ele sai, é hora do próximo passo.
+        let mut pendentes: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
         let t_decode = std::time::Instant::now();
         while res.tokens_saida < teto && querem_mais {
-            let t_amostra = std::time::Instant::now();
-            let escolhido = sampler.sample(&logits, &mut rng);
-            res.ms_amostragem += t_amostra.elapsed().as_secs_f64() * 1e3;
-            let token = u32::try_from(escolhido)
-                .map_err(|_| MotorError::Backend("token fora da faixa de u32".to_owned()))?;
+            let token = if let Some(t) = pendentes.pop_front() {
+                t
+            } else {
+                let t_amostra = std::time::Instant::now();
+                let escolhido = sampler.sample(&logits, &mut rng);
+                res.ms_amostragem += t_amostra.elapsed().as_secs_f64() * 1e3;
+                u32::try_from(escolhido)
+                    .map_err(|_| MotorError::Backend("token fora da faixa de u32".to_owned()))?
+            };
             if self.fim.contains(&token) {
                 res.parada = Some(Parada::Fim);
                 break;
@@ -162,11 +171,24 @@ impl<'a> Motor<'a> {
                 res.parada = Some(Parada::Fim);
                 break;
             }
-            logits = self
-                .sessao
-                .decode(self.gpu, token)
-                .map_err(erro_backend)?
-                .to_vec();
+            if !pendentes.is_empty() {
+                // Um aceito do passo anterior: já está no cache, nada a decodificar.
+                continue;
+            }
+            if usar_mtp {
+                let passo = self
+                    .sessao
+                    .passo_mtp(self.gpu, &sampler, &mut rng, token)
+                    .map_err(erro_backend)?;
+                pendentes.extend(passo.aceitos.iter().flatten());
+                pendentes.push_back(passo.seguinte);
+            } else {
+                logits = self
+                    .sessao
+                    .decode(self.gpu, token)
+                    .map_err(erro_backend)?
+                    .to_vec();
+            }
         }
 
         res.ms_decode = t_decode.elapsed().as_secs_f64() * 1e3;

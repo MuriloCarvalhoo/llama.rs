@@ -119,12 +119,14 @@ Medido no protocolo padrão (`docs/decode-por-configuracao.md`), contexto curto:
 | meta | alvo | medido |
 |---|---|---|
 | frente 1 — base sem MTP | ≤30 ms | 40,2 ms (knobs LDS/rope medidos e piores; sobrou a geometria do matvec) |
-| frente 2 — MTP por flag | ≥46 tok/s | **31,4 tok/s** (+44 % sobre a base; verify de 2 custa +17 %) |
+| frente 2 — MTP por flag | ≥46 tok/s | 31,4 tok/s com n=1 (+44 %); **34,5–36 com n=2 encadeado** |
 | frente 3 — prefill | ≥180 tok/s | 92 tok/s (batch 24 + GEMM, −42 % vs batch 8) |
 | frente 4 — carga warm | ≤6 s | **4,5–5,0 s** ✓ |
-| aceitação encadeada n=2 | ≥40 % para valer | **41,7 %** → 1,80 tok/passo — próxima frente |
+| aceitação encadeada n=2 | ≥40 % para valer | **41,7 %** no experimento; em geração real, 2,20 tok/passo |
 
-O que falta para 50: a base de 40 ms não caiu (matvec ainda a 506 GB/s no Q4_K) e o
-n=2 não está ligado. Com a base atual, o teto do n=2 é ~34 tok/s; os dois juntos
-(base ≤30 ms + n=2) é que cruzam os 50. Em contexto 9,3k o MTP rende 22,1 tok/s —
-a atenção longa (`docs/…atencao…`) segue sendo o gargalo que nenhuma frente atacou.
+Atualização 2026-08-22: o n=2 encadeado foi implementado (verify de 3 tokens, 56,2 ms
+de GPU — 1,4 ms a mais que o de 2) e ligado também no motor do servidor: **36,2 tok/s
+greedy ponta a ponta** (32,6 com temp 0,8). O que falta para 50: a base de 40 ms não
+caiu (matvec ainda a 506 GB/s no Q4_K) — com ela em ≤30 ms, os mesmos 2,20 tok/passo
+dariam ~48–52. Em contexto 9,3k o MTP rende 22,1 tok/s — a atenção longa segue sendo
+o gargalo que nenhuma frente atacou.

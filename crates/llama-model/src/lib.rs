@@ -33,8 +33,9 @@ pub use config::{DeltaNetConfig, LlamaConfig};
 pub use error::ModelError;
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode, MixerRaw,
-    MtpAux, MtpRaw, QTensor, TokenEmbd, gerar_streaming_residente,
+    AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode,
+    HIDDEN_CABECA, MixerRaw, MtpAux, MtpRaw, PassoMtp, QTensor, TokenEmbd, VERIFY_TOK,
+    gerar_streaming_residente,
 };
 pub use model::Model;
 #[cfg(feature = "gpu")]

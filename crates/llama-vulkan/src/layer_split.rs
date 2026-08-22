@@ -293,10 +293,10 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
     }
 
     /// O verify atravessa os shards como o batch: a stream residual que passa entre as
-    /// GPUs carrega os dois tokens, e só o último devolve logits.
+    /// GPUs carrega os tokens do bloco, e só o último devolve logits.
     fn decode_verify(
         &self,
-        tokens: &[u32; 2],
+        tokens: &[u32; llama_model::VERIFY_TOK],
         pos0: usize,
     ) -> Result<Vec<f32>, llama_model::ModelError> {
         let mut carry: Option<Vec<f32>> = None;
@@ -309,11 +309,11 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
         carry.ok_or_else(|| llama_model::ModelError::Gpu("nenhum shard".into()))
     }
 
-    /// O estado recorrente está dividido entre os shards: todos desfazem o segundo token.
-    fn rollback_verify(&self) -> Result<(), llama_model::ModelError> {
+    /// O estado recorrente está dividido entre os shards: todos desfazem os rejeitados.
+    fn rollback_verify(&self, manter: usize) -> Result<(), llama_model::ModelError> {
         for shard in &self.shards {
             shard
-                .rollback_verify()
+                .rollback_verify(manter)
                 .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         }
         Ok(())

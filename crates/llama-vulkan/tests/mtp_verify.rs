@@ -195,85 +195,98 @@ fn erro_rel(a: &[f32], b: &[f32]) -> f32 {
         .fold(0f32, |m, (x, y)| m.max((x - y).abs() / y.abs().max(1.0)))
 }
 
-/// `decode_verify([a, b])` tem de devolver, na primeira metade, os mesmos logits que
-/// `decode(a)` daria, e na segunda os de `decode(b)` logo em seguida.
+/// `decode_verify([a, b, c])` tem de devolver, terço a terço, os mesmos logits que
+/// `decode(a)`, `decode(b)` e `decode(c)` dariam em sequência.
 ///
-/// É o contrato da fase C inteira: se a segunda coluna do matvec de logits lesse a ativação
-/// errada, ou se a máscara causal do bloco deixasse o token 0 enxergar o token 1, o erro
+/// É o contrato da fase C inteira: se uma coluna do matvec de logits lesse a ativação
+/// errada, ou se a máscara causal do bloco deixasse um token enxergar um posterior, o erro
 /// apareceria aqui — e em nenhum dos testes de decode existentes.
 #[test]
 fn decode_verify_bate_com_o_decode_token_a_token() {
     backend_mtp!(bytes, ctx, cfg, raw, aux, backend, 256);
     let prompt: [u32; 4] = [46, 3837, 101, 9707];
-    let (a, b) = (785u32, 1749u32);
+    let bloco: [u32; 3] = [785, 1749, 653];
 
-    // Caminho de referência: os dois tokens, um de cada vez.
+    // Caminho de referência: os três tokens, um de cada vez.
     backend.reset();
     for (pos, &t) in prompt.iter().enumerate() {
         backend.decode(t, pos).unwrap();
     }
-    let l_a = backend.decode(a, prompt.len()).unwrap();
-    let l_b = backend.decode(b, prompt.len() + 1).unwrap();
+    let refs: Vec<Vec<f32>> = bloco
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| backend.decode(t, prompt.len() + i).unwrap())
+        .collect();
 
-    // Caminho do verify: os dois de uma vez, com os pesos lidos uma só vez.
+    // Caminho do verify: os três de uma vez, com os pesos lidos uma só vez.
     backend.reset();
     for (pos, &t) in prompt.iter().enumerate() {
         backend.decode(t, pos).unwrap();
     }
-    let dois = backend.decode_verify(&[a, b], prompt.len()).unwrap();
-    assert_eq!(dois.len(), cfg.vocab * 2, "o verify devolve os dois logits");
-    let (v0, v1) = dois.split_at(cfg.vocab);
+    let tres = backend.decode_verify(&bloco, prompt.len()).unwrap();
+    assert_eq!(tres.len(), cfg.vocab * 3, "o verify devolve os três logits");
 
-    assert_eq!(
-        argmax(v0),
-        argmax(&l_a),
-        "argmax do primeiro token divergiu"
-    );
-    assert_eq!(argmax(v1), argmax(&l_b), "argmax do segundo token divergiu");
-    let (e0, e1) = (erro_rel(v0, &l_a), erro_rel(v1, &l_b));
-    assert!(e0 < 1e-2, "logits[0]: erro relativo {e0}");
-    assert!(e1 < 1e-2, "logits[1]: erro relativo {e1}");
-    eprintln!("decode_verify == decode token a token (erro rel {e0:.2e} / {e1:.2e})");
+    for (i, l_ref) in refs.iter().enumerate() {
+        let v = &tres[i * cfg.vocab..(i + 1) * cfg.vocab];
+        assert_eq!(argmax(v), argmax(l_ref), "argmax do token {i} divergiu");
+        let e = erro_rel(v, l_ref);
+        assert!(e < 1e-2, "logits[{i}]: erro relativo {e}");
+    }
+    eprintln!("decode_verify == decode token a token nos 3 tokens");
 }
 
 /// Depois de uma rejeição, o estado recorrente e o comprimento do KV têm de voltar ao que
-/// eram com **um** token processado — senão a geração diverge a partir dali.
+/// eram com os tokens mantidos — senão a geração diverge a partir dali.
 ///
-/// A proposta é errada de propósito, que é o caso raro (39% dos passos medidos) e o único
-/// que exercita o `rollback_verify`.
+/// Exercita os **dois** pontos de rollback do bloco de 3: rejeição na 1ª proposta
+/// (`manter = 1`) e na encadeada (`manter = 2`). As propostas são erradas de propósito.
 #[test]
 fn rollback_restaura_o_estado_de_um_token() {
     backend_mtp!(bytes, ctx, cfg, raw, aux, backend, 256);
     let prompt: [u32; 4] = [46, 3837, 101, 9707];
-    let a = 785u32;
-    // Um token qualquer que não vai ser o proposto — a rejeição é o ponto do teste.
-    let proposta_errada = 12345u32;
-    let seguinte = 1749u32;
+    let (a, b) = (785u32, 1749u32);
+    // Tokens quaisquer que não vão ser os amostrados — a rejeição é o ponto do teste.
+    let (errada1, errada2) = (12345u32, 54321u32);
+    let seguinte = 653u32;
 
-    // Referência: só `a`, e depois `seguinte`.
-    backend.reset();
-    for (pos, &t) in prompt.iter().enumerate() {
-        backend.decode(t, pos).unwrap();
+    for manter in [1usize, 2] {
+        // Referência: os `manter` tokens do bloco, e depois `seguinte`.
+        backend.reset();
+        for (pos, &t) in prompt.iter().enumerate() {
+            backend.decode(t, pos).unwrap();
+        }
+        for (i, &t) in [a, b][..manter].iter().enumerate() {
+            backend.decode(t, prompt.len() + i).unwrap();
+        }
+        let esperado = backend.decode(seguinte, prompt.len() + manter).unwrap();
+
+        // Verify com rejeição no ponto certo + rollback, e então o mesmo `seguinte`.
+        backend.reset();
+        for (pos, &t) in prompt.iter().enumerate() {
+            backend.decode(t, pos).unwrap();
+        }
+        let bloco = if manter == 1 {
+            [a, errada1, errada2]
+        } else {
+            [a, b, errada2]
+        };
+        let tres = backend.decode_verify(&bloco, prompt.len()).unwrap();
+        assert_eq!(tres.len(), cfg.vocab * 3);
+        backend.rollback_verify(manter).unwrap();
+        let obtido = backend.decode(seguinte, prompt.len() + manter).unwrap();
+
+        assert_eq!(
+            argmax(&obtido),
+            argmax(&esperado),
+            "argmax pós-rollback (manter {manter})"
+        );
+        let e = erro_rel(&obtido, &esperado);
+        assert!(
+            e < 1e-2,
+            "logits pós-rollback (manter {manter}): erro relativo {e}"
+        );
+        eprintln!("rollback com manter={manter} restaura o estado (erro rel {e:.2e})");
     }
-    backend.decode(a, prompt.len()).unwrap();
-    let esperado = backend.decode(seguinte, prompt.len() + 1).unwrap();
-
-    // Verify rejeitado + rollback, e então o mesmo `seguinte`.
-    backend.reset();
-    for (pos, &t) in prompt.iter().enumerate() {
-        backend.decode(t, pos).unwrap();
-    }
-    let dois = backend
-        .decode_verify(&[a, proposta_errada], prompt.len())
-        .unwrap();
-    assert_eq!(dois.len(), cfg.vocab * 2);
-    backend.rollback_verify().unwrap();
-    let obtido = backend.decode(seguinte, prompt.len() + 1).unwrap();
-
-    assert_eq!(argmax(&obtido), argmax(&esperado), "argmax pós-rollback");
-    let e = erro_rel(&obtido, &esperado);
-    assert!(e < 1e-2, "logits pós-rollback: erro relativo {e}");
-    eprintln!("rollback restaura o estado de um token (erro rel {e:.2e})");
 }
 
 /// A cabeça MTP da GPU tem de propor exatamente o que `MtpHead::propor` (CPU) propõe.
@@ -365,35 +378,45 @@ fn greedy_com_mtp_gera_a_mesma_sequencia() {
     let mut pos = prompt.len();
     let mut hidden = 0usize;
     let mut next = argmax(&logits);
-    let mut com_mtp = Vec::with_capacity(N + 1);
+    let mut com_mtp = Vec::with_capacity(N + 2);
     let (mut aceitos, mut passos) = (0usize, 0usize);
     while com_mtp.len() < N {
         com_mtp.push(next);
-        let proposta = backend.propor_mtp(next, hidden).unwrap();
-        let dois = backend.decode_verify(&[next, proposta], pos).unwrap();
-        let (v0, v1) = dois.split_at(cfg.vocab);
-        let t1 = argmax(v0);
+        let p1 = backend.propor_mtp(next, hidden).unwrap();
+        let p2 = backend.propor_mtp(p1, llama_model::HIDDEN_CABECA).unwrap();
+        let tres = backend.decode_verify(&[next, p1, p2], pos).unwrap();
+        let t1 = argmax(&tres[..cfg.vocab]);
         passos += 1;
-        if t1 == proposta {
-            aceitos += 1;
-            pos += 2;
-            hidden = 1;
-            com_mtp.push(t1);
-            next = argmax(v1);
-        } else {
-            backend.rollback_verify().unwrap();
+        if t1 != p1 {
+            backend.rollback_verify(1).unwrap();
             pos += 1;
             hidden = 0;
             next = t1;
+            continue;
         }
+        aceitos += 1;
+        com_mtp.push(t1);
+        let t2 = argmax(&tres[cfg.vocab..2 * cfg.vocab]);
+        if t2 != p2 {
+            backend.rollback_verify(2).unwrap();
+            pos += 2;
+            hidden = 1;
+            next = t2;
+            continue;
+        }
+        aceitos += 1;
+        com_mtp.push(t2);
+        pos += 3;
+        hidden = 2;
+        next = argmax(&tres[2 * cfg.vocab..]);
     }
     com_mtp.truncate(N);
 
     #[allow(clippy::cast_precision_loss)]
     let taxa = aceitos as f64 / passos.max(1) as f64;
     eprintln!(
-        "aceitação em geração real: {aceitos}/{passos} = {:.1}% ({:.2} tokens/passo)",
-        taxa * 100.0,
+        "aceitação em geração real (n=2 encadeado): {aceitos}/{passos} = {:.2} aceitos/passo ({:.2} tokens/passo)",
+        taxa,
         1.0 + taxa
     );
     let divergiu = sem_mtp

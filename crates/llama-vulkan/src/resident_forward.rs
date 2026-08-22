@@ -44,13 +44,13 @@ pub(crate) fn batch_size() -> usize {
         .clamp(1, 32)
 }
 
-/// Tokens do bloco de **verificação** do MTP: o token já amostrado e a proposta da cabeça.
+/// Tokens do bloco de **verificação** do MTP: o token já amostrado, a proposta da cabeça
+/// e a proposta encadeada (a cabeça realimentada com o próprio hidden — o experimento da
+/// tarefa 6 mediu 41,7 % de aceitação condicionada no 2º, acima do limiar do plano).
 ///
-/// É largura fixa, não configurável: o ganho do speculative decoding com esta cabeça é
-/// `1 + aceitação` e a cabeça propõe **um** token (`nextn_predict_layers = 1`). Uma largura
-/// maior exigiria realimentar a cabeça com a própria previsão, o que o experimento da
-/// tarefa 6 (`tests/mtp_aceitacao.rs`) mede antes de qualquer código de produção.
-pub(crate) const VERIFY_TOK: usize = 2;
+/// O valor mora no `llama-model` porque o laço de geração e o trait compartilham a
+/// largura; aqui ele fixa `COLS` das pipelines de verify e o nº de snapshots.
+pub(crate) const VERIFY_TOK: usize = llama_model::VERIFY_TOK;
 
 /// Qual dos três planos do shard executar.
 ///
@@ -62,7 +62,8 @@ pub(crate) enum Modo {
     Decode,
     /// `cfg.n_batch` tokens, logits só do último — o prefill.
     Batch,
-    /// Dois tokens, logits dos **dois**, com snapshot do estado recorrente entre eles.
+    /// `VERIFY_TOK` tokens, logits de **todos**, com snapshot do estado recorrente entre
+    /// cada par consecutivo.
     Verify,
 }
 
@@ -429,13 +430,15 @@ pub(crate) struct DeltaBufs {
     pub estado: Buf,
     /// [conv_dim * (d_conv - 1)] — os tokens anteriores que a convolução ainda enxerga.
     pub janela: Buf,
-    /// Cópia de `estado` e `janela` **depois do primeiro** dos dois tokens do verify.
+    /// Cópias de `estado` e `janela` depois de cada token do verify menos o último —
+    /// `snap[i]` guarda o estado **depois do token `i`** do bloco.
     ///
-    /// É o que o rollback restaura quando a proposta da cabeça MTP é rejeitada: o token
-    /// já amostrado vale, o proposto não. `None` sem MTP — são 3,2 MB por camada, 155 MB
-    /// no Qwen3.8-27B, que não faz sentido reservar no caminho padrão.
-    pub estado_snap: Option<Buf>,
-    pub janela_snap: Option<Buf>,
+    /// É o que o rollback restaura quando uma proposta da cabeça MTP é rejeitada: manter
+    /// `m` tokens é restaurar `snap[m - 1]`. Vazios sem MTP — são 3,2 MB por camada e
+    /// ponto (310 MB total no Qwen3.8-27B), que não faz sentido reservar no caminho
+    /// padrão.
+    pub estado_snap: Vec<Buf>,
+    pub janela_snap: Vec<Buf>,
 }
 
 /// Identifica qual pipeline um dispatch usa (resolvido em `pipe_of`).
@@ -452,7 +455,7 @@ pub(crate) enum PipeId {
     MatvecQ4KB,
     /// GEMM Q4_K com tiling em LDS — experimental, ver [`gemm_prefill`].
     MulMmQ4K,
-    /// As mesmas quatro com `COLS = 2`: só o plano de verify do MTP as usa.
+    /// As mesmas quatro com `COLS = VERIFY_TOK`: só o plano de verify do MTP as usa.
     MatvecV,
     MatvecQ5KV,
     MatvecQ6KV,
@@ -838,7 +841,7 @@ pub(crate) struct ResidentState<'w> {
     /// Command buffer gravado **uma vez** com as cópias de volta dos snapshots. O
     /// conteúdo é estático (origem, destino e tamanho não mudam), então a rejeição custa
     /// só um submit. `None` sem MTP ou sem camada de atenção linear.
-    pub rollback_cmd: Option<vk::CommandBuffer>,
+    pub rollback_cmds: Vec<vk::CommandBuffer>,
     pub token_cmd: vk::CommandBuffer,
     pub token_fence: vk::Fence,
     /// Perfilamento por op via timestamp queries. `Some` só com LLAMA_RS_PROFILE=1.
@@ -917,7 +920,7 @@ pub struct ResidentForward<'ctx> {
     /// GEMM Q4_K com tiling em LDS, para o prefill. Criada sempre; só entra no plano com
     /// `LLAMA_RS_PREFILL_GEMM=1` — ver [`gemm_prefill`].
     pub(crate) mul_mm_q4k: ComputePipeline,
-    // As mesmas quatro com COLS = 2, para o plano de verify do MTP.
+    // As mesmas quatro com COLS = VERIFY_TOK, para o plano de verify do MTP.
     pub(crate) matvec_v: ComputePipeline,
     pub(crate) matvec_q5k_v: ComputePipeline,
     pub(crate) matvec_q6k_v: ComputePipeline,
@@ -1532,13 +1535,18 @@ impl<'ctx> ResidentForward<'ctx> {
                                 .flat_map(|h| [da.a[h], da.dt_bias[h]])
                                 .collect();
                             let janela_len = conv_dim_de(dn) * (dn.d_conv - 1);
-                            // Os snapshots só existem com MTP: 3,2 MB por camada que o
-                            // caminho padrão nunca leria.
-                            let snap = |n: usize| -> Result<Option<Buf>, MatmulError> {
+                            // Os snapshots só existem com MTP: 3,2 MB por camada e ponto
+                            // que o caminho padrão nunca leria. Um ponto por token do
+                            // verify menos o último.
+                            let snap = |n: usize| -> Result<Vec<Buf>, MatmulError> {
                                 if mtp {
-                                    Ok(Some(Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)?))
+                                    (0..VERIFY_TOK - 1)
+                                        .map(|_| {
+                                            Buf::device(ctx, phys, d, (n * 4) as vk::DeviceSize)
+                                        })
+                                        .collect()
                                 } else {
-                                    Ok(None)
+                                    Ok(Vec::new())
                                 }
                             };
                             Some(DeltaBufs {
@@ -1759,7 +1767,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 mtp: mtp_bufs,
                 mtp_plan: Vec::new(),
                 mtp_barreiras: Vec::new(),
-                rollback_cmd: None,
+                rollback_cmds: Vec::new(),
                 token_cmd,
                 token_fence,
                 prof: None,
@@ -1845,7 +1853,9 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(me)
     }
 
-    /// Grava, uma vez, o command buffer que restaura os snapshots do estado recorrente.
+    /// Grava, uma vez, os command buffers que restauram os snapshots do estado
+    /// recorrente — um por ponto de rollback (`cmds[i]` restaura o estado depois do
+    /// token `i` do bloco, ou seja, mantém `i + 1` tokens).
     ///
     /// O conteúdo é estático — origem, destino e tamanho de cada cópia são conhecidos na
     /// construção —, então a rejeição de uma proposta custa só um submit, sem gravação.
@@ -1855,49 +1865,54 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(st) = self.state.as_ref() else {
             return Ok(());
         };
-        // As cópias existem só onde há snapshot, ou seja, com MTP e camada linear.
-        let copias: Vec<(vk::Buffer, vk::Buffer, vk::DeviceSize)> = st
-            .aux
-            .iter()
-            .filter_map(|la| la.delta.as_ref())
-            .flat_map(|dn| {
-                dn.estado_snap
-                    .iter()
-                    .map(|s| (s.buffer, dn.estado.buffer, dn.estado.size))
-                    .chain(
-                        dn.janela_snap
-                            .iter()
-                            .map(|s| (s.buffer, dn.janela.buffer, dn.janela.size)),
-                    )
-            })
-            .collect();
-        if copias.is_empty() {
-            return Ok(());
-        }
-        let info = vk::CommandBufferAllocateInfo {
-            command_pool: cmd_pool,
-            level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        };
-        // SAFETY: device e pool válidos; o buffer é gravado agora e só resubmetido depois.
-        let cmd = unsafe { d.allocate_command_buffers(&info)? }[0];
-        let begin = vk::CommandBufferBeginInfo::default();
-        // SAFETY: cmd recém-alocado; as cópias apontam para buffers vivos no state.
-        unsafe {
-            d.begin_command_buffer(cmd, &begin)?;
-            for (src, dst, size) in &copias {
-                let region = vk::BufferCopy {
-                    src_offset: 0,
-                    dst_offset: 0,
-                    size: *size,
-                };
-                d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
+        let mut cmds = Vec::with_capacity(VERIFY_TOK - 1);
+        for ponto in 0..VERIFY_TOK - 1 {
+            // As cópias existem só onde há snapshot, ou seja, com MTP e camada linear.
+            let copias: Vec<(vk::Buffer, vk::Buffer, vk::DeviceSize)> = st
+                .aux
+                .iter()
+                .filter_map(|la| la.delta.as_ref())
+                .flat_map(|dn| {
+                    dn.estado_snap
+                        .get(ponto)
+                        .map(|s| (s.buffer, dn.estado.buffer, dn.estado.size))
+                        .into_iter()
+                        .chain(
+                            dn.janela_snap
+                                .get(ponto)
+                                .map(|s| (s.buffer, dn.janela.buffer, dn.janela.size)),
+                        )
+                })
+                .collect();
+            if copias.is_empty() {
+                return Ok(());
             }
-            d.end_command_buffer(cmd)?;
+            let info = vk::CommandBufferAllocateInfo {
+                command_pool: cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            // SAFETY: device e pool válidos; o buffer é gravado agora e resubmetido depois.
+            let cmd = unsafe { d.allocate_command_buffers(&info)? }[0];
+            let begin = vk::CommandBufferBeginInfo::default();
+            // SAFETY: cmd recém-alocado; as cópias apontam para buffers vivos no state.
+            unsafe {
+                d.begin_command_buffer(cmd, &begin)?;
+                for (src, dst, size) in &copias {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: *size,
+                    };
+                    d.cmd_copy_buffer(cmd, *src, *dst, &[region]);
+                }
+                d.end_command_buffer(cmd)?;
+            }
+            cmds.push(cmd);
         }
         if let Some(st) = self.state.as_mut() {
-            st.rollback_cmd = Some(cmd);
+            st.rollback_cmds = cmds;
         }
         Ok(())
     }
@@ -2443,8 +2458,9 @@ impl<'ctx> ResidentForward<'ctx> {
         let da = la.delta.as_ref().ok_or_else(faltando)?;
         // Sem os buffers de snapshot não há rollback possível, e um verify sem rollback
         // corrompe o estado na primeira rejeição — melhor falhar na construção do plano.
-        let estado_snap = da.estado_snap.as_ref().ok_or_else(faltando)?;
-        let janela_snap = da.janela_snap.as_ref().ok_or_else(faltando)?;
+        if da.estado_snap.len() != n_tok - 1 || da.janela_snap.len() != n_tok - 1 {
+            return Err(faltando());
+        }
 
         let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
         let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
@@ -2485,12 +2501,12 @@ impl<'ctx> ResidentForward<'ctx> {
         }
 
         // Convolução causal: a janela é estado, então os tokens entram em ordem e o
-        // snapshot dela fica entre os dois.
+        // snapshot dela fica entre cada par consecutivo.
         for t in 0..n_tok {
-            if t == 1 {
+            if t >= 1 {
                 plan.push(PlannedOp::Copia {
                     src: da.janela.buffer,
-                    dst: janela_snap.buffer,
+                    dst: da.janela_snap[t - 1].buffer,
                     bytes: da.janela.size,
                 });
             }
@@ -2533,10 +2549,10 @@ impl<'ctx> ResidentForward<'ctx> {
 
         // Recorrência, um token de cada vez, com o snapshot do estado entre eles.
         for t in 0..n_tok {
-            if t == 1 {
+            if t >= 1 {
                 plan.push(PlannedOp::Copia {
                     src: da.estado.buffer,
-                    dst: estado_snap.buffer,
+                    dst: da.estado_snap[t - 1].buffer,
                     bytes: da.estado.size,
                 });
             }
@@ -3306,13 +3322,23 @@ impl<'ctx> ResidentForward<'ctx> {
                     unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
                 }
                 PlannedOp::CopiaHidden => {
+                    // Com `HIDDEN_CABECA` a origem é o residual do próprio bloco MTP da
+                    // proposta anterior (`m.b_x`, ainda intacto: o `eh_proj` só o
+                    // sobrescreve depois desta cópia) — é o encadeamento n=2. Senão, um
+                    // dos hidden do tronco em `st.b_x`.
+                    let (src, src_offset) = if hidden_idx == llama_model::HIDDEN_CABECA {
+                        (m.b_x.buffer, 0)
+                    } else {
+                        (st.b_x.buffer, (hidden_idx * c.n_embd * 4) as vk::DeviceSize)
+                    };
                     let region = vk::BufferCopy {
-                        src_offset: (hidden_idx * c.n_embd * 4) as vk::DeviceSize,
+                        src_offset,
                         dst_offset: 0,
                         size: (c.n_embd * 4) as vk::DeviceSize,
                     };
-                    // SAFETY: `b_x` cobre `n_embd * n_batch` floats e `hidden_idx` é 0 ou 1.
-                    unsafe { d.cmd_copy_buffer(cmd, st.b_x.buffer, m.b_h.buffer, &[region]) };
+                    // SAFETY: `b_x` cobre `n_embd * nblk` floats e `hidden_idx` é menor
+                    // que o bloco do último passo (ou o sentinel, que lê `m.b_x` em 0).
+                    unsafe { d.cmd_copy_buffer(cmd, src, m.b_h.buffer, &[region]) };
                 }
                 PlannedOp::KvAppendMtp => {
                     let region = vk::BufferCopy {
@@ -4683,7 +4709,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let (unidade, por, nome) = match modo {
             Modo::Decode => ("tokens", "ms/token", "decode"),
             Modo::Batch => ("blocos", "ms/bloco", "prefill em batch"),
-            Modo::Verify => ("verifies", "ms/verify", "verify do MTP (2 tokens)"),
+            Modo::Verify => ("verifies", "ms/verify", "verify do MTP (3 tokens)"),
         };
         let sh = st.cfg.shard;
         eprintln!(
@@ -4752,9 +4778,9 @@ impl<'ctx> ResidentForward<'ctx> {
         self.decode_shard_batch(&[token], pos, x_in)
     }
 
-    /// Verifica dois tokens em posições consecutivas a partir de `pos0` e devolve os
-    /// logits dos **dois** (`2 × vocab`, o primeiro token primeiro) no último shard, ou a
-    /// stream residual dos dois nos demais.
+    /// Verifica `VERIFY_TOK` tokens em posições consecutivas a partir de `pos0` e devolve
+    /// os logits de **todos** (`VERIFY_TOK × vocab`, o primeiro token primeiro) no último
+    /// shard, ou a stream residual do bloco nos demais.
     ///
     /// É um passo de speculative decoding: `tokens[0]` é o token já amostrado e
     /// `tokens[1]` a proposta da cabeça MTP. Ler os pesos uma vez serve aos dois, que é o
@@ -4778,22 +4804,28 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
-    /// Desfaz o **segundo** token do último verify: restaura os snapshots do estado
-    /// recorrente e da janela da convolução, e recua o comprimento do KV em um.
+    /// Desfaz os tokens rejeitados do último verify, mantendo os `manter` primeiros:
+    /// restaura os snapshots do estado recorrente e da janela da convolução tirados
+    /// depois do token `manter - 1`, e recua o comprimento do KV em
+    /// `VERIFY_TOK - manter`.
     ///
-    /// O KV-cache não precisa de snapshot. As duas posições do verify são consecutivas e o
-    /// que o próximo passo escreve sobrescreve a segunda — recuar é só o contador, que é
-    /// escrituração: quem de fato decide a posição é o `pos` que o chamador passa adiante.
-    /// Com o `rope_kv` ligado o K já entrou no slot girado, e isso também não muda nada.
-    pub fn rollback_verify(&self) -> Result<(), MatmulError> {
+    /// O KV-cache não precisa de snapshot. As posições do verify são consecutivas e o
+    /// que o próximo passo escreve sobrescreve as rejeitadas — recuar é só o contador,
+    /// que é escrituração: quem de fato decide a posição é o `pos` que o chamador passa
+    /// adiante. Com o `rope_kv` ligado o K já entrou no slot girado, e isso também não
+    /// muda nada.
+    pub fn rollback_verify(&self, manter: usize) -> Result<(), MatmulError> {
+        if manter == 0 || manter >= VERIFY_TOK {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
         let st = self
             .state
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
         let mut len = st.len.borrow_mut();
-        *len = len.saturating_sub(1);
+        *len = len.saturating_sub(VERIFY_TOK - manter);
         drop(len);
-        let Some(cmd) = st.rollback_cmd else {
+        let Some(&cmd) = st.rollback_cmds.get(manter - 1) else {
             // Modelo sem camada de atenção linear: não há estado recorrente a restaurar.
             return Ok(());
         };
@@ -5248,14 +5280,14 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     }
     fn decode_verify(
         &self,
-        tokens: &[u32; 2],
+        tokens: &[u32; VERIFY_TOK],
         pos0: usize,
     ) -> Result<Vec<f32>, llama_model::ModelError> {
         self.verify_shard(tokens, pos0, None)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
     }
-    fn rollback_verify(&self) -> Result<(), llama_model::ModelError> {
-        ResidentForward::rollback_verify(self)
+    fn rollback_verify(&self, manter: usize) -> Result<(), llama_model::ModelError> {
+        ResidentForward::rollback_verify(self, manter)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
     }
     /// Zera o comprimento do KV-cache **e** o estado recorrente das camadas lineares.
@@ -5409,8 +5441,8 @@ impl Drop for ResidentForward<'_> {
             // SAFETY: token_cmd/token_fence criados por nós; GPU ociosa.
             unsafe {
                 d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
-                if let Some(cmd) = st.rollback_cmd {
-                    d.free_command_buffers(self.dev.cmd_pool, &[cmd]);
+                if !st.rollback_cmds.is_empty() {
+                    d.free_command_buffers(self.dev.cmd_pool, &st.rollback_cmds);
                 }
                 d.destroy_fence(st.token_fence, None);
             }

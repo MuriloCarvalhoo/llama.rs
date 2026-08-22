@@ -34,10 +34,8 @@ struct Args {
     gpu_layer_split: bool,
 
     /// Constrói o backend com a cabeça de multi-token prediction (`nextn`) e o plano de
-    /// verify. Desligado por padrão: custa ~155 MB de snapshot mais 289 MB do bloco.
-    ///
-    /// O laço do `motor.rs` ainda decodifica um token por passo — quem o converte para
-    /// propor→verificar é a frente que mexe em `Sessao`/TTFT.
+    /// verify, e o laço do motor passa a propor→verificar (2 propostas encadeadas por
+    /// passo). Desligado por padrão: custa ~310 MB de snapshots mais 289 MB do bloco.
     #[arg(long = "mtp", default_value_t = false)]
     mtp: bool,
 }

@@ -145,6 +145,9 @@ mod com_backend {
         /// Quantos tokens havia no cache quando o backend guardou o snapshot. `None`
         /// enquanto não houver um (backend sem suporte, ou sessão recém-zerada).
         marca: Option<usize>,
+        /// Índice, dentro do último passo de GPU, do hidden que produziu `logits` —
+        /// é dele que a cabeça MTP parte na próxima proposta.
+        hidden: usize,
     }
 
     impl Sessao {
@@ -155,6 +158,7 @@ mod com_backend {
                 tokens: Vec::new(),
                 logits: Vec::new(),
                 marca: None,
+                hidden: 0,
             }
         }
 
@@ -217,7 +221,40 @@ mod com_backend {
         ) -> Result<&[f32], ModelError> {
             self.logits = gpu.decode(token, self.tokens.len())?;
             self.tokens.push(token);
+            self.hidden = 0;
             Ok(&self.logits)
+        }
+
+        /// Um passo de speculative decoding sobre a sessão: propõe com a cabeça MTP
+        /// (encadeando), verifica e aceita ou desfaz — ver [`crate::gpu::passo_mtp`].
+        ///
+        /// `token` já foi amostrado pelo chamador e entra no cache junto com os
+        /// aceitos; `passo.seguinte` ainda não passou pelo modelo.
+        pub fn passo_mtp(
+            &mut self,
+            gpu: &dyn GpuResidentDecode,
+            sampler: &llama_sampling::Sampler,
+            rng: &mut impl rand::Rng,
+            token: u32,
+        ) -> Result<crate::gpu::PassoMtp, ModelError> {
+            let vocab = self.logits.len();
+            if vocab == 0 {
+                return Err(ModelError::Gpu("passo_mtp antes do prefill".into()));
+            }
+            let passo = crate::gpu::passo_mtp(
+                gpu,
+                sampler,
+                rng,
+                token,
+                self.hidden,
+                self.tokens.len(),
+                vocab,
+            )?;
+            self.tokens.push(token);
+            self.tokens.extend(passo.aceitos.iter().flatten());
+            self.hidden = passo.hidden;
+            self.logits.clone_from(&passo.logits_ultimo);
+            Ok(passo)
         }
 
         /// Prefill de `ids[pos0..]`: blocos de `batch_size()` e o resto token a token.
@@ -235,10 +272,12 @@ mod com_backend {
                     break;
                 };
                 self.logits = gpu.decode_batch(bloco, pos)?;
+                self.hidden = nb - 1;
                 pos += nb;
             }
             for &t in ids.get(pos..).unwrap_or(&[]) {
                 self.logits = gpu.decode(t, pos)?;
+                self.hidden = 0;
                 pos += 1;
             }
             self.tokens

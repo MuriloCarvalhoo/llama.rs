@@ -418,31 +418,51 @@ pub trait GpuResidentDecode {
 
     /// Propõe o token seguinte a `token` com a cabeça MTP.
     ///
-    /// `hidden_idx` diz de qual hidden do último passo partir: 0 depois de um decode
-    /// simples ou de um verify rejeitado, 1 depois de um verify **aceito** — nesse caso o
-    /// token de partida veio dos logits do segundo token do bloco.
+    /// `hidden_idx` diz de qual hidden partir: `0..VERIFY_TOK` indexa os hidden do tronco
+    /// no último passo (0 depois de um decode simples ou de um verify rejeitado no 1º; o
+    /// índice do último token aceito depois de um verify). [`HIDDEN_CABECA`] realimenta a
+    /// cabeça com o hidden **do próprio bloco** da proposta anterior — é o encadeamento
+    /// (n=2) medido em `aceitacao_encadeada_do_segundo_token`.
     fn propor_mtp(&self, token: u32, hidden_idx: usize) -> Result<u32, ModelError> {
         let _ = (token, hidden_idx);
         Err(ModelError::Gpu("backend sem cabeça MTP".into()))
     }
 
-    /// Processa os dois tokens de uma verificação nas posições `pos0` e `pos0 + 1` e
-    /// devolve os logits dos **dois**, concatenados (`2 × vocab`, o primeiro token
-    /// primeiro).
+    /// Processa os [`VERIFY_TOK`] tokens de uma verificação nas posições `pos0..` e
+    /// devolve os logits de **todos**, concatenados (`VERIFY_TOK × vocab`, o primeiro
+    /// token primeiro).
     ///
-    /// `tokens[0]` é o token já amostrado e `tokens[1]` a proposta da cabeça. Ler os pesos
-    /// uma vez serve aos dois — é daí que vem o ganho do speculative decoding.
-    fn decode_verify(&self, tokens: &[u32; 2], pos0: usize) -> Result<Vec<f32>, ModelError> {
+    /// `tokens[0]` é o token já amostrado; `tokens[1]` e `tokens[2]` são a proposta da
+    /// cabeça e a proposta encadeada. Ler os pesos uma vez serve aos três — é daí que vem
+    /// o ganho do speculative decoding.
+    fn decode_verify(
+        &self,
+        tokens: &[u32; VERIFY_TOK],
+        pos0: usize,
+    ) -> Result<Vec<f32>, ModelError> {
         let _ = (tokens, pos0);
         Err(ModelError::Gpu("backend sem plano de verify".into()))
     }
 
-    /// Desfaz o segundo token do último `decode_verify`: restaura o estado recorrente e
-    /// recua o comprimento do KV em um. Chamado só quando a proposta é rejeitada.
-    fn rollback_verify(&self) -> Result<(), ModelError> {
+    /// Desfaz os tokens rejeitados do último `decode_verify`, mantendo os `manter`
+    /// primeiros (1 quando a 1ª proposta falhou, 2 quando só a encadeada falhou):
+    /// restaura o snapshot do estado recorrente tirado depois do token `manter - 1` e
+    /// recua o comprimento do KV em `VERIFY_TOK - manter`.
+    fn rollback_verify(&self, manter: usize) -> Result<(), ModelError> {
+        let _ = manter;
         Err(ModelError::Gpu("backend sem plano de verify".into()))
     }
 }
+
+/// Tokens por passo de verify do MTP: o token já amostrado, a proposta da cabeça e a
+/// proposta encadeada (a cabeça realimentada com o próprio hidden). O valor fixa a
+/// largura das pipelines de verify (`COLS` é specialization constant) e o número de
+/// pontos de snapshot (`VERIFY_TOK - 1`).
+pub const VERIFY_TOK: usize = 3;
+
+/// Sentinela de `hidden_idx` em [`GpuResidentDecode::propor_mtp`]: alimentar a cabeça com
+/// o hidden do próprio bloco MTP da proposta anterior, em vez de um hidden do tronco.
+pub const HIDDEN_CABECA: usize = usize::MAX;
 
 impl<'a> GpuAuxWeights<'a> {
     /// Lê os pesos auxiliares direto do GGUF, sem passar pelo `Model`.
@@ -622,7 +642,7 @@ pub fn gerar_streaming_residente(
             let passo = passo_mtp(gpu, sampler, rng, next, hidden, pos, config.vocab)?;
             pos = passo.pos;
             hidden = passo.hidden;
-            if let Some(aceito) = passo.aceito {
+            for aceito in passo.aceitos.into_iter().flatten() {
                 if aceito == config.eos_id {
                     return Ok(());
                 }
@@ -677,28 +697,32 @@ fn prefill_residente(
 }
 
 /// O que um passo de speculative decoding produziu.
-struct PassoMtp {
-    /// O segundo token do passo, quando a proposta foi aceita.
-    aceito: Option<u32>,
+pub struct PassoMtp {
+    /// Os tokens do passo além do primeiro, quando aceitos (0, 1 ou 2 deles).
+    pub aceitos: [Option<u32>; VERIFY_TOK - 1],
     /// O token a emitir no próximo passo (ainda não passou pelo modelo).
-    seguinte: u32,
-    /// Posição seguinte no KV-cache: avança 2 na aceitação, 1 na rejeição.
-    pos: usize,
+    pub seguinte: u32,
+    /// Posição seguinte no KV-cache: avança 1 + nº de aceitos.
+    pub pos: usize,
     /// Qual hidden do passo alimenta a próxima proposta.
-    hidden: usize,
+    pub hidden: usize,
+    /// Logits do último token que ficou no cache — de onde `seguinte` foi amostrado.
+    /// A sessão os guarda para responder de graça a um prompt repetido.
+    pub logits_ultimo: Vec<f32>,
 }
 
-/// Um passo de speculative decoding: propor → verificar → aceitar ou desfazer.
+/// Um passo de speculative decoding: propor (encadeando) → verificar → aceitar ou desfazer.
 ///
-/// `token` já foi amostrado e emitido; a cabeça propõe o **seguinte** a ele e o verify
-/// processa os dois de uma vez, lendo os pesos uma única vez. A rejeição não desperdiça o
-/// forward: os logits do primeiro token do bloco **são** os do token correto seguinte, e
-/// por isso todo passo entrega pelo menos um token novo além de `token`.
+/// `token` já foi amostrado e emitido; a cabeça propõe o **seguinte** a ele, é
+/// realimentada com o próprio hidden para propor mais um, e o verify processa os três de
+/// uma vez, lendo os pesos uma única vez. A rejeição não desperdiça o forward: os logits
+/// do último token verificado **são** os do token correto seguinte, e por isso todo passo
+/// entrega pelo menos um token novo além de `token`.
 ///
-/// Com amostragem (temp > 0) a proposta só é aceita se coincidir com o token que o sampler
-/// tira dos logits[0] — a distribuição continua exatamente a do caminho sem MTP, e a taxa
-/// de aceitação cai na proporção da entropia.
-fn passo_mtp(
+/// Com amostragem (temp > 0) uma proposta só é aceita se coincidir com o token que o
+/// sampler tira dos logits do anterior — a distribuição continua exatamente a do caminho
+/// sem MTP, e a taxa de aceitação cai na proporção da entropia.
+pub fn passo_mtp(
     gpu: &dyn GpuResidentDecode,
     sampler: &llama_sampling::Sampler,
     rng: &mut impl rand::Rng,
@@ -707,27 +731,48 @@ fn passo_mtp(
     pos: usize,
     vocab: usize,
 ) -> Result<PassoMtp, ModelError> {
-    let proposta = gpu.propor_mtp(token, hidden)?;
-    let logits = gpu.decode_verify(&[token, proposta], pos)?;
-    let (l0, l1) = logits.split_at(vocab.min(logits.len()));
-    let t1 = u32::try_from(sampler.sample(l0, rng)).map_err(|_| ModelError::Overflow)?;
-    if t1 != proposta {
-        // Rejeitou: o token certo já veio nos logits[0]. Desfaz o segundo token do bloco.
-        gpu.rollback_verify()?;
+    let p1 = gpu.propor_mtp(token, hidden)?;
+    let p2 = gpu.propor_mtp(p1, HIDDEN_CABECA)?;
+    let logits = gpu.decode_verify(&[token, p1, p2], pos)?;
+    let fatia = |i: usize| -> Result<&[f32], ModelError> {
+        logits
+            .get(i * vocab..(i + 1) * vocab)
+            .ok_or_else(|| ModelError::Gpu("verify devolveu menos logits que o bloco".into()))
+    };
+    let amostra = |l: &[f32], rng: &mut _| -> Result<u32, ModelError> {
+        u32::try_from(sampler.sample(l, rng)).map_err(|_| ModelError::Overflow)
+    };
+    let t1 = amostra(fatia(0)?, rng)?;
+    if t1 != p1 {
+        // Rejeitou a 1ª: o token certo já veio nos logits[0]. Desfaz os dois do bloco.
+        gpu.rollback_verify(1)?;
         return Ok(PassoMtp {
-            aceito: None,
+            aceitos: [None; VERIFY_TOK - 1],
             seguinte: t1,
             pos: pos + 1,
             hidden: 0,
+            logits_ultimo: fatia(0)?.to_vec(),
         });
     }
-    let seguinte = u32::try_from(sampler.sample(l1, rng)).map_err(|_| ModelError::Overflow)?;
+    let t2 = amostra(fatia(1)?, rng)?;
+    if t2 != p2 {
+        gpu.rollback_verify(2)?;
+        return Ok(PassoMtp {
+            aceitos: [Some(t1), None],
+            seguinte: t2,
+            pos: pos + 2,
+            hidden: 1,
+            logits_ultimo: fatia(1)?.to_vec(),
+        });
+    }
+    let seguinte = amostra(fatia(2)?, rng)?;
     Ok(PassoMtp {
-        aceito: Some(t1),
+        aceitos: [Some(t1), Some(t2)],
         seguinte,
-        // O hidden que produziu `seguinte` é o do **segundo** token do bloco.
-        pos: pos + 2,
-        hidden: 1,
+        // O hidden que produziu `seguinte` é o do **último** token do bloco.
+        pos: pos + VERIFY_TOK,
+        hidden: VERIFY_TOK - 1,
+        logits_ultimo: fatia(2)?.to_vec(),
     })
 }
 
