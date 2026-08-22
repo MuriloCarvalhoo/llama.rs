@@ -42,6 +42,21 @@ impl<'ctx> LayerSplitForward<'ctx> {
         raw: &GpuRawWeights,
         aux: &GpuAuxWeights<'ctx>,
     ) -> Result<Self, MatmulError> {
+        Self::new_com(ctx, config, raw, aux, false)
+    }
+
+    /// Como [`Self::new`], com o multi-token prediction ligado em todos os shards.
+    ///
+    /// A cabeça em si só é montada no **último** shard, que é o que tem a norma final e
+    /// portanto o hidden que ela combina com o embedding — mas os snapshots do estado
+    /// recorrente são de cada shard, porque as camadas lineares estão divididas entre eles.
+    pub fn new_com(
+        ctx: &'ctx VulkanContext,
+        config: &LlamaConfig,
+        raw: &GpuRawWeights,
+        aux: &GpuAuxWeights<'ctx>,
+        mtp: bool,
+    ) -> Result<Self, MatmulError> {
         let devs = ctx.amd_compute_devices();
         if devs.len() < 2 {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
@@ -89,7 +104,7 @@ impl<'ctx> LayerSplitForward<'ctx> {
                 .filter(|&(_, &(first, end))| first != end)
                 .map(|(i, &(first, end))| {
                     escopo.spawn(move || {
-                        ResidentForward::new_shard(
+                        ResidentForward::new_shard_com(
                             ctx,
                             config,
                             raw,
@@ -100,6 +115,7 @@ impl<'ctx> LayerSplitForward<'ctx> {
                                 end_layer: end,
                                 n_layer_total: config.n_layer,
                             },
+                            mtp,
                         )
                         .map(EnviaShard)
                     })
@@ -248,6 +264,59 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
         self.shards
             .iter()
             .fold(true, |ok, s| ok & s.restaurar_snapshot())
+    }
+
+    /// A cabeça mora no último shard — é dele o hidden que ela consome.
+    fn tem_mtp(&self) -> bool {
+        self.shards.last().is_some_and(ResidentForward::tem_mtp)
+    }
+
+    /// A tabela de embedding só existe no **primeiro** shard (nos demais seriam 5 GB de
+    /// RAM sem uso), e a cabeça mora no último: a linha do token atravessa as duas GPUs
+    /// pelo host, 20 KB por passo.
+    fn propor_mtp(&self, token: u32, hidden_idx: usize) -> Result<u32, llama_model::ModelError> {
+        let erro = |m: String| llama_model::ModelError::Gpu(m);
+        let primeiro = self
+            .shards
+            .first()
+            .ok_or_else(|| erro("nenhum shard".to_owned()))?;
+        let ultimo = self
+            .shards
+            .last()
+            .ok_or_else(|| erro("nenhum shard".to_owned()))?;
+        let emb = primeiro
+            .linha_embd(token)
+            .ok_or_else(|| erro(format!("token {token} fora da tabela")))?;
+        ultimo
+            .propor_mtp(&emb, hidden_idx)
+            .map_err(|e| erro(e.to_string()))
+    }
+
+    /// O verify atravessa os shards como o batch: a stream residual que passa entre as
+    /// GPUs carrega os dois tokens, e só o último devolve logits.
+    fn decode_verify(
+        &self,
+        tokens: &[u32; 2],
+        pos0: usize,
+    ) -> Result<Vec<f32>, llama_model::ModelError> {
+        let mut carry: Option<Vec<f32>> = None;
+        for shard in &self.shards {
+            let out = shard
+                .verify_shard(tokens, pos0, carry.as_deref())
+                .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
+            carry = Some(out);
+        }
+        carry.ok_or_else(|| llama_model::ModelError::Gpu("nenhum shard".into()))
+    }
+
+    /// O estado recorrente está dividido entre os shards: todos desfazem o segundo token.
+    fn rollback_verify(&self) -> Result<(), llama_model::ModelError> {
+        for shard in &self.shards {
+            shard
+                .rollback_verify()
+                .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
