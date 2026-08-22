@@ -1158,7 +1158,15 @@ impl<'ctx> ResidentForward<'ctx> {
             push_mv,
             &[(0, VERIFY_TOK as u32)],
         )?;
-        let matvec_q4k_v = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_v)?;
+        // Mesma geometria do decode ⇒ mesma aritmética de LDS morta (ver `matvec_lds_pad`).
+        let geom_q4k_v = [
+            (0, mv_wg),
+            (1, mv_rows),
+            (2, VERIFY_TOK as u32),
+            (3, matvec_lds_pad()),
+        ];
+        let matvec_q4k_v =
+            ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_q4k_v)?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         // dim:u32 + tem_residual:u32
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
@@ -4676,11 +4684,12 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     /// Desfaz o **segundo** token do último verify: restaura os snapshots do estado
-    /// recorrente e da janela da convolução e recua o comprimento do KV em um.
+    /// recorrente e da janela da convolução, e recua o comprimento do KV em um.
     ///
-    /// O KV-cache não precisa de snapshot: as duas posições do verify são consecutivas e
-    /// o próximo append sobrescreve a segunda. Com o `rope_kv` ligado o K já entrou no
-    /// slot girado, e isso também não muda nada — recuar é só o contador.
+    /// O KV-cache não precisa de snapshot. As duas posições do verify são consecutivas e o
+    /// que o próximo passo escreve sobrescreve a segunda — recuar é só o contador, que é
+    /// escrituração: quem de fato decide a posição é o `pos` que o chamador passa adiante.
+    /// Com o `rope_kv` ligado o K já entrou no slot girado, e isso também não muda nada.
     pub fn rollback_verify(&self) -> Result<(), MatmulError> {
         let st = self
             .state
