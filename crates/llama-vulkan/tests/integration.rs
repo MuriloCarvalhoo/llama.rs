@@ -1453,7 +1453,10 @@ fn matvec_k_em_batch_bate_coluna_a_coluna() {
 
     for q in [QuantK::Q4, QuantK::Q5, QuantK::Q6] {
         let w = q.pesos(n_out, sb_per_row);
-        for cols in [2usize, 4, 8] {
+        // Até o teto de `batch_size()`. O Q6_K dimensionava os acumuladores por um
+        // `MAX_COLS = 8` fixo em vez de por `COLS`, e era ele que prendia o batch em 8:
+        // com 16 ou mais o shader escrevia fora do array. Daí os valores acima de 8 aqui.
+        for cols in [2usize, 4, 8, 16, 24, 32] {
             // Colunas propositalmente diferentes entre si: uma coluna repetida esconderia
             // um erro de indexação que sempre lesse a coluna 0.
             let xs: Vec<Vec<f32>> = (0..cols)

@@ -25,7 +25,14 @@ pub(crate) const NORM_P1_WG: u32 = 32;
 /// Vira a specialization constant `COLS` dos matvec, então é fixa na criação das
 /// pipelines — daí ser uma constante de processo e não um parâmetro. Com N tokens o peso
 /// sai da VRAM uma vez para N ativações, que é o ganho todo: o decode é limitado por
-/// banda, não por ALU. 8 é o teto do `q6_k_matvec.comp` (`MAX_COLS`).
+/// banda, não por ALU.
+///
+/// O teto era 8 pelo `MAX_COLS` do `q6_k_matvec.comp` — o único shader que dimensionava os
+/// acumuladores por uma constante fixa em vez de por `COLS`. Com ele resolvido, o teto
+/// passa a ser a pressão de registrador: são `ROWS_PER_WAVE * COLS` acumuladores vivos por
+/// lane, e em algum ponto a ocupância cai mais do que o reuso do peso rende. **Onde fica
+/// esse ponto é empírico e ainda não foi medido neste hardware**; 32 é o limite superior
+/// da varredura, não um ótimo conhecido. O padrão segue 8, que é o valor medido.
 ///
 /// `LLAMA_RS_BATCH=n` sobrescreve; `1` desliga o batch (prefill volta a ser token a token).
 pub(crate) fn batch_size() -> usize {
@@ -33,7 +40,7 @@ pub(crate) fn batch_size() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(8)
-        .clamp(1, 8)
+        .clamp(1, 32)
 }
 
 /// Geometria dos matvec do **bloco de prefill**, separada da do decode.
