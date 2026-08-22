@@ -186,9 +186,16 @@ fn run_hibrido(
         n_tokens += 1;
     };
 
+    // `--mtp` só faz sentido nos modelos que trazem a cabeça `nextn`; sem ela o backend
+    // seria construído com os snapshots e o KV extra sem nada para usá-los.
+    let mtp = args.mtp && raw.mtp.is_some();
+    if args.mtp && !mtp {
+        eprintln!("[mtp] o modelo não traz bloco nextn — seguindo sem MTP");
+    }
+
     let usar_split = args.gpu_layer_split && n_gpus >= 2;
     if usar_split {
-        let backend = LayerSplitForward::new(&ctx, &cfg, &raw, &aux)
+        let backend = LayerSplitForward::new_com(&ctx, &cfg, &raw, &aux, mtp)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         let layout: Vec<String> = backend
             .layout()
@@ -208,7 +215,7 @@ fn run_hibrido(
         )?;
         backend.print_profile();
     } else {
-        let backend = ResidentForward::new(&ctx, &cfg, &raw, &aux)
+        let backend = ResidentForward::new_com(&ctx, &cfg, &raw, &aux, mtp)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))?;
         llama_model::gerar_streaming_residente(
             &cfg,
@@ -577,6 +584,7 @@ mod choose_sampler_tests {
             gpu_single: false,
             gpu_resident: false,
             gpu_layer_split: false,
+            mtp: false,
             trace: None,
         }
     }

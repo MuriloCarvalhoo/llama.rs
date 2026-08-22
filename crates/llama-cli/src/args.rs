@@ -66,6 +66,13 @@ pub struct Args {
     #[arg(long = "gpu-layer-split", default_value_t = false)]
     pub gpu_layer_split: bool,
 
+    /// Multi-token prediction: usa a cabeça `nextn` do modelo para propor o token seguinte
+    /// e verifica os dois num passo só. Desligado por padrão — custa ~155 MB de VRAM de
+    /// snapshot mais 289 MB do bloco, e só existe nos modelos que trazem a cabeça
+    /// (`nextn_predict_layers > 0`). Com greedy a saída é idêntica à de sem a flag.
+    #[arg(long = "mtp", default_value_t = false)]
+    pub mtp: bool,
+
     /// Grava uma timeline cronológica de CPU e GPU no arquivo dado (formato Chrome Trace,
     /// abre em https://ui.perfetto.dev). Requer feature "profiling".
     #[arg(long = "trace", value_name = "ARQUIVO")]

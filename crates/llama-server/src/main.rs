@@ -32,6 +32,14 @@ struct Args {
     /// Divide as camadas entre as GPUs. Necessário para o que não cabe numa placa.
     #[arg(long = "gpu-layer-split", default_value_t = false)]
     gpu_layer_split: bool,
+
+    /// Constrói o backend com a cabeça de multi-token prediction (`nextn`) e o plano de
+    /// verify. Desligado por padrão: custa ~155 MB de snapshot mais 289 MB do bloco.
+    ///
+    /// O laço do `motor.rs` ainda decodifica um token por passo — quem o converte para
+    /// propor→verificar é a frente que mexe em `Sessao`/TTFT.
+    #[arg(long = "mtp", default_value_t = false)]
+    mtp: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -81,8 +89,14 @@ fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("nenhuma GPU AMD encontrada".into());
     }
 
+    let mtp = args.mtp && raw.mtp.is_some();
+    if args.mtp && !mtp {
+        eprintln!("[mtp] o modelo não traz bloco nextn — seguindo sem MTP");
+    }
+
     if args.gpu_layer_split && n_gpus >= 2 {
-        let backend = LayerSplitForward::new(&vk, &cfg, &raw, &aux).map_err(|e| e.to_string())?;
+        let backend =
+            LayerSplitForward::new_com(&vk, &cfg, &raw, &aux, mtp).map_err(|e| e.to_string())?;
         let layout: Vec<String> = backend
             .layout()
             .iter()
@@ -95,7 +109,8 @@ fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             Motor::novo(&tokenizer, &backend, cfg.ctx, cfg.eos_id),
         )
     } else {
-        let backend = ResidentForward::new(&vk, &cfg, &raw, &aux).map_err(|e| e.to_string())?;
+        let backend =
+            ResidentForward::new_com(&vk, &cfg, &raw, &aux, mtp).map_err(|e| e.to_string())?;
         eprintln!("[gpu] residente numa placa");
         laco(
             &args.bind,

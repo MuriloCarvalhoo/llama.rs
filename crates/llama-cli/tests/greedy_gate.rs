@@ -35,6 +35,7 @@ fn greedy_matches_oracle_reference() {
         gpu_single: false,
         gpu_resident: false,
         gpu_layer_split: false,
+        mtp: false,
         trace: None,
     };
 
@@ -70,6 +71,7 @@ fn topp_sampler_does_not_panic() {
         gpu_single: false,
         gpu_resident: false,
         gpu_layer_split: false,
+        mtp: false,
         trace: None,
     };
     generate_text(&args).expect("nao deve falhar com TopP");
@@ -96,6 +98,7 @@ fn run_generate_streaming_does_not_panic() {
         gpu_single: false,
         gpu_resident: false,
         gpu_layer_split: false,
+        mtp: false,
         trace: None,
     };
     let mut pieces: Vec<String> = Vec::new();
