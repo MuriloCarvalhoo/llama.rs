@@ -648,6 +648,13 @@ pub(crate) struct ResidentState {
     /// caminho crítico. Válido enquanto o `State` viver (unmap no Drop).
     pub logits_ptr: *mut std::ffi::c_void,
     pub len: RefCell<usize>,
+    /// Cópia do `estado` e da `janela` de cada camada linear numa fronteira de turno, para
+    /// que uma divergência depois dela não custe reprocessar o prompt inteiro — ver
+    /// `marcar_snapshot`. Vazio nas arquiteturas densas: lá não há nada recorrente, e o
+    /// snapshot é só o comprimento do KV.
+    pub snap: Vec<(Buf, Buf)>,
+    /// Comprimento do KV-cache no snapshot. `None` = nenhum snapshot válido.
+    pub snap_len: std::cell::Cell<Option<usize>>,
     pub plan: Vec<PlannedOp>,
     /// Paralelo a `plan`: se a op precisa de uma barreira de memória **antes** dela.
     /// Calculado uma vez em `marcar_barreiras`.
@@ -1261,6 +1268,19 @@ impl<'ctx> ResidentForward<'ctx> {
                     },
                 });
             }
+            // Snapshot de fronteira de turno: uma cópia do estado recorrente e da janela de
+            // cada camada linear. São ~155 MB no Qwen3.8-27B, alocados uma vez — o que eles
+            // compram é a divergência barata (ver `marcar_snapshot`). Arquitetura densa não
+            // aloca nada: o KV-cache já volta atrás só recuando o comprimento.
+            let mut snap = Vec::new();
+            for la in &aux_buf {
+                if let Some(dn) = la.delta.as_ref() {
+                    snap.push((
+                        Buf::device(ctx, phys, d, dn.estado.size)?,
+                        Buf::device(ctx, phys, d, dn.janela.size)?,
+                    ));
+                }
+            }
             let output_norm_buf = mk(&aux.output_norm)?;
             let freq_buf = mk(&aux.freq_table)?;
             let embd_stage =
@@ -1393,6 +1413,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 logits_host,
                 logits_ptr,
                 len: RefCell::new(0),
+                snap,
+                snap_len: std::cell::Cell::new(None),
                 plan: Vec::new(),
                 barreiras: Vec::new(),
                 plan_batch: Vec::new(),
@@ -3593,10 +3615,117 @@ impl<'ctx> ResidentForward<'ctx> {
             .map_or(Shard::whole(0, 0), |st| st.cfg.shard)
     }
 
+    /// Guarda estado recorrente, janela da convolução e comprimento do KV como estão agora.
+    ///
+    /// É o que torna barata a divergência de prompt entre dois turnos. O KV-cache de
+    /// atenção volta atrás sozinho — basta recuar o comprimento e reescrever os slots —,
+    /// mas o estado recorrente das camadas delta-net é o produto de todos os tokens em
+    /// ordem, e sem uma cópia dele a divergência custa reprocessar o prompt inteiro.
+    ///
+    /// Um snapshot só: o novo sobrescreve o anterior. A fronteira que interessa é o fim do
+    /// prefill de cada requisição, porque o que diverge no turno seguinte é o **re-render**
+    /// da resposta que veio depois dela (bloco de raciocínio removido, chamada de
+    /// ferramenta reformatada); guardar o fim da resposta deixaria a divergência antes do
+    /// snapshot, que é justamente o caso que ele não cobre.
+    pub fn marcar_snapshot(&self) -> bool {
+        let Some(st) = self.state.as_ref() else {
+            return false;
+        };
+        let pares: Vec<(&Buf, &Buf)> = st
+            .aux
+            .iter()
+            .filter_map(|la| la.delta.as_ref())
+            .zip(&st.snap)
+            .flat_map(|(dn, (e, j))| [(&dn.estado, e), (&dn.janela, j)])
+            .collect();
+        if !self.copiar_bufs(&pares) {
+            return false;
+        }
+        st.snap_len.set(Some(*st.len.borrow()));
+        true
+    }
+
+    /// Volta ao último [`marcar_snapshot`]. `false` quando não há snapshot válido — e aí o
+    /// chamador não tem alternativa senão reprocessar do zero.
+    pub fn restaurar_snapshot(&self) -> bool {
+        let Some(st) = self.state.as_ref() else {
+            return false;
+        };
+        let Some(len) = st.snap_len.get() else {
+            return false;
+        };
+        let pares: Vec<(&Buf, &Buf)> = st
+            .aux
+            .iter()
+            .filter_map(|la| la.delta.as_ref())
+            .zip(&st.snap)
+            .flat_map(|(dn, (e, j))| [(e, &dn.estado), (j, &dn.janela)])
+            .collect();
+        if !self.copiar_bufs(&pares) {
+            return false;
+        }
+        // O KV-cache não precisa ser limpo: as posições a partir daqui serão reescritas
+        // pelos tokens novos, e a atenção só olha `total_len` posições.
+        *st.len.borrow_mut() = len;
+        true
+    }
+
+    /// Copia `(origem, destino)` em um command buffer só e espera. Acontece entre
+    /// requisições, com a GPU ociosa — é o mesmo caminho de `reset_len`.
+    fn copiar_bufs(&self, pares: &[(&Buf, &Buf)]) -> bool {
+        if pares.is_empty() {
+            return true;
+        }
+        let d = &self.dev.device;
+        // SAFETY: GPU ociosa entre sequências; buffers criados por nós, com tamanhos iguais.
+        unsafe {
+            let _ = d.device_wait_idle();
+            let cb_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.dev.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let Ok(cbs) = d.allocate_command_buffers(&cb_info) else {
+                return false;
+            };
+            let cmd = cbs[0];
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            let mut ok = false;
+            if d.begin_command_buffer(cmd, &begin).is_ok() {
+                for (src, dst) in pares {
+                    let region = vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: src.size.min(dst.size),
+                    };
+                    d.cmd_copy_buffer(cmd, src.buffer, dst.buffer, &[region]);
+                }
+                ok = d.end_command_buffer(cmd).is_ok();
+                let submit = vk::SubmitInfo {
+                    command_buffer_count: 1,
+                    p_command_buffers: &cmd,
+                    ..Default::default()
+                };
+                ok &= d
+                    .queue_submit(self.dev.queue, &[submit], vk::Fence::null())
+                    .is_ok();
+                ok &= d.queue_wait_idle(self.dev.queue).is_ok();
+            }
+            d.free_command_buffers(self.dev.cmd_pool, &cbs);
+            ok
+        }
+    }
+
     /// Zera o comprimento do KV-cache (início de nova sequência).
     pub fn reset_len(&self) {
         if let Some(st) = self.state.as_ref() {
             *st.len.borrow_mut() = 0;
+            // O snapshot pertence à sequência que acabou de ser descartada.
+            st.snap_len.set(None);
             // Nas camadas de atenção linear não há comprimento de KV-cache para zerar: o
             // histórico está no estado recorrente e na janela da convolução, que precisam
             // voltar a zero — é o que representa "contexto vazio" nesta arquitetura.
@@ -3771,10 +3900,20 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
         self.decode_shard_batch(tokens, pos0, None)
             .map_err(|e| llama_model::ModelError::Gpu(e.to_string()))
     }
+    /// Zera o comprimento do KV-cache **e** o estado recorrente das camadas lineares.
+    ///
+    /// Recuar só o comprimento bastava enquanto todas as camadas eram de atenção: os slots
+    /// do cache são reescritos pelos tokens novos. No qwen35 o histórico das 48 camadas
+    /// delta-net está num estado que ninguém sobrescreve, e uma sequência nova começando
+    /// sobre o estado da anterior gera texto influenciado por ela.
     fn reset(&self) {
-        if let Some(st) = self.state.as_ref() {
-            *st.len.borrow_mut() = 0;
-        }
+        self.reset_len();
+    }
+    fn marcar(&self) -> bool {
+        self.marcar_snapshot()
+    }
+    fn restaurar(&self) -> bool {
+        self.restaurar_snapshot()
     }
 }
 
@@ -3821,6 +3960,10 @@ impl Drop for ResidentForward<'_> {
                 lq.ffn_down.gpu.destroy(d);
             }
             st.output_w.gpu.destroy(d);
+            for (estado, janela) in &st.snap {
+                estado.destroy(d);
+                janela.destroy(d);
+            }
             for la in st.aux {
                 la.attn_norm.destroy(d);
                 la.ffn_norm.destroy(d);
