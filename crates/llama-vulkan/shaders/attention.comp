@@ -4,17 +4,26 @@
 layout(local_size_x = 512) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;   // [n_head*head_dim]
-layout(set = 0, binding = 1) readonly buffer KBuf { float k[]; } kb;   // KV-cache K (camada via kv_layer_off)
-layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; } vb;   // KV-cache V
+// KV-cache em f16 **empacotado**: um uint por par de elementos consecutivos
+// (`kv_pack.comp`). Metade dos bytes por posicao — e em contexto longo este laco le
+// gigabytes por token. Os indices continuam em elementos; o par e `idx >> 1` e a metade
+// e `idx & 1` (todas as bases — kv_layer_off, j*kv_dim, kv_h*head_dim — sao pares).
+layout(set = 0, binding = 1) readonly buffer KBuf { uint k[]; } kb;    // KV-cache K (camada via kv_layer_off)
+layout(set = 0, binding = 2) readonly buffer VBuf { uint v[]; } vb;    // KV-cache V
 layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; } ob;  // [n_head*head_dim]
 
 layout(push_constant) uniform PC {
     uint n_head; uint n_head_kv; uint head_dim;
-    uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos f32
+    uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos (nao em pares)
     // Distancia entre cabecas no buffer de Q. Igual a head_dim quando as cabecas sao
     // contiguas; no qwen35 e 2*head_dim, porque cada cabeca traz query e gate lado a lado.
     uint q_stride;
 } pc;
+
+float kv_le(uint palavra, uint idx) {
+    vec2 par = unpackHalf2x16(palavra);
+    return (idx & 1u) == 0u ? par.x : par.y;
+}
 
 const uint WG = 64u;      // lanes por wave (wave64 no MI50)
 const uint NWAVE = 8u;    // waves por head — local_size_x / WG
@@ -78,7 +87,8 @@ void main() {
         float partial = 0.0;
         for (uint i = 0u; i < dpl; i++) {
             uint d = lane + i * WG;
-            partial += (d < pc.head_dim) ? qd[i] * kb.k[kvbase + d] : 0.0;
+            uint e = kvbase + d;
+            partial += (d < pc.head_dim) ? qd[i] * kv_le(kb.k[e >> 1u], e) : 0.0;
         }
         float s = subgroupAdd(partial) * scale;
         float m_new = max(m, s);
@@ -87,7 +97,8 @@ void main() {
         l = l * corr + p;
         for (uint i = 0u; i < dpl; i++) {
             uint d = lane + i * WG;
-            float vd = (d < pc.head_dim) ? vb.v[kvbase + d] : 0.0;
+            uint e = kvbase + d;
+            float vd = (d < pc.head_dim) ? kv_le(vb.v[e >> 1u], e) : 0.0;
             acc[i] = acc[i] * corr + p * vd;
         }
         m = m_new;

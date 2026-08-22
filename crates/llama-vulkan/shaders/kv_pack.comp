@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// Converte K e V do passo (f32, token-major) para o KV-cache em **f16 empacotado**:
+// cada uint do cache guarda um par de elementos consecutivos (packHalf2x16). Metade
+// dos bytes na atenção — que em contexto longo lê gigabytes por token — e metade da
+// VRAM de contexto, sem extensão nenhuma (pack/unpack são core GLSL).
+//
+// Substitui o que era um `cmd_copy_buffer` por buffer: cópia não converte formato.
+
+layout(set = 0, binding = 0) readonly buffer KIn { float k[]; } kin;
+layout(set = 0, binding = 1) readonly buffer VIn { float v[]; } vin;
+layout(set = 0, binding = 2) writeonly buffer KOut { uint k[]; } kout;
+layout(set = 0, binding = 3) writeonly buffer VOut { uint v[]; } vout;
+
+layout(push_constant) uniform PC {
+    uint n_pares;  // kv_dim * n_tok / 2 — pares a escrever
+    uint dst_par;  // (slot * ctx + pos0) * kv_dim / 2 — offset em pares no cache
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_pares) { return; }
+    uint s = i * 2u;
+    kout.k[pc.dst_par + i] = packHalf2x16(vec2(kin.k[s], kin.k[s + 1u]));
+    vout.v[pc.dst_par + i] = packHalf2x16(vec2(vin.v[s], vin.v[s + 1u]));
+}

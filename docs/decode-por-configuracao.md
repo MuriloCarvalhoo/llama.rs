@@ -37,6 +37,15 @@ LLAMA_RS_SPLIT=31 numactl --interleave=all target/release/llama-cli \
 | MTP ligado, contexto 9,3k | 22,1 | 59,5 (passo de 2 tok) | 1 execução; a atenção de contexto longo domina |
 | **MTP n=2 encadeado (2026-08-22)** | **34,5** | 56,2 (passo de 3 tok) | 3 execuções: 31,4 36,2 36,0; greedy; verify = 27,5 + 28,5 ms |
 | MTP n=2 pelo servidor (motor propor→verificar) | 36,2 | — | `[gen] decode 80 tok (36.2 tok/s)`, greedy; temp 0,8 dá 32,6 |
+| KV-cache f16 empacotado (`kv_pack.comp`) | 33,7 | 55,8 (passo de 3 tok) | 2 execuções: 35,8 31,6; **a atenção a 9,4k não mudou** (11,5 ms/token) — ela é limitada por VALU, não por banda. O que o f16 entrega: metade da VRAM de contexto e paridade de formato com o llama.cpp |
+
+### Atenção longa: fatias × tempo (9,4k, decode, soma das 2 GPUs)
+
+`LLAMA_RS_ATTN_SPLIT` ∈ {4, 8, 16}: 20,1 → 12,6 → **11,6 ms/token**. A curva achata em
+16 (o default de `splits_do_kv` já satura o paralelismo); o resto é teto de VALU do
+kernel — wave64 gasta 4 ciclos por instrução e o laço faz ~100 instruções por posição.
+O próximo ganho seria `V_DOT2_F32_F16` (matemática f16 nativa), que exige
+`shaderFloat16` no device — frente futura.
 | `LLAMA_RS_ROPE_KV=0` (agora padrão) | — | 40,2 | 3 execuções; a fusão rope→KV custava ~0,4 ms/token |
 | `LLAMA_RS_MATVEC_LDS_PAD=13` | — | 41,6 | 1 execução; pior, knob fica 0 |
 | `LLAMA_RS_MATVEC_LDS_PAD=22` | — | 51,2 | 1 execução; muito pior (−26 % de ocupância útil) |

@@ -108,12 +108,14 @@ estado de tamanho fixo). São **136 KB por token**:
 
 | ctx | KV-cache |
 |---:|---:|
-| 4 096 | 0,5 GB |
-| 32 768 | 4,4 GB |
-| 65 536 | 8,7 GB |
+| 4 096 | 0,26 GB |
+| 32 768 | 2,2 GB |
+| 65 536 | 4,4 GB |
 
-Com os 16,3 GB de pesos, `--ctx 32768` ocupa ~21 GB das duas MI50. Antes de o cache ser
-indexado por camada de atenção, o mesmo contexto pediria 17 GB só de cache e não caberia.
+*(Valores com o cache em f16 empacotado, 2026-08-22 — metade dos de f32.)* Com os
+16,3 GB de pesos, `--ctx 32768` ocupa ~18,5 GB das duas MI50. Antes de o cache ser
+indexado por camada de atenção, o mesmo contexto pediria 17 GB só de cache (em f32) e
+não caberia.
 
 ## Medido no modelo real
 

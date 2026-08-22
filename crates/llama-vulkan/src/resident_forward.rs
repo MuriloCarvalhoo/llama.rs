@@ -197,16 +197,9 @@ pub(crate) fn matvec_lds_pad() -> u32 {
         .min(48)
 }
 
-/// Se o RoPE de K escreve direto no slot do KV-cache (`rope_kv.comp`), dispensando a cópia
-/// de K do `kv_append`. V continua indo pela cópia — ele não passa por RoPE.
-///
-/// Desligado por padrão: medido em 2026-08-21 (TOTAL GPU, 3 execuções por lado), a fusão
-/// custa ~0,4 ms/token (40,6 contra 40,2 ms) — a escrita espalhada no cache grande perde
-/// mais do que a cópia de `b_k` custa. `LLAMA_RS_ROPE_KV=1` religa para comparar no mesmo
-/// binário.
-fn rope_no_kv() -> bool {
-    std::env::var("LLAMA_RS_ROPE_KV").is_ok_and(|v| v == "1")
-}
+// O experimento `rope_kv` (RoPE de K escrevendo direto no slot do cache) morreu em
+// 2026-08-22: já era ~0,4 ms/token pior que a cópia, e o cache em f16 empacotado o
+// invalidou de vez — o RoPE escreveria f32 num buffer de pares f16.
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.
 pub(crate) struct Buf {
@@ -466,8 +459,8 @@ pub(crate) enum PipeId {
     /// Escala + quantização, fechando a redução do `NormFused`.
     NormP2,
     Rope,
-    /// RoPE de K escrevendo direto no slot do KV-cache — `rope_kv.comp`.
-    RopeKv,
+    /// Converte K/V do passo para o cache em f16 empacotado — `kv_pack.comp`.
+    KvPack,
     Attention,
     AttentionSplit,
     AttnReduce,
@@ -504,7 +497,7 @@ impl PipeId {
             PipeId::NormFused => "norm_fused",
             PipeId::NormP2 => "norm_p2",
             PipeId::Rope => "rope",
-            PipeId::RopeKv => "rope_kv",
+            PipeId::KvPack => "kv_pack",
             PipeId::Attention => "attention",
             PipeId::AttentionSplit => "attention_split",
             PipeId::AttnReduce => "attn_reduce",
@@ -555,7 +548,7 @@ impl PipeId {
             PipeId::Rope | PipeId::Add => (&[0, 1], &[0]),
             // k, freq → KV-cache. O binding do cache é o buffer inteiro, porque o offset
             // do slot só existe na gravação — ver `marcar_barreiras`.
-            PipeId::RopeKv => (&[0, 1], &[2]),
+            PipeId::KvPack => (&[0, 1], &[2, 3]),
             // o estado recorrente (binding 0) é lido e reescrito no mesmo dispatch.
             PipeId::DeltaNet => (&[0, 1, 2, 3, 4], &[0, 5]),
             PipeId::DnConv => (&[0, 1, 2], &[0, 3]),
@@ -583,9 +576,9 @@ pub(crate) enum PushSpec {
     Static(Vec<u8>),
     /// RoPE: precisa de `pos` na gravação. `n_head` e o passo entre cabeças são fixos.
     Rope { n_head: u32, stride: u32 },
-    /// RoPE de K direto no cache: além de `pos`, precisa do offset do slot, que sai da
-    /// posição do primeiro token do bloco. `kv_layer_off` é a parte fixa (slot × ctx × kv_dim).
-    RopeKv { n_head: u32, kv_layer_off: u32 },
+    /// Conversão de K/V para o cache f16: o destino sai da posição do primeiro token do
+    /// bloco, conhecida só na gravação. `n_tok` é a largura do plano dono do dispatch.
+    KvPack { slot: u32, n_tok: u32 },
     /// Attention: precisa de `total_len`. `kv_layer_off` fixo.
     Attention { kv_layer_off: u32 },
     /// Redução dos parciais do split: precisa do número de fatias, escolhido na gravação
@@ -636,16 +629,6 @@ pub(crate) enum PlannedOp {
         dst: vk::Buffer,
         bytes: vk::DeviceSize,
     },
-    /// Append do K e do V da camada ao KV-cache a partir da posição do primeiro token do
-    /// bloco. As posições do bloco são consecutivas, então é uma cópia só.
-    ///
-    /// `com_k` é falso quando o `rope_kv` já escreveu K no slot (ver [`rope_no_kv`]) e só
-    /// resta copiar V.
-    KvAppend { slot: usize, com_k: bool },
-    /// Append de K e V no KV-cache **próprio da cabeça MTP**, na posição corrente dela.
-    /// O bloco tem um cache só (não é dividido em slots por camada) e sempre copia os
-    /// dois: a cabeça usa o `rope` in-place, não o `rope_kv`, para não depender do knob.
-    KvAppendMtp,
     /// Copia o hidden de um dos tokens do último passo (`b_x`) para o buffer da cabeça.
     /// **Qual** token é escolhido na gravação: depois de um verify aceito é o segundo,
     /// depois de um rejeitado (ou de um decode simples) é o primeiro.
@@ -669,7 +652,6 @@ impl PlannedOp {
             PlannedOp::Dispatch { pipe, .. } => pipe.label(),
             PlannedOp::Embed => "embed",
             PlannedOp::Copia { .. } | PlannedOp::CopiaHidden => "copia",
-            PlannedOp::KvAppend { .. } | PlannedOp::KvAppendMtp => "kv_append",
             PlannedOp::Atencao { .. } => "attention",
         }
     }
@@ -885,8 +867,8 @@ pub enum DnPipe {
     GateQuant,
     /// SwiGLU + quantização fundidos — `swiglu_quant.comp`.
     SwigluQuant,
-    /// RoPE de K escrevendo direto no slot do KV-cache — `rope_kv.comp`.
-    RopeKv,
+    /// Conversão de K/V para o cache em f16 empacotado — `kv_pack.comp`.
+    KvPack,
     /// Não é do delta net, mas entra aqui para poder ser testado com o mesmo helper.
     QuantizeX,
     /// Idem — os dois passos da norma fundida, para testar o batch pela dimensão Y.
@@ -929,7 +911,7 @@ pub struct ResidentForward<'ctx> {
     pub(crate) norm_fused: ComputePipeline,
     pub(crate) norm_p2: ComputePipeline,
     pub(crate) rope: ComputePipeline,
-    pub(crate) rope_kv: ComputePipeline,
+    pub(crate) kv_pack: ComputePipeline,
     pub(crate) attention: ComputePipeline,
     /// Atenção com o KV fatiado entre workgroups + a redução dos parciais. Só entram
     /// com contexto longo, onde a cadeia serial do `attention` domina o token.
@@ -1239,7 +1221,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let norm_p2 = ComputePipeline::with(d, crate::NORM_P2_SPV, 6, 12, &[])?;
         let rope = ComputePipeline::with(d, crate::ROPE_SPV, 2, 20, &[])?;
         // (k, freq, kcache) + n_head, head_dim, rope_dim, pos, kv_off.
-        let rope_kv = ComputePipeline::with(d, crate::ROPE_KV_SPV, 3, 20, &[])?;
+        let kv_pack = ComputePipeline::with(d, crate::KV_PACK_SPV, 4, 8, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
         let attention_split = ComputePipeline::with(d, crate::ATTENTION_SPLIT_SPV, 4, 28, &[])?;
         let attn_reduce = ComputePipeline::with(d, crate::ATTN_REDUCE_SPV, 2, 12, &[])?;
@@ -1297,7 +1279,7 @@ impl<'ctx> ResidentForward<'ctx> {
             norm_fused,
             norm_p2,
             rope,
-            rope_kv,
+            kv_pack,
             attention,
             attention_split,
             attn_reduce,
@@ -1581,9 +1563,10 @@ impl<'ctx> ResidentForward<'ctx> {
             // camada global custaria 4× — ver `slots_kv`.
             let (_, n_slots_kv) =
                 slots_kv(qw.iter().map(|l| !matches!(l.mixer, MixerQ::Delta { .. })));
+            // f16 empacotado (2 B por elemento) — ver `kv_pack.comp`.
             let kv_elems = (n_slots_kv * cfg.ctx * kv_dim) as vk::DeviceSize;
-            let kcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
-            let vcache = Buf::device(ctx, phys, d, kv_elems * 4)?;
+            let kcache = Buf::device(ctx, phys, d, kv_elems * 2)?;
+            let vcache = Buf::device(ctx, phys, d, kv_elems * 2)?;
 
             let attn_dim = if config.delta_net.is_some() {
                 config.head_dim * config.n_head
@@ -1626,7 +1609,8 @@ impl<'ctx> ResidentForward<'ctx> {
                     } else {
                         config.n_embd
                     };
-                    let kv_pos = (config.ctx * kv_dim * 4) as vk::DeviceSize;
+                    // f16 empacotado, como o cache do modelo — a atenção é o mesmo shader.
+                    let kv_pos = (config.ctx * kv_dim * 2) as vk::DeviceSize;
                     Some(MtpBufs {
                         eh_proj: up_q(&mut upl, &mraw.eh_proj, config.n_embd * 2, config.n_embd)?,
                         attn_q: up_q(&mut upl, attn_q, config.n_embd, q_out)?,
@@ -1917,6 +1901,44 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(())
     }
 
+    /// f32 → f16 (bits), arredondando para o mais próximo — para os helpers de teste
+    /// montarem caches no formato empacotado que os shaders de atenção leem.
+    fn f32_para_f16(x: f32) -> u16 {
+        let b = x.to_bits();
+        let s = (b >> 16) & 0x8000;
+        let exp = (b >> 23) & 0xFF;
+        let m = b & 0x7F_FFFF;
+        let e = exp as i32 - 127 + 15;
+        let v = if exp == 255 {
+            0x7C00 | (u32::from(m != 0) << 9)
+        } else if e >= 31 {
+            0x7C00
+        } else if e <= 0 {
+            if e < -10 {
+                0
+            } else {
+                let m2 = m | 0x80_0000;
+                let sh = (14 - e) as u32;
+                (m2 >> sh) + ((m2 >> (sh - 1)) & 1)
+            }
+        } else {
+            ((e as u32) << 10) + ((m + 0xFFF + ((m >> 13) & 1)) >> 13)
+        };
+        (s | v) as u16
+    }
+
+    /// Empacota um cache f32 em pares f16 (formato de `kv_pack.comp`), reinterpretado
+    /// como f32 para subir pelo `upload_f32` — os bytes no buffer saem idênticos.
+    fn empacota_kv(x: &[f32]) -> Vec<f32> {
+        x.chunks(2)
+            .map(|p| {
+                let a = u32::from(Self::f32_para_f16(p[0]));
+                let b = u32::from(Self::f32_para_f16(p.get(1).copied().unwrap_or(0.0)));
+                f32::from_bits(a | (b << 16))
+            })
+            .collect()
+    }
+
     /// Diagnóstico: roda o shader attention GQA sobre q/k_cache/v_cache e devolve o resultado.
     #[allow(clippy::too_many_arguments)]
     pub fn dbg_attention(
@@ -1949,6 +1971,9 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         let d = &self.dev.device;
         let kv_dim = n_head_kv * head_dim;
+        // O shader lê o cache no formato empacotado — converte como o `kv_pack` faria.
+        let kc = Self::empacota_kv(k_cache);
+        let vc = Self::empacota_kv(v_cache);
         let qb = Buf::device(
             self.ctx,
             self.phys(),
@@ -1959,13 +1984,13 @@ impl<'ctx> ResidentForward<'ctx> {
             self.ctx,
             self.phys(),
             d,
-            std::mem::size_of_val(k_cache) as vk::DeviceSize,
+            std::mem::size_of_val(kc.as_slice()) as vk::DeviceSize,
         )?;
         let vb = Buf::device(
             self.ctx,
             self.phys(),
             d,
-            std::mem::size_of_val(v_cache) as vk::DeviceSize,
+            std::mem::size_of_val(vc.as_slice()) as vk::DeviceSize,
         )?;
         let ob = Buf::device(
             self.ctx,
@@ -1974,8 +1999,8 @@ impl<'ctx> ResidentForward<'ctx> {
             (n_tokens * n_head * head_dim * 4) as vk::DeviceSize,
         )?;
         self.upload_f32(&qb, q)?;
-        self.upload_f32(&kb, k_cache)?;
-        self.upload_f32(&vb, v_cache)?;
+        self.upload_f32(&kb, &kc)?;
+        self.upload_f32(&vb, &vc)?;
         let set = self.alloc_set(&self.attention)?;
         let push = P {
             n_head: n_head as u32,
@@ -2046,9 +2071,11 @@ impl<'ctx> ResidentForward<'ctx> {
         let d = &self.dev.device;
         let kv_dim = n_head_kv * head_dim;
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let kc = Self::empacota_kv(k_cache);
+        let vc = Self::empacota_kv(v_cache);
         let qb = Buf::device(self.ctx, self.phys(), d, nb(q.len()))?;
-        let kb = Buf::device(self.ctx, self.phys(), d, nb(k_cache.len()))?;
-        let vb = Buf::device(self.ctx, self.phys(), d, nb(v_cache.len()))?;
+        let kb = Buf::device(self.ctx, self.phys(), d, nb(kc.len()))?;
+        let vb = Buf::device(self.ctx, self.phys(), d, nb(vc.len()))?;
         let parciais = Buf::device(
             self.ctx,
             self.phys(),
@@ -2057,8 +2084,8 @@ impl<'ctx> ResidentForward<'ctx> {
         )?;
         let ob = Buf::device(self.ctx, self.phys(), d, nb(n_tokens * n_head * head_dim))?;
         self.upload_f32(&qb, q)?;
-        self.upload_f32(&kb, k_cache)?;
-        self.upload_f32(&vb, v_cache)?;
+        self.upload_f32(&kb, &kc)?;
+        self.upload_f32(&vb, &vc)?;
 
         let push = P {
             n_head: n_head as u32,
@@ -2144,9 +2171,11 @@ impl<'ctx> ResidentForward<'ctx> {
         let d = &self.dev.device;
         let kv_dim = n_head_kv * head_dim;
         let nb = |n: usize| (n * 4) as vk::DeviceSize;
+        let kc = Self::empacota_kv(k_cache);
+        let vc = Self::empacota_kv(v_cache);
         let qb = Buf::device(self.ctx, self.phys(), d, nb(q.len()))?;
-        let kb = Buf::device(self.ctx, self.phys(), d, nb(k_cache.len()))?;
-        let vb = Buf::device(self.ctx, self.phys(), d, nb(v_cache.len()))?;
+        let kb = Buf::device(self.ctx, self.phys(), d, nb(kc.len()))?;
+        let vb = Buf::device(self.ctx, self.phys(), d, nb(vc.len()))?;
         let parciais = Buf::device(
             self.ctx,
             self.phys(),
@@ -2155,8 +2184,8 @@ impl<'ctx> ResidentForward<'ctx> {
         )?;
         let ob = Buf::device(self.ctx, self.phys(), d, nb(n_head * head_dim))?;
         self.upload_f32(&qb, q)?;
-        self.upload_f32(&kb, k_cache)?;
-        self.upload_f32(&vb, v_cache)?;
+        self.upload_f32(&kb, &kc)?;
+        self.upload_f32(&vb, &vc)?;
 
         let push = P {
             n_head: n_head as u32,
@@ -2671,7 +2700,7 @@ impl<'ctx> ResidentForward<'ctx> {
             DnPipe::L2Qk => &self.dn_l2_qk,
             DnPipe::GateQuant => &self.gate_quant,
             DnPipe::SwigluQuant => &self.swiglu_quant,
-            DnPipe::RopeKv => &self.rope_kv,
+            DnPipe::KvPack => &self.kv_pack,
             DnPipe::QuantizeX => &self.quantize_x,
             DnPipe::NormFused => &self.norm_fused,
             DnPipe::NormP2 => &self.norm_p2,
@@ -2892,24 +2921,6 @@ impl<'ctx> ResidentForward<'ctx> {
                 PlannedOp::Copia { src, dst, bytes } => {
                     (vec![(*src, 0, *bytes)], vec![(*dst, 0, *bytes)])
                 }
-                // Sem K (o `rope_kv` já o escreveu) a op não toca `b_k` nem o `kcache`, e
-                // aí ela cabe no mesmo grupo do RoPE em vez de exigir barreira.
-                PlannedOp::KvAppend { com_k: true, .. } => (
-                    vec![tudo(&st.b_k), tudo(&st.b_v)],
-                    vec![tudo(&st.kcache), tudo(&st.vcache)],
-                ),
-                PlannedOp::KvAppend { com_k: false, .. } => {
-                    (vec![tudo(&st.b_v)], vec![tudo(&st.vcache)])
-                }
-                // O cache da cabeça é outro buffer: sem declará-lo aqui, a atenção do
-                // bloco leria o que a cópia ainda não terminou de escrever.
-                PlannedOp::KvAppendMtp => match st.mtp.as_ref() {
-                    Some(m) => (
-                        vec![tudo(&st.b_k), tudo(&st.b_v)],
-                        vec![tudo(&m.kcache), tudo(&m.vcache)],
-                    ),
-                    None => (Vec::new(), Vec::new()),
-                },
                 PlannedOp::CopiaHidden => match st.mtp.as_ref() {
                     Some(m) => (vec![tudo(&st.b_x)], vec![tudo(&m.b_h)]),
                     None => (Vec::new(), Vec::new()),
@@ -2998,30 +3009,22 @@ impl<'ctx> ResidentForward<'ctx> {
                 };
                 unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }.to_vec()
             }
-            PushSpec::RopeKv {
-                n_head,
-                kv_layer_off,
-            } => {
+            PushSpec::KvPack { slot, n_tok } => {
                 #[repr(C)]
                 struct P {
-                    n_head: u32,
-                    head_dim: u32,
-                    rope_dim: u32,
-                    pos: f32,
-                    kv_off: u32,
+                    n_pares: u32,
+                    dst_par: u32,
                 }
-                // O bloco ocupa posições consecutivas a partir de `pos0`, e `groups_y` é
-                // quantos tokens ele tem — o mesmo `n_tok` que o `KvAppend` usa.
-                let pos0 = total_len as usize - *groups_y as usize;
+                // O bloco ocupa posições consecutivas a partir de `pos0`; o destino em
+                // pares (u32 = 2 × f16) — `kv_dim` é par por construção (múltiplo de
+                // head_dim).
+                let pos0 = pos + 1 - *n_tok as usize;
                 let pp = P {
-                    n_head: *n_head,
-                    head_dim: c.head_dim as u32,
-                    rope_dim: c.rope_dim as u32,
-                    pos: pos as f32,
-                    kv_off: kv_layer_off + (pos0 * c.kv_dim) as u32,
+                    n_pares: (c.kv_dim / 2 * *n_tok as usize) as u32,
+                    dst_par: ((*slot as usize * c.ctx + pos0) * c.kv_dim / 2) as u32,
                 };
-                // SAFETY: P é #[repr(C)] de 5 palavras de 32 bits; 20 bytes é o push range.
-                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 20) }.to_vec()
+                // SAFETY: P é #[repr(C)] de 2 palavras de 32 bits; 8 bytes é o push range.
+                unsafe { std::slice::from_raw_parts(&pp as *const P as *const u8, 8) }.to_vec()
             }
             PushSpec::Attention { kv_layer_off } => {
                 #[repr(C)]
@@ -3203,28 +3206,8 @@ impl<'ctx> ResidentForward<'ctx> {
                     // é o tamanho do menor deles (fixado na construção do plano).
                     unsafe { d.cmd_copy_buffer(cmd, *src, *dst, &[region]) };
                 }
-                PlannedOp::KvAppend { slot, com_k } => {
-                    // As posições do bloco são consecutivas no cache e `b_k`/`b_v` estão
-                    // token-major, então uma cópia cobre os N tokens.
-                    let pos0 = pos + 1 - n_tok;
-                    let off = ((slot * c.ctx + pos0) * c.kv_dim * 4) as vk::DeviceSize;
-                    let sz = (c.kv_dim * n_tok * 4) as vk::DeviceSize;
-                    let rk = vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: off,
-                        size: sz,
-                    };
-                    // SAFETY: idem.
-                    unsafe {
-                        // Com o `rope_kv` ligado, K já foi escrito no slot pelo próprio RoPE.
-                        if *com_k {
-                            d.cmd_copy_buffer(cmd, st.b_k.buffer, st.kcache.buffer, &[rk]);
-                        }
-                        d.cmd_copy_buffer(cmd, st.b_v.buffer, st.vcache.buffer, &[rk]);
-                    }
-                }
-                // Só o plano da cabeça MTP as usa — ver `record_mtp`.
-                PlannedOp::KvAppendMtp | PlannedOp::CopiaHidden => {}
+                // Só o plano da cabeça MTP a usa — ver `record_mtp`.
+                PlannedOp::CopiaHidden => {}
                 PlannedOp::Dispatch { .. } => {
                     self.gravar_dispatch(cmd, op, c, pos, total_len, 1, 1);
                 }
@@ -3340,19 +3323,6 @@ impl<'ctx> ResidentForward<'ctx> {
                     // que o bloco do último passo (ou o sentinel, que lê `m.b_x` em 0).
                     unsafe { d.cmd_copy_buffer(cmd, src, m.b_h.buffer, &[region]) };
                 }
-                PlannedOp::KvAppendMtp => {
-                    let region = vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: (pos * c.kv_dim * 4) as vk::DeviceSize,
-                        size: (c.kv_dim * 4) as vk::DeviceSize,
-                    };
-                    // SAFETY: o cache do bloco tem `ctx` posições e `pos < ctx` (conferido
-                    // em `propor_mtp`).
-                    unsafe {
-                        d.cmd_copy_buffer(cmd, st.b_k.buffer, m.kcache.buffer, &[region]);
-                        d.cmd_copy_buffer(cmd, st.b_v.buffer, m.vcache.buffer, &[region]);
-                    }
-                }
                 PlannedOp::Atencao {
                     curto,
                     split,
@@ -3367,8 +3337,8 @@ impl<'ctx> ResidentForward<'ctx> {
                         self.gravar_dispatch(cmd, reduce, c, pos, total_len, 1, n_split);
                     }
                 }
-                // O plano da cabeça não faz embedding lookup nem toca no KV do modelo.
-                PlannedOp::Embed | PlannedOp::KvAppend { .. } => {}
+                // O plano da cabeça não faz embedding lookup.
+                PlannedOp::Embed => {}
             }
         }
         self.full_barrier(cmd);
@@ -3490,7 +3460,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::NormFused => &self.norm_fused,
             PipeId::NormP2 => &self.norm_p2,
             PipeId::Rope => &self.rope,
-            PipeId::RopeKv => &self.rope_kv,
+            PipeId::KvPack => &self.kv_pack,
             PipeId::Attention => &self.attention,
             PipeId::AttentionSplit => &self.attention_split,
             PipeId::AttnReduce => &self.attn_reduce,
@@ -3986,43 +3956,37 @@ impl<'ctx> ResidentForward<'ctx> {
                 ));
                 let slot = slot_kv.get(l).copied().flatten().unwrap_or(0);
                 let layer_off = (slot * c.ctx * c.kv_dim) as u32;
-                // K pode ir do RoPE direto para o slot do cache, dispensando a cópia do
-                // `kv_append` — ver `rope_no_kv`. Nesse caminho o shader cobre `head_dim/2`
-                // pares por cabeça em vez de `rope_dim/2`: o que não gira ainda precisa ser
-                // copiado, coisa que o RoPE in-place ganhava de graça.
-                let com_k = !rope_no_kv();
                 plan.push(Self::com_y(
-                    if com_k {
-                        mk(
-                            PipeId::Rope,
-                            &[
-                                (st.b_k.buffer, 0, nbt(c.kv_dim)),
-                                (st.freq_buf.buffer, 0, st.freq_buf.size),
-                            ],
-                            Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
-                            PushSpec::Rope {
-                                n_head: c.n_head_kv as u32,
-                                stride: c.head_dim as u32,
-                            },
-                        )?
-                    } else {
-                        mk(
-                            PipeId::RopeKv,
-                            &[
-                                (st.b_k.buffer, 0, nbt(c.kv_dim)),
-                                (st.freq_buf.buffer, 0, st.freq_buf.size),
-                                (st.kcache.buffer, 0, st.kcache.size),
-                            ],
-                            Self::groups_for(c.n_head_kv * (c.head_dim / 2)),
-                            PushSpec::RopeKv {
-                                n_head: c.n_head_kv as u32,
-                                kv_layer_off: layer_off,
-                            },
-                        )?
-                    },
+                    mk(
+                        PipeId::Rope,
+                        &[
+                            (st.b_k.buffer, 0, nbt(c.kv_dim)),
+                            (st.freq_buf.buffer, 0, st.freq_buf.size),
+                        ],
+                        Self::groups_for(c.n_head_kv * (c.rope_dim / 2)),
+                        PushSpec::Rope {
+                            n_head: c.n_head_kv as u32,
+                            stride: c.head_dim as u32,
+                        },
+                    )?,
                     nt,
                 ));
-                plan.push(PlannedOp::KvAppend { slot, com_k });
+                // K e V do bloco entram no cache convertidos para f16 empacotado — um
+                // dispatch cobre os `n_tok` tokens (posições consecutivas, token-major).
+                plan.push(mk(
+                    PipeId::KvPack,
+                    &[
+                        (st.b_k.buffer, 0, nbt(c.kv_dim)),
+                        (st.b_v.buffer, 0, nbt(c.kv_dim)),
+                        (st.kcache.buffer, 0, st.kcache.size),
+                        (st.vcache.buffer, 0, st.vcache.size),
+                    ],
+                    Self::groups_for(c.kv_dim * n_tok / 2),
+                    PushSpec::KvPack {
+                        slot: slot as u32,
+                        n_tok: nt,
+                    },
+                )?);
                 // Os dois caminhos da atenção ficam prontos; a gravação escolhe pelo
                 // comprimento do KV (ver `splits_do_kv`).
                 let attn_bind = [
@@ -4421,8 +4385,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 PushSpec::Static(push_qk(c.n_head_kv, c.head_dim)),
             )?);
         }
-        // RoPE in-place nos dois, e a cópia para o cache do bloco logo depois. A cabeça
-        // não usa o `rope_kv`: são 4 KB por proposta, e assim o plano não depende do knob.
+        // RoPE in-place nos dois, e a conversão para o cache do bloco logo depois.
         plan.push(self.mk_op(
             PipeId::Rope,
             &[
@@ -4447,7 +4410,19 @@ impl<'ctx> ResidentForward<'ctx> {
                 stride: u(c.head_dim),
             },
         )?);
-        plan.push(PlannedOp::KvAppendMtp);
+        // K/V da proposta entram no cache da cabeça convertidos para f16 empacotado —
+        // mesmo formato do cache do modelo, porque a atenção é o mesmo shader.
+        plan.push(self.mk_op(
+            PipeId::KvPack,
+            &[
+                (st.b_k.buffer, 0, nb(c.kv_dim)),
+                (st.b_v.buffer, 0, nb(c.kv_dim)),
+                (m.kcache.buffer, 0, m.kcache.size),
+                (m.vcache.buffer, 0, m.vcache.size),
+            ],
+            Self::groups_for(c.kv_dim / 2),
+            PushSpec::KvPack { slot: 0, n_tok: 1 },
+        )?);
         let attn_push = PushSpec::Attention { kv_layer_off: 0 };
         plan.push(PlannedOp::Atencao {
             curto: Box::new(self.mk_op(
@@ -4812,8 +4787,7 @@ impl<'ctx> ResidentForward<'ctx> {
     /// O KV-cache não precisa de snapshot. As posições do verify são consecutivas e o
     /// que o próximo passo escreve sobrescreve as rejeitadas — recuar é só o contador,
     /// que é escrituração: quem de fato decide a posição é o `pos` que o chamador passa
-    /// adiante. Com o `rope_kv` ligado o K já entrou no slot girado, e isso também não
-    /// muda nada.
+    /// adiante.
     pub fn rollback_verify(&self, manter: usize) -> Result<(), MatmulError> {
         if manter == 0 || manter >= VERIFY_TOK {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));

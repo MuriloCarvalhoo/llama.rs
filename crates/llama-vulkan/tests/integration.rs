@@ -865,6 +865,33 @@ fn attention_caso_split(
     );
 }
 
+/// Arredonda por f16 (ida e volta), porque o cache real guarda K/V em f16
+/// (`kv_pack.comp`) e a referência de CPU tem de partir dos MESMOS valores —
+/// senão o assert mede o erro do f16 (~1e-3) em vez do erro do shader (<1e-5),
+/// mesma lição da ativação int8 do matvec.
+fn arredonda_f16(x: f32) -> f32 {
+    let b = x.to_bits();
+    let s = (b >> 16) & 0x8000;
+    let exp = (b >> 23) & 0xFF;
+    let m = b & 0x7F_FFFF;
+    let e = exp as i32 - 127 + 15;
+    let h: u32 = if e >= 31 {
+        0x7C00
+    } else if e <= 0 {
+        0 // os valores de teste ficam longe dos subnormais de f16
+    } else {
+        ((e as u32) << 10) + ((m + 0xFFF + ((m >> 13) & 1)) >> 13)
+    };
+    let hs = s | h;
+    let he = (hs >> 10) & 0x1F;
+    let hm = hs & 0x3FF;
+    f32::from_bits(if he == 0 && hm == 0 {
+        (hs >> 15) << 31
+    } else {
+        ((hs >> 15) << 31) | ((he + 127 - 15) << 23) | (hm << 13)
+    })
+}
+
 fn attention_caso(
     fwd: &llama_vulkan::ResidentForward<'_>,
     n_head: usize,
@@ -880,10 +907,10 @@ fn attention_caso(
         .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
         .collect();
     let kc: Vec<f32> = (0..total_len * kv_dim)
-        .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+        .map(|i| arredonda_f16(((i % 23) as f32) * 0.03 - 0.3))
         .collect();
     let vc: Vec<f32> = (0..total_len * kv_dim)
-        .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+        .map(|i| arredonda_f16(((i % 29) as f32) * 0.02 - 0.2))
         .collect();
 
     let mut cpu = vec![0f32; n_head * head_dim];

@@ -789,95 +789,83 @@ fn swiglu_quant_quantiza_igual_ao_quantize_x() {
     );
 }
 
-/// `rope_kv` gira K e escreve direto no slot do KV-cache, no lugar de girar `b_k` in-place
-/// e deixar a cópia para o `kv_append`. A referência é o **próprio `rope.comp`**, que é o
-/// que ele substitui: o conteúdo do slot tem de ficar igual ao que a cópia teria posto lá.
-///
-/// Três coisas só quebram aqui e em nenhum outro teste:
-///
-/// - **rotary parcial** (`rope_dim < head_dim`): o RoPE in-place não tocava nessas dimensões
-///   e a cópia as levava assim mesmo. Escrevendo direto, o shader tem de copiá-las — se ele
-///   cobrisse só `rope_dim/2` pares, o resto do K nunca chegaria ao cache;
-/// - **`kv_off`**: o único offset do plano que depende da posição;
-/// - **bloco de N tokens**: cada um gira pelo seu ângulo e vai para o seu slot.
+/// f16 (bits) → f32, para conferir o que o `kv_pack` escreveu no cache.
+fn f16_para_f32(h: u16) -> f32 {
+    let sinal = u32::from(h >> 15) << 31;
+    let exp = u32::from((h >> 10) & 0x1F);
+    let mant = u32::from(h & 0x3FF);
+    let bits = match (exp, mant) {
+        (0, 0) => sinal,
+        // Subnormais não aparecem nos valores de teste; normaliza mesmo assim.
+        (0, _) => {
+            let shift = mant.leading_zeros() - 21;
+            sinal | ((127 - 15 - shift + 1) << 23) | ((mant << (shift + 14)) & 0x7F_FFFF)
+        }
+        (0x1F, _) => sinal | 0x7F80_0000 | (mant << 13),
+        _ => sinal | ((exp + 127 - 15) << 23) | (mant << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// `kv_pack` converte K e V do passo para o cache em f16 empacotado (um u32 por par).
+/// A referência é a própria entrada: desempacotar o slot tem de devolver K e V dentro do
+/// arredondamento de f16, no offset certo, e **nada fora do slot** pode ser escrito —
+/// `dst_par` é o único offset do plano que depende da posição.
 #[test]
-fn rope_kv_escreve_no_slot_o_mesmo_que_o_rope_mais_a_copia() {
+fn kv_pack_escreve_o_bloco_convertido_no_slot() {
     let Some((ctx, ())) = ctx_fwd() else { return };
     let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
 
-    let n_head_kv = 8usize;
-    let head_dim = 128usize;
-    let kv_dim = n_head_kv * head_dim;
-    let freq: Vec<f32> = (0..head_dim / 2)
-        .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
-        .collect();
+    let kv_dim = 1024usize;
+    for n_tok in [1usize, 3] {
+        let slot_off_par = 7usize * kv_dim / 2; // (slot × ctx + pos0) × kv_dim / 2
+        let k = pseudo(kv_dim * n_tok, 11 + n_tok);
+        let v = pseudo(kv_dim * n_tok, 300 + n_tok);
+        let n_pares = kv_dim * n_tok / 2;
+        // Caches maiores que o bloco, para pegar escrita fora do slot. Os buffers do
+        // helper são f32; o shader os escreve como u32 — mesmo tamanho, reinterpretado.
+        let cache = vec![0f32; slot_off_par + n_pares + kv_dim];
 
-    // `head_dim` = rotary completa; `head_dim / 2` = parcial, com metade das dimensões só
-    // copiadas para o cache.
-    for rope_dim in [head_dim, head_dim / 2] {
-        for n_tok in [1usize, 2] {
-            let pos = 37usize; // posição do ÚLTIMO token do bloco
-            let slot_off = 5usize * kv_dim; // slot da camada + posições anteriores
-            let k = pseudo(kv_dim * n_tok, 81 + rope_dim + n_tok);
-            // Cache maior que o bloco, para pegar escrita fora do slot.
-            let cache = vec![0f32; slot_off + kv_dim * (n_tok + 2)];
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct P {
+            n_pares: u32,
+            dst_par: u32,
+        }
+        let saida = fwd
+            .dbg_dn(
+                DnPipe::KvPack,
+                &[k.clone(), v.clone(), cache.clone(), cache.clone()],
+                &push_bytes(&P {
+                    n_pares: n_pares as u32,
+                    dst_par: slot_off_par as u32,
+                }),
+                u32::try_from(n_pares.div_ceil(64)).unwrap(),
+            )
+            .expect("dispatch kv_pack");
 
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct P {
-                n_head: u32,
-                head_dim: u32,
-                rope_dim: u32,
-                pos: f32,
-                kv_off: u32,
+        for (nome, orig, out) in [("K", &k, &saida[2]), ("V", &v, &saida[3])] {
+            let mut dif = 0f32;
+            for (i, &x) in orig.iter().enumerate() {
+                let par = out[slot_off_par + i / 2].to_bits();
+                let h = if i % 2 == 0 {
+                    par as u16
+                } else {
+                    (par >> 16) as u16
+                };
+                dif = dif.max((f16_para_f32(h) - x).abs());
             }
-            let saida = fwd
-                .dbg_dn_xy(
-                    DnPipe::RopeKv,
-                    &[k.clone(), freq.clone(), cache.clone()],
-                    &push_bytes(&P {
-                        n_head: n_head_kv as u32,
-                        head_dim: head_dim as u32,
-                        rope_dim: rope_dim as u32,
-                        pos: pos as f32,
-                        kv_off: slot_off as u32,
-                    }),
-                    u32::try_from((n_head_kv * (head_dim / 2)).div_ceil(64)).unwrap(),
-                    u32::try_from(n_tok).unwrap(),
-                )
-                .expect("dispatch rope_kv");
-
-            // Referência: o `rope.comp` sobre a mesma entrada — o que o `kv_append` copiaria.
-            let mut ref_k = k.clone();
-            let girado = fwd
-                .dbg_rope_xy(
-                    &mut ref_k,
-                    n_head_kv,
-                    head_dim,
-                    rope_dim,
-                    &freq,
-                    pos,
-                    u32::try_from(n_tok).unwrap(),
-                )
-                .expect("dispatch rope");
-
-            let no_slot = &saida[2][slot_off..slot_off + kv_dim * n_tok];
-            let dif = max_dif(no_slot, &girado);
-            eprintln!("rope_kv (rope_dim={rope_dim}, n_tok={n_tok}): dif={dif:.3e}");
-            assert!(dif < 1e-6, "slot difere do rope+cópia: {dif}");
-
-            // Nada fora do slot pode ter sido escrito: um `kv_off` errado passaria no
-            // assert acima se por acaso o bloco caísse todo dentro da janela comparada.
+            // Arredondamento de f16 em valores |x| < 1: passo máximo ~2^-11.
             assert!(
-                saida[2][..slot_off].iter().all(|&v| v == 0.0),
-                "escreveu antes do slot (rope_dim={rope_dim}, n_tok={n_tok})"
+                dif < 1e-3,
+                "{nome} difere além do f16 (n_tok={n_tok}): {dif}"
             );
             assert!(
-                saida[2][slot_off + kv_dim * n_tok..]
-                    .iter()
-                    .all(|&v| v == 0.0),
-                "escreveu depois do bloco (rope_dim={rope_dim}, n_tok={n_tok})"
+                out[..slot_off_par].iter().all(|&b| b == 0.0)
+                    && out[slot_off_par + n_pares..].iter().all(|&b| b == 0.0),
+                "{nome}: escreveu fora do slot (n_tok={n_tok})"
             );
         }
+        eprintln!("kv_pack n_tok={n_tok}: bloco no slot, dentro do arredondamento de f16");
     }
 }

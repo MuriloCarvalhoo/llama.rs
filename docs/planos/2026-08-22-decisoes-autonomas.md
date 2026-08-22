@@ -57,3 +57,52 @@ verify de 2.
 **Resultado medido:** `[gen] decode 80 tok (36.2 tok/s)` greedy; 32,6 tok/s com
 temp 0,8. Texto coerente nos dois casos.
 
+## 4. Rodada "caminho restante" — o que os perfis por-op decidiram
+
+Perfis completos capturados (curto e 9,4k, `scratchpad/perfil-{curto,9k}.log`):
+
+- **Atenção a 9,4k: 11,5 ms/token (214 GB/s efetivos), 22-25 % do decode; 24,4 ms
+  por passo de verify; 25 % do bloco de prefill.** → **Frente A: KV-cache em f16
+  empacotado em u32** (`packHalf2x16`/`unpackHalf2x16`, core GLSL — o device é
+  criado sem features e não quero arriscar `storage_buffer_16bit`). Paga três
+  vezes e devolve metade da VRAM de contexto.
+- **matvec_q4k: 57 % do decode curto a 461-518 GB/s, contra 636 do q6k.** O
+  cabeçalho do shader prova que 3 loads/lane é o piso e o LDS pad já falhou dos
+  dois lados. Hipótese restante: paralelismo de memória — com ROWS_PER_WAVE=2 as
+  3 cargas da linha 0 são consumidas antes de emitir as da linha 1. → **Frente B
+  (uma tentativa única):** içar as cargas das duas linhas antes do cômputo.
+  Regra: se não melhorar o `TOTAL GPU`, reverter e parar — é a 5ª tentativa numa
+  frente com 4 fracassos. **Resultado: 456-478 GB/s, igual ao baseline (revertido).**
+  O compilador já agrupava as cargas; os ~470 GB/s do Q4_K neste hardware são o que
+  esta estrutura de kernel entrega. Frente fechada — o caminho para a base é outra
+  quantização (plano B, Q3_K) ou nada.
+- **Não ataco:** fusão das ops pequenas (~2,7 ms/GPU a 4-7 GB/s, mas são ~10 µs
+  de latência de dispatch cada — ganho ~1 ms com risco alto de regressão);
+  gravação de host (0,6 ms < 1 ms, regra da frente 1); GEMM para Q5_K/Q6_K no
+  prefill (25 ms/bloco, fica anotado como próxima frente de prefill).
+
+## 5. Implementação do KV f16 (frente A)
+
+- Cache como pares f16 num u32 (`kv_pack.comp` empacota; a atenção desempacota
+  com `unpackHalf2x16` — índices continuam em elementos, par = `idx>>1`).
+- O `kv_append` por `cmd_copy_buffer` virou o dispatch `KvPack` com
+  `PushSpec::KvPack{slot, n_tok}` resolvido na gravação (padrão do `Attention`);
+  o cache da cabeça MTP usa o mesmo formato (a atenção é o mesmo shader).
+- **`rope_kv` removido de vez** (shader, PipeId, knob): já era 0,4 ms pior e
+  escreveria f32 num cache de pares f16 — a remoção é consequência da mudança,
+  não limpeza gratuita. O teste dele virou o teste do `kv_pack`.
+- Referências de CPU nos testes de atenção passam a arredondar K/V por f16
+  antes (mesma lição da ativação int8: comparar partindo dos mesmos valores).
+- Nota: o oráculo (llama.cpp) usa KV f16 por padrão — o formato novo aproxima
+  os dois, não afasta.
+
+**Resultado medido:** os 40 testes com modelo passam (logits GPU×CPU inclusive);
+contexto curto inalterado; **a atenção a 9,4k NÃO mudou** (11,5 ms/token decode,
+24,6 no verify) — metade dos bytes, mesmo tempo. Conclusão: ela não é limitada
+por banda. A aritmética fecha com **throughput de VALU** (wave64 = 4 ciclos por
+instrução, ~13 waves/SIMD residentes): os bytes caíram, as instruções não. O f16
+fica pelo que entrega — metade da VRAM de contexto (32k: 4,4 → 2,2 GB) e
+paridade com o formato do llama.cpp — e o próximo ganho de atenção longa seria
+matemática f16 nativa (`V_DOT2_F32_F16`), que exige habilitar `shaderFloat16`
+no device: fica anotado como frente futura, não desta rodada.
+
