@@ -1353,6 +1353,67 @@ fn q4_k_matvec_caso(
     );
 }
 
+/// O GEMM com tiling em LDS (`mul_mm.comp`, experimental) contra o matvec Q4_K que ele
+/// substituiria. A referência é o próprio matvec, não a CPU: os dois têm de calcular a
+/// mesma coisa, e o matvec já está preso à referência de CPU por
+/// `q4_k_matvec_gpu_bate_com_a_referencia_de_cpu`.
+///
+/// O que só quebra aqui: o tile de peso em LDS (128 linhas × 32 elementos, carregado por
+/// duas threads por linha), o mapeamento de 256 threads para 4 linhas × COLS/8 colunas, e o
+/// termo afim do Q4_K (`-dmin·m·soma(x)`), que sobrevive ao tiling porque `soma(x)` só
+/// depende da coluna. Um `n_out` que não é múltiplo de 128 entra de propósito, para pegar o
+/// workgroup incompleto do fim.
+///
+/// A igualdade é **relativa**: a ordem de acumulação difere (o matvec reduz no subgrupo, o
+/// GEMM acumula por thread), então bit a bit não vale.
+#[test]
+fn gemm_em_lds_bate_com_o_matvec_q4k() {
+    let ctx = match llama_vulkan::VulkanContext::new() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let phys = ctx.amd_compute_devices();
+    if phys.is_empty() {
+        eprintln!("nenhum device AMD — pulando");
+        return;
+    }
+    let dev = llama_vulkan::VulkanDevice::create(&ctx, &phys[0]).unwrap();
+
+    let n_in = 1024usize;
+    let w = QuantK::Q4.pesos(300, n_in / 256);
+
+    // 300 linhas: dois workgroups cheios (128 + 128) e um de 44, que exercita a guarda.
+    for n_out in [128usize, 300] {
+        for cols in [8usize, 16, 32] {
+            let x: Vec<f32> = (0..cols * n_in)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.021)
+                .collect();
+            let gemm = llama_vulkan::matmul::dispatch_mul_mm_q4k(
+                &ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols,
+            )
+            .expect("dispatch mul_mm");
+            let mv = QuantK::Q4.dispatch(&ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols);
+
+            assert_eq!(gemm.len(), mv.len());
+            let escala = mv.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let (i_pior, pior) = gemm
+                .iter()
+                .zip(&mv)
+                .enumerate()
+                .map(|(i, (a, b))| (i, (a - b).abs() / escala))
+                .fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+            eprintln!("mul_mm n_out={n_out} cols={cols}: erro rel máx {pior:.3e}");
+            assert!(
+                pior < 1e-5,
+                "GEMM divergiu do matvec em n_out={n_out} cols={cols}: \
+                 índice {i_pior}, rel {pior} (gemm={} mv={})",
+                gemm[i_pior],
+                mv[i_pior]
+            );
+        }
+    }
+}
+
 /// Qual K-quant o caso de batch exercita. Os três têm o mesmo contrato de `cols`, mas
 /// layouts de superbloco (e, no Q6_K, `constant_id`) diferentes.
 #[derive(Clone, Copy)]

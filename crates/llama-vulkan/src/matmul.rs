@@ -421,6 +421,45 @@ pub fn dispatch_q6_k_matvec(
     )
 }
 
+/// GEMM Q4_K com tiling em LDS (`mul_mm.comp`) — o caminho **experimental** do prefill.
+///
+/// Mesmo contrato de `dispatch_q4_k_matvec`: pesos crus, `cols` ativações concatenadas,
+/// saída coluna a coluna. A diferença é interna — o tile de peso passa pela LDS em vez de
+/// ficar em registrador. `cols` tem de ser múltiplo de 8 e no máximo 64: é a largura do
+/// tile, e a grade de threads tem 8 grupos de coluna.
+// Contexto Vulkan (3) + pesos/ativacoes (2) + dimensoes (3): agrupa-los numa struct
+// so daria um wrapper de uso unico. Mesmo criterio do `plano_delta`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mul_mm_q4k(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        w_bytes,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, cols_u32)],
+    )
+}
+
 /// Caminho comum dos matvecs K-quant: sobe pesos e ativação, despacha
 /// `n_out / rows_por_wg` workgroups e lê o resultado. `w_bytes` já vem no layout que o
 /// shader espera.

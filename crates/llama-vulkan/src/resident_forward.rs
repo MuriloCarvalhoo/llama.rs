@@ -72,6 +72,32 @@ pub(crate) fn matvec_geom_batch() -> (u32, u32) {
         .unwrap_or((64, 1))
 }
 
+/// Linhas de saída que um workgroup do GEMM cobre — o `BM` do tile de `mul_mm.comp`.
+pub(crate) const GEMM_LINHAS_POR_WG: u32 = 128;
+
+/// Se o prefill usa o GEMM com tiling em LDS (`mul_mm.comp`) nos pesos Q4_K.
+///
+/// **Desligado por padrão, e experimental.** O critério de adoção do plano é uma medição
+/// que ainda não foi feita: o GEMM tem de vencer o matvec-COLS no mesmo bloco por uma
+/// margem que pague manter dois caminhos. `LLAMA_RS_PREFILL_GEMM=1` liga para o A/B.
+///
+/// Só vale para Q4_K (53% do tempo de matvec no Qwen3.8-27B) e só com `n_batch` múltiplo
+/// de 8 — é a largura do tile. Os demais tipos e larguras seguem no matvec-COLS.
+fn gemm_prefill() -> bool {
+    std::env::var("LLAMA_RS_PREFILL_GEMM").is_ok_and(|v| v == "1")
+}
+
+/// Larguras de bloco que o tile do `mul_mm.comp` cobre: múltiplas de 8 (a grade de threads
+/// tem 8 grupos de coluna) e no máximo 64 (acima disso os acumuladores por thread estouram).
+fn gemm_largura_ok(cols: usize) -> bool {
+    (8..=64).contains(&cols) && cols.is_multiple_of(8)
+}
+
+/// Se este matvec vai pelo GEMM em vez do matvec-COLS.
+fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
+    gemm_prefill() && matches!(ty, gguf::GgmlType::Q4_K) && gemm_largura_ok(cols)
+}
+
 /// Slot de KV-cache de cada camada local e o total de slots.
 ///
 /// Só camada de atenção tem cache. As delta-net do qwen35 (três de cada quatro) guardam
@@ -385,6 +411,8 @@ pub(crate) enum PipeId {
     MatvecQ5KB,
     MatvecQ6KB,
     MatvecQ4KB,
+    /// GEMM Q4_K com tiling em LDS — experimental, ver [`gemm_prefill`].
+    MulMmQ4K,
     QuantizeX,
     /// Residual + parciais da RMSNorm — ver `norm_fused.comp`.
     NormFused,
@@ -420,6 +448,7 @@ impl PipeId {
             PipeId::MatvecQ5KB => "matvec_q5k_b",
             PipeId::MatvecQ6KB => "matvec_q6k_b",
             PipeId::MatvecQ4KB => "matvec_q4k_b",
+            PipeId::MulMmQ4K => "mul_mm_q4k",
             PipeId::QuantizeX => "quantize_x",
             PipeId::NormFused => "norm_fused",
             PipeId::NormP2 => "norm_p2",
@@ -457,7 +486,8 @@ impl PipeId {
             | PipeId::MatvecB
             | PipeId::MatvecQ5KB
             | PipeId::MatvecQ6KB
-            | PipeId::MatvecQ4KB => (&[0, 1, 2, 4], &[3]),
+            | PipeId::MatvecQ4KB
+            | PipeId::MulMmQ4K => (&[0, 1, 2, 4], &[3]),
             PipeId::Attention | PipeId::AttentionSplit => (&[0, 1, 2], &[3]),
             PipeId::AttnReduce => (&[0], &[1]),
             PipeId::QuantizeX => (&[0], &[1, 2]),
@@ -735,6 +765,9 @@ pub struct ResidentForward<'ctx> {
     pub(crate) matvec_q5k_b: ComputePipeline,
     pub(crate) matvec_q6k_b: ComputePipeline,
     pub(crate) matvec_q4k_b: ComputePipeline,
+    /// GEMM Q4_K com tiling em LDS, para o prefill. Criada sempre; só entra no plano com
+    /// `LLAMA_RS_PREFILL_GEMM=1` — ver [`gemm_prefill`].
+    pub(crate) mul_mm_q4k: ComputePipeline,
     pub(crate) rmsnorm: ComputePipeline,
     pub(crate) norm_fused: ComputePipeline,
     pub(crate) norm_p2: ComputePipeline,
@@ -1003,6 +1036,16 @@ impl<'ctx> ResidentForward<'ctx> {
         let matvec_q6k_b =
             ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[(0, cols)])?;
         let matvec_q4k_b = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
+        // `COLS` do GEMM é a largura do bloco quando ele está ligado; com o knob desligado
+        // (ou a largura fora do tile) vale 8, a menor válida, só para a pipeline compilar.
+        // O plano só emite `MulMmQ4K` quando `gemm_para` aceita — ver `mv_gen`.
+        let gemm_cols = if gemm_prefill() && gemm_largura_ok(cols as usize) {
+            cols
+        } else {
+            8
+        };
+        let mul_mm_q4k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols)])?;
         let rmsnorm = ComputePipeline::with(d, crate::RMSNORM_SPV, 3, 8, &[])?; // dim:u32 + eps:f32
         // dim:u32 + tem_residual:u32
         let norm_fused = ComputePipeline::with(d, crate::NORM_FUSED_SPV, 3, 8, &[])?;
@@ -1059,6 +1102,7 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q5k_b,
             matvec_q6k_b,
             matvec_q4k_b,
+            mul_mm_q4k,
             rmsnorm,
             norm_fused,
             norm_p2,
@@ -2639,6 +2683,7 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MatvecQ5KB => &self.matvec_q5k_b,
             PipeId::MatvecQ6KB => &self.matvec_q6k_b,
             PipeId::MatvecQ4KB => &self.matvec_q4k_b,
+            PipeId::MulMmQ4K => &self.mul_mm_q4k,
             PipeId::DeltaNet => &self.delta_net,
             PipeId::DnConv => &self.dn_conv,
             PipeId::DnGates => &self.dn_gates,
@@ -2862,40 +2907,44 @@ impl<'ctx> ResidentForward<'ctx> {
             let batch = cols > 1;
             // A ativação é lida uma vez para todas as linhas do wave; quantas linhas cada
             // workgroup cobre sai de `matvec_geom` (Q5_K/Q4_K) ou da geometria fixa dos
-            // shaders Q8_0 e Q6_K.
-            let (pipe, rows_por_wg) = match w.ty {
-                gguf::GgmlType::Q8_0 => (
-                    if batch {
-                        PipeId::MatvecB
-                    } else {
-                        PipeId::Matvec
-                    },
-                    MATVEC_NUM_ROWS as usize,
-                ),
-                gguf::GgmlType::Q5_K => (
-                    if batch {
-                        PipeId::MatvecQ5KB
-                    } else {
-                        PipeId::MatvecQ5K
-                    },
-                    rows_q5k,
-                ),
-                gguf::GgmlType::Q4_K => (
-                    if batch {
-                        PipeId::MatvecQ4KB
-                    } else {
-                        PipeId::MatvecQ4K
-                    },
-                    rows_q5k,
-                ),
-                _ => (
-                    if batch {
-                        PipeId::MatvecQ6KB
-                    } else {
-                        PipeId::MatvecQ6K
-                    },
-                    8,
-                ),
+            // shaders Q8_0 e Q6_K. O GEMM, quando ligado, cobre `BM` linhas por workgroup.
+            let (pipe, rows_por_wg) = if gemm_para(cols, w.ty) {
+                (PipeId::MulMmQ4K, GEMM_LINHAS_POR_WG as usize)
+            } else {
+                match w.ty {
+                    gguf::GgmlType::Q8_0 => (
+                        if batch {
+                            PipeId::MatvecB
+                        } else {
+                            PipeId::Matvec
+                        },
+                        MATVEC_NUM_ROWS as usize,
+                    ),
+                    gguf::GgmlType::Q5_K => (
+                        if batch {
+                            PipeId::MatvecQ5KB
+                        } else {
+                            PipeId::MatvecQ5K
+                        },
+                        rows_q5k,
+                    ),
+                    gguf::GgmlType::Q4_K => (
+                        if batch {
+                            PipeId::MatvecQ4KB
+                        } else {
+                            PipeId::MatvecQ4K
+                        },
+                        rows_q5k,
+                    ),
+                    _ => (
+                        if batch {
+                            PipeId::MatvecQ6KB
+                        } else {
+                            PipeId::MatvecQ6K
+                        },
+                        8,
+                    ),
+                }
             };
             mk(
                 pipe,
@@ -4065,5 +4114,23 @@ mod tests {
 
         assert_eq!(total, 3);
         assert_eq!(slots, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    /// A largura que o tile do GEMM cobre. O mesmo predicado decide o `COLS` com que a
+    /// pipeline é compilada e se o plano emite `MulMmQ4K`; se os dois discordassem, o
+    /// dispatch rodaria com um tile de outra largura. O decode (`cols = 1`) e a projeção de
+    /// logits têm de ficar de fora sempre.
+    #[test]
+    fn largura_do_tile_do_gemm() {
+        use super::gemm_largura_ok;
+        for cols in [8usize, 16, 24, 32, 64] {
+            assert!(
+                gemm_largura_ok(cols),
+                "{cols} é múltiplo de 8 e cabe no tile"
+            );
+        }
+        for cols in [0usize, 1, 4, 12, 72] {
+            assert!(!gemm_largura_ok(cols), "{cols} não cabe no tile");
+        }
     }
 }

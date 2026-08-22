@@ -26,6 +26,8 @@ fn main() {
         ("dn_norm.comp", "DN_NORM_SPV"),
         ("dn_l2_qk.comp", "DN_L2_QK_SPV"),
         ("gate_quant.comp", "GATE_QUANT_SPV"),
+        // GEMM com tiling em LDS para o prefill (experimental, atrás de knob).
+        ("mul_mm.comp", "MUL_MM_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
