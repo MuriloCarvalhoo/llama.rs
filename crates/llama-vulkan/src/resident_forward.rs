@@ -1848,6 +1848,12 @@ impl<'ctx> ResidentForward<'ctx> {
             .delta
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        // A janela da convolução vive em registrador dentro do `dn_conv.comp`, num array de
+        // `MAX_PASSOS = 4`. Acima disso o shader calcularia com uma janela curta demais e o
+        // erro só apareceria na qualidade da saída — falhar aqui é o que impede isso.
+        if dn_cfg.d_conv > 5 {
+            return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        }
 
         let key_dim = dn_cfg.d_state * dn_cfg.n_k_heads;
         let value_dim = dn_cfg.head_v_dim() * dn_cfg.n_v_heads;
