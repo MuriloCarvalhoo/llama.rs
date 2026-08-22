@@ -680,9 +680,11 @@ pub(crate) struct ResidentState {
     pub len: RefCell<usize>,
     /// Cópia do `estado` e da `janela` de cada camada linear numa fronteira de turno, para
     /// que uma divergência depois dela não custe reprocessar o prompt inteiro — ver
-    /// `marcar_snapshot`. Vazio nas arquiteturas densas: lá não há nada recorrente, e o
-    /// snapshot é só o comprimento do KV.
-    pub snap: Vec<(Buf, Buf)>,
+    /// `marcar_snapshot`. Alocada no primeiro snapshot, não na carga: são ~155 MB de VRAM
+    /// que só quem serve várias requisições sobre a mesma sessão usa. Fica vazia nas
+    /// arquiteturas densas, onde não há nada recorrente e o snapshot é só o comprimento
+    /// do KV.
+    pub snap: RefCell<Vec<(Buf, Buf)>>,
     /// Comprimento do KV-cache no snapshot. `None` = nenhum snapshot válido.
     pub snap_len: std::cell::Cell<Option<usize>>,
     pub plan: Vec<PlannedOp>,
@@ -1312,19 +1314,6 @@ impl<'ctx> ResidentForward<'ctx> {
                     },
                 });
             }
-            // Snapshot de fronteira de turno: uma cópia do estado recorrente e da janela de
-            // cada camada linear. São ~155 MB no Qwen3.8-27B, alocados uma vez — o que eles
-            // compram é a divergência barata (ver `marcar_snapshot`). Arquitetura densa não
-            // aloca nada: o KV-cache já volta atrás só recuando o comprimento.
-            let mut snap = Vec::new();
-            for la in &aux_buf {
-                if let Some(dn) = la.delta.as_ref() {
-                    snap.push((
-                        Buf::device(ctx, phys, d, dn.estado.size)?,
-                        Buf::device(ctx, phys, d, dn.janela.size)?,
-                    ));
-                }
-            }
             let output_norm_buf = mk(&aux.output_norm)?;
             let freq_buf = mk(&aux.freq_table)?;
             let embd_stage =
@@ -1457,7 +1446,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 logits_host,
                 logits_ptr,
                 len: RefCell::new(0),
-                snap,
+                snap: RefCell::new(Vec::new()),
                 snap_len: std::cell::Cell::new(None),
                 plan: Vec::new(),
                 barreiras: Vec::new(),
@@ -3680,17 +3669,48 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(st) = self.state.as_ref() else {
             return false;
         };
+        if !self.alocar_snapshot(st) {
+            return false;
+        }
+        let snap = st.snap.borrow();
         let pares: Vec<(&Buf, &Buf)> = st
             .aux
             .iter()
             .filter_map(|la| la.delta.as_ref())
-            .zip(&st.snap)
+            .zip(snap.iter())
             .flat_map(|(dn, (e, j))| [(&dn.estado, e), (&dn.janela, j)])
             .collect();
         if !self.copiar_bufs(&pares) {
             return false;
         }
         st.snap_len.set(Some(*st.len.borrow()));
+        true
+    }
+
+    /// Aloca os buffers do snapshot na primeira chamada. `false` se a VRAM não deu — e aí
+    /// a sessão segue sem snapshot, reprocessando na divergência como antes.
+    fn alocar_snapshot(&self, st: &ResidentState) -> bool {
+        let mut snap = st.snap.borrow_mut();
+        if !snap.is_empty() {
+            return true;
+        }
+        let d = &self.dev.device;
+        for la in &st.aux {
+            let Some(dn) = la.delta.as_ref() else {
+                continue;
+            };
+            let (Ok(e), Ok(j)) = (
+                Buf::device(self.ctx, self.phys(), d, dn.estado.size),
+                Buf::device(self.ctx, self.phys(), d, dn.janela.size),
+            ) else {
+                for (e, j) in snap.drain(..) {
+                    e.destroy(d);
+                    j.destroy(d);
+                }
+                return false;
+            };
+            snap.push((e, j));
+        }
         true
     }
 
@@ -3703,11 +3723,12 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(len) = st.snap_len.get() else {
             return false;
         };
+        let snap = st.snap.borrow();
         let pares: Vec<(&Buf, &Buf)> = st
             .aux
             .iter()
             .filter_map(|la| la.delta.as_ref())
-            .zip(&st.snap)
+            .zip(snap.iter())
             .flat_map(|(dn, (e, j))| [(e, &dn.estado), (j, &dn.janela)])
             .collect();
         if !self.copiar_bufs(&pares) {
@@ -4009,7 +4030,7 @@ impl Drop for ResidentForward<'_> {
                 lq.ffn_down.gpu.destroy(d);
             }
             st.output_w.gpu.destroy(d);
-            for (estado, janela) in &st.snap {
+            for (estado, janela) in st.snap.borrow().iter() {
                 estado.destroy(d);
                 janela.destroy(d);
             }
