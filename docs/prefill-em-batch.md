@@ -75,9 +75,24 @@ COLS=32. `dotPacked4x8AccSatEXT` no laço interno, que é onde a MI50 tem folga 
 Q4_K (`-dmin·m·soma(x)`) sobrevive ao tiling porque `soma(x)` só depende da coluna — sai
 uma vez por (coluna, passo de K) para a LDS.
 
-**Critério de adoção, ainda não medido:** o GEMM tem de vencer o matvec-COLS no mesmo bloco
-por uma margem que pague manter dois caminhos. Enquanto isso não for medido, o knob fica
-desligado.
+**Medido (2026-08-21, prompt de ~3,2k tokens, `TOTAL GPU` das duas GPUs, ms por token de
+prefill):**
+
+| config | ms/token | parede (carga+prefill+8 tok) |
+|---|---:|---:|
+| batch 8, matvec-COLS (padrão anterior) | 18,7 | 66,1 s |
+| batch 16, matvec-COLS | 18,4 | 66,0 s |
+| batch 32, matvec-COLS | 27,4 | 94,6 s |
+| batch 8 + GEMM | 21,8 | 76,7 s |
+| batch 16 + GEMM | 14,6 | — |
+| **batch 24 + GEMM** | **10,8** | — |
+| batch 32 + GEMM | 13,2 | 49,4 s |
+
+Duas curvas que se cruzam: o matvec-COLS satura em 16 e despenca em 32 (pressão de
+registrador, como previsto acima); o GEMM piora em bloco pequeno (o tile de 128×COLS não
+enche), tem o ótimo em 24 e volta a cair em 32. −42 % contra o padrão antigo — o critério
+dos 20 % foi batido: **adotado como padrão** `LLAMA_RS_BATCH=24` + GEMM (o knob agora
+desliga com `LLAMA_RS_PREFILL_GEMM=0`).
 
 ## O que mais precisa virar batch
 

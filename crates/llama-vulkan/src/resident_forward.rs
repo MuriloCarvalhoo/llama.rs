@@ -31,15 +31,16 @@ pub(crate) const NORM_P1_WG: u32 = 32;
 /// acumuladores por uma constante fixa em vez de por `COLS`. Com ele resolvido, o teto
 /// passa a ser a pressão de registrador: são `ROWS_PER_WAVE * COLS` acumuladores vivos por
 /// lane, e em algum ponto a ocupância cai mais do que o reuso do peso rende. **Onde fica
-/// esse ponto é empírico e ainda não foi medido neste hardware**; 32 é o limite superior
-/// da varredura, não um ótimo conhecido. O padrão segue 8, que é o valor medido.
+/// esse ponto é empírico**: medido em 2026-08-21 com o GEMM ligado, a curva faz
+/// 8→21,8, 16→14,6, **24→10,8**, 32→13,2 ms por token de prefill — o padrão é 24
+/// (ver `docs/prefill-em-batch.md`).
 ///
 /// `LLAMA_RS_BATCH=n` sobrescreve; `1` desliga o batch (prefill volta a ser token a token).
 pub(crate) fn batch_size() -> usize {
     std::env::var("LLAMA_RS_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8)
+        .unwrap_or(24)
         .clamp(1, 32)
 }
 
@@ -110,14 +111,14 @@ pub(crate) const GEMM_LINHAS_POR_WG: u32 = 128;
 
 /// Se o prefill usa o GEMM com tiling em LDS (`mul_mm.comp`) nos pesos Q4_K.
 ///
-/// **Desligado por padrão, e experimental.** O critério de adoção do plano é uma medição
-/// que ainda não foi feita: o GEMM tem de vencer o matvec-COLS no mesmo bloco por uma
-/// margem que pague manter dois caminhos. `LLAMA_RS_PREFILL_GEMM=1` liga para o A/B.
+/// **Ligado por padrão** desde a medição de 2026-08-21: com batch 24, o GEMM faz o
+/// prefill em 10,8 ms/token contra 18,7 do matvec-COLS com batch 8 (−42 %) — ver a
+/// tabela em `docs/prefill-em-batch.md`. `LLAMA_RS_PREFILL_GEMM=0` desliga para o A/B.
 ///
 /// Só vale para Q4_K (53% do tempo de matvec no Qwen3.8-27B) e só com `n_batch` múltiplo
 /// de 8 — é a largura do tile. Os demais tipos e larguras seguem no matvec-COLS.
 fn gemm_prefill() -> bool {
-    std::env::var("LLAMA_RS_PREFILL_GEMM").is_ok_and(|v| v == "1")
+    !std::env::var("LLAMA_RS_PREFILL_GEMM").is_ok_and(|v| v == "0")
 }
 
 /// Larguras de bloco que o tile do `mul_mm.comp` cobre: múltiplas de 8 (a grade de threads
@@ -198,14 +199,12 @@ pub(crate) fn matvec_lds_pad() -> u32 {
 /// Se o RoPE de K escreve direto no slot do KV-cache (`rope_kv.comp`), dispensando a cópia
 /// de K do `kv_append`. V continua indo pela cópia — ele não passa por RoPE.
 ///
-/// Ligado por padrão: a matemática é a mesma e o passo escreve K uma vez em vez de
-/// escrever `b_k` e copiá-lo em seguida, o que ainda deixa `rope` e `kv_append` no mesmo
-/// grupo de barreiras (antes o append lia o que o rope acabara de escrever).
-/// `LLAMA_RS_ROPE_KV=0` volta ao caminho antigo, para comparar os dois no mesmo binário —
-/// é a mesma saída de emergência que `LLAMA_RS_NO_GROUP` dá para o agrupamento de
-/// barreiras. **Nenhum dos dois foi medido ainda.**
+/// Desligado por padrão: medido em 2026-08-21 (TOTAL GPU, 3 execuções por lado), a fusão
+/// custa ~0,4 ms/token (40,6 contra 40,2 ms) — a escrita espalhada no cache grande perde
+/// mais do que a cópia de `b_k` custa. `LLAMA_RS_ROPE_KV=1` religa para comparar no mesmo
+/// binário.
 fn rope_no_kv() -> bool {
-    !std::env::var("LLAMA_RS_ROPE_KV").is_ok_and(|v| v == "0")
+    std::env::var("LLAMA_RS_ROPE_KV").is_ok_and(|v| v == "1")
 }
 
 /// Buffer Vulkan simples (device-local ou host-visible) com tamanho conhecido.

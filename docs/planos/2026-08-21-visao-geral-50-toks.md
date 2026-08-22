@@ -88,11 +88,12 @@ delta-net multi-token), por isso a ordem 2→3 reaproveita trabalho.
 
 ## Housekeeping (fazer junto com a frente 0)
 
-- [ ] `docs/qwen35-arquitetura.md`: marcar no topo como doc de projeto histórico e
+- [x] `docs/qwen35-arquitetura.md`: marcar no topo como doc de projeto histórico e
       riscar a seção "O que falta no llama-rs" (tudo feito).
-- [ ] `crates/llama-vulkan/src/resident_forward.rs:1059-1060`: comentário obsoleto diz
+- [x] `crates/llama-vulkan/src/resident_forward.rs:1059-1060`: comentário obsoleto diz
       que delta-net não tem plano de decode; a linha 1084 trata `MixerRaw::Delta`.
-- [ ] Tokenizer: `tokenizer.ggml.pre` não é lido em lugar nenhum (grep confirma). O
+      *(sumiu na reescrita do merge das frentes)*
+- [x] Tokenizer: `tokenizer.ggml.pre` não é lido em lugar nenhum (grep confirma). O
       Qwen3.8 usa `pre = "qwen35"`, cuja regex difere da do Qwen2 que usamos: letras
       consomem combining marks (`[\p{L}\p{M}]+` — `~/llama.cpp/src/llama-vocab.cpp:382-388`).
       Português NFC quase não sofre, mas é divergência real de tokenização. Ler a chave em
@@ -110,3 +111,20 @@ delta-net multi-token), por isso a ordem 2→3 reaproveita trabalho.
   `~/llama.cpp/common/speculative.cpp:1281-1717` (driver MTP),
   `~/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp` (scan
   multi-token com estado em registrador).
+
+## Resultado (2026-08-21, pós-merge das frentes)
+
+Medido no protocolo padrão (`docs/decode-por-configuracao.md`), contexto curto:
+
+| meta | alvo | medido |
+|---|---|---|
+| frente 1 — base sem MTP | ≤30 ms | 40,2 ms (knobs LDS/rope medidos e piores; sobrou a geometria do matvec) |
+| frente 2 — MTP por flag | ≥46 tok/s | **31,4 tok/s** (+44 % sobre a base; verify de 2 custa +17 %) |
+| frente 3 — prefill | ≥180 tok/s | 92 tok/s (batch 24 + GEMM, −42 % vs batch 8) |
+| frente 4 — carga warm | ≤6 s | **4,5–5,0 s** ✓ |
+| aceitação encadeada n=2 | ≥40 % para valer | **41,7 %** → 1,80 tok/passo — próxima frente |
+
+O que falta para 50: a base de 40 ms não caiu (matvec ainda a 506 GB/s no Q4_K) e o
+n=2 não está ligado. Com a base atual, o teto do n=2 é ~34 tok/s; os dois juntos
+(base ≤30 ms + n=2) é que cruzam os 50. Em contexto 9,3k o MTP rende 22,1 tok/s —
+a atenção longa (`docs/…atencao…`) segue sendo o gargalo que nenhuma frente atacou.

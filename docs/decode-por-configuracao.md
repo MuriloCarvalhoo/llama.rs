@@ -32,8 +32,12 @@ LLAMA_RS_SPLIT=31 numactl --interleave=all target/release/llama-cli \
 | `dn_gates` com NWAVE+vec4 (`5a4d2fc`) | — | **41,35** | 3 execuções: 41,44 41,56 41,04 |
 | greedy (`--temp 0`) | 22,35 | — | 3 execuções; a amostragem custa ~1,3 ms/token |
 | amostragem completa (temp 0.8, top-k 40) | 21,74 | — | 3 execuções, bem estável |
-| MTP ligado | *pendente* | | falta o decode em batch |
-| MTP desligado (mesma build) | *pendente* | | controle do anterior |
+| MTP ligado (merge das frentes, pós-fix dos push constants) | **31,4** | 47,8 (passo de 2 tok) | 3 execuções: 32,6 30,6 30,9; greedy; verify = 23,8 + 24,0 ms |
+| MTP desligado (mesma build) | 21,8 | 40,7 | 3 execuções: 21,1 22,3 22,1; decode = 19,8 + 20,9 ms |
+| MTP ligado, contexto 9,3k | 22,1 | 59,5 (passo de 2 tok) | 1 execução; a atenção de contexto longo domina |
+| `LLAMA_RS_ROPE_KV=0` (agora padrão) | — | 40,2 | 3 execuções; a fusão rope→KV custava ~0,4 ms/token |
+| `LLAMA_RS_MATVEC_LDS_PAD=13` | — | 41,6 | 1 execução; pior, knob fica 0 |
+| `LLAMA_RS_MATVEC_LDS_PAD=22` | — | 51,2 | 1 execução; muito pior (−26 % de ocupância útil) |
 
 ### Taxa de aceitação do MTP — **60,9 % medido**
 
@@ -51,6 +55,14 @@ Isso é o teto do ganho: `tok/s = base × (1 + aceitação) = base × 1,61`.
 **Contradiz o +3,4 % do llama.cpp** na tabela abaixo. A explicação mais provável é que a
 implementação dele não faz batch eficiente num híbrido SSM — a cabeça do modelo prevê bem.
 Medido com greedy; com amostragem a temperatura alta a aceitação cai.
+
+**Medido ponta a ponta (2026-08-21)**: 31,4 tok/s com MTP contra 21,8 sem — +44 %. O passo
+verify de 2 tokens custa 47,8 ms de GPU contra 40,7 do decode de 1 (+17 %): verificar o
+segundo token quase de graça é o que paga o MTP.
+
+**Aceitação encadeada (n=2)**: 1º token 56,5 % (13/23), 2º condicionado ao 1º **41,7 %**
+(5/12) → 1,80 tokens/passo contra 1,57 do n=1. Acima do limiar de 40 % do plano: propor
+2 tokens é a próxima frente (amostra pequena — revalidar com mais tokens).
 
 ### Requests por superbloco do Q4_K — a conta não explica os 13%
 

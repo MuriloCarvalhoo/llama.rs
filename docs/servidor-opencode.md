@@ -141,8 +141,10 @@ do pedido (render do template e tokenização incluídos, porque o cliente esper
 ```
 
 É o número que decide a experiência com prompt grande: a taxa de decode não compensa
-minutos de espera antes de a resposta começar. *Antes/depois desta frente: pendente de
-medição.*
+minutos de espera antes de a resposta começar. *Medido via CLI em 2026-08-21 (prompt de
+9 312 tokens, batch 24 + GEMM, greedy): prefill a 12,75 ms/token → **TTFT ≈ 2 min** do
+zero (sem cache de prefixo). O batch de 24 é pequeno demais para amortizar o peso como o
+llama.cpp faz com blocos de 512; subir o teto do bloco é a próxima fronteira do prefill.*
 
 ## Uma requisição por vez
 
