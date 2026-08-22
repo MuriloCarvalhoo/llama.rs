@@ -58,6 +58,8 @@ struct PushDelta {
     d: u32,
     n_heads: u32,
     rep: u32,
+    n_tok: u32,
+    v_stride: u32,
 }
 
 /// Um passo da recorrência: devolve (estado depois, saída).
@@ -122,6 +124,8 @@ fn snapshot_do_estado_desfaz_exatamente_um_token() {
         d: d as u32,
         n_heads: n_heads as u32,
         rep: 1,
+        n_tok: 1,
+        v_stride: (n_heads * d) as u32,
     });
     let groups = (n_heads * d / 4) as u32;
     // Três tokens diferentes: um token repetido esconderia um estado que não avançou.

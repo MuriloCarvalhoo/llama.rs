@@ -2504,7 +2504,8 @@ impl<'ctx> ResidentForward<'ctx> {
                     (b.conv.buffer, nb(t * conv_dim), nb(conv_dim)),
                 ],
                 Self::groups_for(conv_dim),
-                PushSpec::Static(push3(u(conv_dim), u(dn_cfg.d_conv), 0)),
+                // n_tok = 1: aqui cada dispatch processa um token (o batch usa `nt`).
+                PushSpec::Static(push3(u(conv_dim), u(dn_cfg.d_conv), 1)),
             )?);
         }
 
@@ -2520,10 +2521,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 ],
                 u(dn_cfg.n_k_heads * 2),
                 PushSpec::Static({
-                    let mut v = Vec::with_capacity(12);
+                    let mut v = Vec::with_capacity(16);
                     v.extend_from_slice(&u(dn_cfg.d_state).to_le_bytes());
                     v.extend_from_slice(&u(dn_cfg.n_k_heads).to_le_bytes());
                     v.extend_from_slice(&eps.to_le_bytes());
+                    // stride entre tokens: sem uso aqui (Y = 1 token por dispatch).
+                    v.extend_from_slice(&0u32.to_le_bytes());
                     v
                 }),
             )?);
@@ -2553,11 +2556,18 @@ impl<'ctx> ResidentForward<'ctx> {
                     (b.out.buffer, nb(t * value_dim), nb(value_dim)),
                 ],
                 u(dn_cfg.n_v_heads * dn_cfg.d_state / 4),
-                PushSpec::Static(push3(
-                    u(dn_cfg.d_state),
-                    u(dn_cfg.n_v_heads),
-                    u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
-                )),
+                PushSpec::Static({
+                    let mut v = push3(
+                        u(dn_cfg.d_state),
+                        u(dn_cfg.n_v_heads),
+                        u32::try_from(dn_cfg.n_v_heads / dn_cfg.n_k_heads).unwrap_or(1),
+                    );
+                    // n_tok = 1: um token por dispatch; v_stride não é lido com t = 0,
+                    // mas o layout do shader exige os 20 bytes.
+                    v.extend_from_slice(&1u32.to_le_bytes());
+                    v.extend_from_slice(&u(value_dim).to_le_bytes());
+                    v
+                }),
             )?);
         }
 
