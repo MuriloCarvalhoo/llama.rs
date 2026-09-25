@@ -3,10 +3,8 @@
 
 // GEMM Q4_K com tiling em LDS: `Y[n_out x COLS] = W[n_out x n_in] * X[n_in x COLS]`.
 //
-// **Experimental, desligado por padrao** (`LLAMA_RS_PREFILL_GEMM=1` liga). Ver o criterio
-// de adocao em `docs/planos/2026-08-21-prefill-e-respostas.md`: so vale se vencer o
-// matvec-COLS no mesmo bloco por uma margem que pague manter dois caminhos, e essa
-// comparacao e uma medicao que ainda nao foi feita neste hardware.
+// Padrao do prefill desde 2026-08-22 (`LLAMA_RS_PREFILL_GEMM=0` desliga) — ver
+// `docs/prefill-em-batch.md`.
 //
 // ## Por que um GEMM, e por que so no prefill
 //
@@ -27,6 +25,16 @@
 // As 256 threads sao uma grade 32 x 8: cada uma calcula TM=4 linhas por TN=COLS/8 colunas.
 // Por passo de K, a thread le TM*8 uints de peso e TN*8 de ativacao da LDS e faz TM*TN*8
 // dots — intensidade TM*TN/(TM+TN) = 2 com COLS=32, que e o ponto do exercicio.
+//
+// Duas correcoes de 2026-09-25, medidas na bancada (`bancada.rs`, `bancada_mul_mm`):
+// - **bancos da LDS**: com passo 8 e linhas contiguas por thread (ti*TM + r), as linhas que
+//   uma wave le juntas ficavam a 32 palavras umas das outras, todas no mesmo banco; com
+//   COLS=32 as colunas tambem (tj*4*8). Passo 9 (`LDS_PASSO`) e linhas intercaladas
+//   (r*32 + ti) espalham os dois. Era por isso que o bloco 32 perdia para o 24.
+// - **buffer duplo em registrador**: os loads globais do passo k+1 saem antes das contas do
+//   passo k (`buscar`). Com ~2 workgroups por CU, sem isso cada passo esperava a latencia
+//   inteira da memoria.
+// Juntas: 7,3 -> 10,1 TOPS no ffn_gate (5120->17408) com COLS=32, e o bloco 32 passou a valer.
 //
 // BK=32 nao e escolha livre: e o sub-bloco de quantizacao do Q4_K **e** o bloco do
 // `quantize_x`, entao cada passo de K tem exatamente uma escala de peso e uma de ativacao.
@@ -54,6 +62,10 @@ const uint COL_GRUPOS = 8u;
 const uint LINHA_GRUPOS = THREADS / COL_GRUPOS;  // 32
 const uint TM = BM / LINHA_GRUPOS;               // 4 linhas por thread
 const uint TN = COLS / COL_GRUPOS;               // colunas por thread
+// Passo das linhas (peso) e colunas (ativacao) na LDS: 9 uints, nao 8. Com 8, as linhas que
+// as threads de uma wave leem juntas ficavam a 32 palavras umas das outras — todas no mesmo
+// banco, leitura 8x serializada. 9 e coprimo com os 32 bancos.
+const uint LDS_PASSO = 9u;
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
@@ -72,11 +84,11 @@ layout(push_constant) uniform PC {
 const uint UVEC4_PER_SB = 9u;   // 144 bytes por superbloco Q4_K
 
 // Tile de peso: BM linhas x 32 int8, empacotados 4 por uint.
-shared uint lw[BM * 8u];
+shared uint lw[BM * LDS_PASSO];
 shared float lwsc[BM];    // d * sc do sub-bloco
 shared float lwoff[BM];   // -dmin * m do sub-bloco
 // Tile de ativacao: COLS colunas x 32 int8, mais escala e soma dos int8 por coluna.
-shared int lx[COLS * 8u];
+shared int lx[COLS * LDS_PASSO];
 shared float lxd[COLS];
 shared float lxs[COLS];
 
@@ -103,6 +115,30 @@ uint wpack(uint qsw, bool hi) {
     return (hi ? (qsw >> 4u) : qsw) & 0x0F0F0F0Fu;
 }
 
+// Os loads globais de um passo de K para os registradores da thread: peso (cabeçalho do
+// superbloco e o uvec4 de `qs` da metade dela), ativação (um uint) e, nas COLS primeiras
+// threads, escala e os 8 uints do bloco para a soma do termo do `dmin`.
+void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, uint x_u,
+            uint t, inout uvec4 hdr, inout uvec4 qs, inout int xq, inout float xd,
+            inout int xs[8]) {
+    uint sb = k0 >> 8u;
+    uint j = (k0 >> 5u) & 7u;
+    uint blk = k0 >> 5u;
+    if (lg < pc.n_out) {
+        uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
+        hdr = weight_buf.w4[b4];
+        qs = weight_buf.w4[b4 + 1u + (j >> 1u) * 2u + (w_alta ? 1u : 0u)];
+    }
+    if (x_col < COLS) {
+        xq = xq_buf.xq[(x_col * n_blk + blk) * 8u + x_u];
+    }
+    if (t < COLS) {
+        uint cb = t * n_blk + blk;
+        xd = xd_buf.xd[cb];
+        for (uint u = 0u; u < 8u; u++) { xs[u] = xq_buf.xq[cb * 8u + u]; }
+    }
+}
+
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint linha0 = gl_WorkGroupID.x * BM;
@@ -126,29 +162,35 @@ void main() {
     float acc[TM * TN];
     for (uint i = 0u; i < TM * TN; i++) { acc[i] = 0.0; }
 
+    // Buffer duplo em registrador: os loads globais do passo k+1 saem logo depois da barreira
+    // do passo k e chegam enquanto as contas dele rodam. Sem isso cada passo de K esperava a
+    // latência inteira da memória com a GPU quase parada (~2 workgroups por CU).
+    uint lg = linha0 + w_linha;
+    uvec4 r_hdr = uvec4(0u);
+    uvec4 r_qs = uvec4(0u);
+    int r_xq = 0;
+    float r_xd = 0.0;
+    int r_xs[8];
+    for (uint u = 0u; u < 8u; u++) { r_xs[u] = 0; }
+    buscar(0u, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_xq, r_xd, r_xs);
+
     for (uint k0 = 0u; k0 < pc.n_in; k0 += BK) {
-        uint sb = k0 >> 8u;          // superbloco
-        uint j = (k0 >> 5u) & 7u;    // sub-bloco de 32 dentro dele
-        uint blk = k0 >> 5u;         // bloco da ativacao
+        uint j = (k0 >> 5u) & 7u;    // sub-bloco de 32 dentro do superbloco
 
         // Fecha as leituras do passo anterior antes de sobrescrever a LDS.
         barrier();
 
-        uint lg = linha0 + w_linha;
         if (lg < pc.n_out) {
-            uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
-            uvec4 hdr = weight_buf.w4[b4];
-            uvec4 qs = weight_buf.w4[b4 + 1u + (j >> 1u) * 2u + (w_alta ? 1u : 0u)];
             bool hi = (j & 1u) != 0u;
-            uint dst = w_linha * 8u + (w_alta ? 4u : 0u);
-            lw[dst + 0u] = wpack(qs.x, hi);
-            lw[dst + 1u] = wpack(qs.y, hi);
-            lw[dst + 2u] = wpack(qs.z, hi);
-            lw[dst + 3u] = wpack(qs.w, hi);
+            uint dst = w_linha * LDS_PASSO + (w_alta ? 4u : 0u);
+            lw[dst + 0u] = wpack(r_qs.x, hi);
+            lw[dst + 1u] = wpack(r_qs.y, hi);
+            lw[dst + 2u] = wpack(r_qs.z, hi);
+            lw[dst + 3u] = wpack(r_qs.w, hi);
             if (!w_alta) {
-                vec2 dm = unpackHalf2x16(hdr.x);   // .x = d, .y = dmin
+                vec2 dm = unpackHalf2x16(r_hdr.x);   // .x = d, .y = dmin
                 uint sc, m;
-                scale_min(hdr, j, sc, m);
+                scale_min(r_hdr, j, sc, m);
                 lwsc[w_linha] = dm.x * float(sc);
                 lwoff[w_linha] = -dm.y * float(m);
             }
@@ -157,23 +199,24 @@ void main() {
             lwsc[w_linha] = 0.0;
             lwoff[w_linha] = 0.0;
         }
-
         if (x_col < COLS) {
-            uint cb = x_col * n_blk + blk;
-            lx[x_col * 8u + x_u] = xq_buf.xq[cb * 8u + x_u];
+            lx[x_col * LDS_PASSO + x_u] = r_xq;
         }
         if (t < COLS) {
-            uint cb = t * n_blk + blk;
-            lxd[t] = xd_buf.xd[cb];
+            lxd[t] = r_xd;
             // Soma dos int8 do bloco, para o termo do `dmin`. So depende da coluna.
             int isx = 0;
             for (uint u = 0u; u < 8u; u++) {
-                isx = dotPacked4x8AccSatEXT(0x01010101, xq_buf.xq[cb * 8u + u], isx);
+                isx = dotPacked4x8AccSatEXT(0x01010101, r_xs[u], isx);
             }
             lxs[t] = float(isx);
         }
 
         barrier();
+
+        if (k0 + BK < pc.n_in) {
+            buscar(k0 + BK, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_xq, r_xd, r_xs);
+        }
 
         // As colunas desta thread saem da LDS uma vez e servem as TM linhas.
         int xr[TN * 8u];
@@ -181,17 +224,19 @@ void main() {
         float xs_c[TN];
         for (uint c = 0u; c < TN; c++) {
             uint col = tj * TN + c;
-            for (uint u = 0u; u < 8u; u++) { xr[c * 8u + u] = lx[col * 8u + u]; }
+            for (uint u = 0u; u < 8u; u++) { xr[c * 8u + u] = lx[col * LDS_PASSO + u]; }
             xd_c[c] = lxd[col];
             xs_c[c] = lxs[col];
         }
 
         for (uint r = 0u; r < TM; r++) {
-            uint rr = ti * TM + r;
+            // Linhas intercaladas (ti, ti+32, ...): com passo 9, as 8 linhas distintas de uma
+            // wave caem em 8 bancos distintos.
+            uint rr = r * LINHA_GRUPOS + ti;
             float sc = lwsc[rr];
             float off = lwoff[rr];
             int w[8];
-            for (uint u = 0u; u < 8u; u++) { w[u] = int(lw[rr * 8u + u]); }
+            for (uint u = 0u; u < 8u; u++) { w[u] = int(lw[rr * LDS_PASSO + u]); }
             for (uint c = 0u; c < TN; c++) {
                 int isum = 0;
                 for (uint u = 0u; u < 8u; u++) {
@@ -203,7 +248,7 @@ void main() {
     }
 
     for (uint r = 0u; r < TM; r++) {
-        uint rr = linha0 + ti * TM + r;
+        uint rr = linha0 + r * LINHA_GRUPOS + ti;
         if (rr >= pc.n_out) { continue; }
         float bias = pc.tem_bias != 0u ? bias_buf.b[rr] : 0.0;
         for (uint c = 0u; c < TN; c++) {

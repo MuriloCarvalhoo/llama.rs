@@ -94,6 +94,20 @@ enche), tem o ótimo em 24 e volta a cair em 32. −42 % contra o padrão antigo
 dos 20 % foi batido: **adotado como padrão** `LLAMA_RS_BATCH=24` + GEMM (o knob agora
 desliga com `LLAMA_RS_PREFILL_GEMM=0`).
 
+**Atualização 2026-09-25:** a queda em 32 era conflito de banco na LDS do GEMM — com 32
+colunas, `tj*4*8` põe as colunas de uma wave no mesmo banco, e as linhas já caíam assim em
+qualquer bloco. Com passo 9 na LDS, linhas intercaladas e buffer duplo em registrador
+(`mul_mm.comp`), e o pstate `peak` no prefill (`pstate.rs`), prompt de 1,7k tokens:
+
+| config | mul_mm (ms/bloco) | matvec Q5_K/Q6_K (ms/bloco) | ms/token |
+|---|---:|---:|---:|
+| batch 24, GEMM antigo | 161 | 47 | 9,96 |
+| batch 24, GEMM novo | 137 | 47 | 8,98 |
+| **batch 32, GEMM novo** | 138 | 92 | **8,47** |
+
+Padrão virou 32. O próximo gargalo é o matvec-COLS do Q5_K/Q6_K, que dobra em 32 por
+pressão de registrador — um GEMM para esses dois tipos é o passo seguinte.
+
 ## O que mais precisa virar batch
 
 O matvec não é o único: **todo o resto do plano assume um vetor**. Os que precisam de uma

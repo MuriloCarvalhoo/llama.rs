@@ -109,6 +109,7 @@ fn subir(
 
 /// Um shader de matvec K-quant na bancada: pipeline, bindings (pesos, xq, xd, y, bias) e
 /// geometria do dispatch.
+#[derive(Clone, Copy)]
 pub(crate) struct Kernel<'a> {
     pub spv: &'a [u8],
     pub spec: &'a [(u32, u32)],
@@ -116,7 +117,7 @@ pub(crate) struct Kernel<'a> {
 }
 
 /// Roda `k` sobre `w` (já no layout do shader) e devolve `(µs por dispatch, y)`.
-// Contexto Vulkan (3) + kernel + dados (2) + dimensões (2): mesmo critério do
+// Contexto Vulkan (3) + kernel + dados (2) + dimensões (3): mesmo critério do
 // `dispatch_k_matvec`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn medir(
@@ -128,6 +129,7 @@ pub(crate) fn medir(
     x: &[f32],
     n_in: usize,
     n_out: usize,
+    cols: usize,
 ) -> (f64, Vec<f32>) {
     let d = &dev.device;
     let (xq, xd) = crate::tensor::quantize_x_host(x);
@@ -138,7 +140,7 @@ pub(crate) fn medir(
         subir(ctx, phys, dev, w),
         subir(ctx, phys, dev, xq_b),
         subir(ctx, phys, dev, xd_b),
-        subir(ctx, phys, dev, &vec![0u8; n_out * 4]),
+        subir(ctx, phys, dev, &vec![0u8; cols * n_out * 4]),
     ];
     let pipe =
         ComputePipeline::with(d, k.spv, 5, size_of::<PushConstants>() as u32, k.spec).unwrap();
@@ -148,7 +150,13 @@ pub(crate) fn medir(
         row_offset: 0,
         tem_bias: 0,
     };
-    let tamanhos = [w.len(), xq_b.len(), xd_b.len(), n_out * 4, xd_b.len()];
+    let tamanhos = [
+        w.len(),
+        xq_b.len(),
+        xd_b.len(),
+        cols * n_out * 4,
+        xd_b.len(),
+    ];
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
         descriptor_count: 5,
@@ -292,21 +300,14 @@ pub(crate) fn medir(
         }
 
         // Readback de y, para comparar variantes do shader entre si.
-        let read = create_buf(d, (n_out * 4) as u64, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+        let y_bytes = (cols * n_out * 4) as u64;
+        let read = create_buf(d, y_bytes, vk::BufferUsageFlags::TRANSFER_DST).unwrap();
         let read_mem = alloc_and_bind(ctx, phys, d, read, true).unwrap();
-        one_shot_copy(
-            d,
-            dev.queue,
-            dev.cmd_pool,
-            bufs[3].0,
-            read,
-            (n_out * 4) as u64,
-        )
-        .unwrap();
+        one_shot_copy(d, dev.queue, dev.cmd_pool, bufs[3].0, read, y_bytes).unwrap();
         let ptr = d
-            .map_memory(read_mem, 0, (n_out * 4) as u64, vk::MemoryMapFlags::empty())
+            .map_memory(read_mem, 0, y_bytes, vk::MemoryMapFlags::empty())
             .unwrap();
-        let y = std::slice::from_raw_parts(ptr.cast::<f32>(), n_out).to_vec();
+        let y = std::slice::from_raw_parts(ptr.cast::<f32>(), cols * n_out).to_vec();
         d.unmap_memory(read_mem);
         d.destroy_buffer(read, None);
         d.free_memory(read_mem, None);
@@ -377,9 +378,75 @@ fn bancada_q4k() {
                 if let Some(p) = &pstate {
                     p.em_uso(false);
                 }
-                medir(&ctx, phys, &dev, &k, &w, &x, n_in, n_out).0
+                medir(&ctx, phys, &dev, &k, &w, &x, n_in, n_out, 1).0
             })
             .fold(f64::MAX, f64::min);
         linha(nome, n_in, n_out, w.len(), us);
+    }
+}
+
+/// GEMM Q4_K do prefill (`mul_mm.comp`) nas formas grandes, em TOPS de int8 contra os
+/// 51 TOPS de `V_DOT4_I32_I8` medidos em `scripts/teto-mi50.sh`. `LLAMA_RS_BATCH` muda as
+/// colunas, como no prefill de verdade.
+#[test]
+#[ignore = "bancada de desempenho: ocupa a GPU e só imprime"]
+fn bancada_mul_mm() {
+    let Ok(ctx) = VulkanContext::new() else {
+        return;
+    };
+    let Some(phys) = device_sem_monitor(&ctx) else {
+        return;
+    };
+    let dev = VulkanDevice::create(&ctx, phys).unwrap();
+    let cols = crate::resident_forward::batch_size();
+    let spec = [(0, cols as u32)];
+    let k = Kernel {
+        spv: crate::MUL_MM_SPV,
+        spec: &spec,
+        rows_por_wg: crate::resident_forward::GEMM_LINHAS_POR_WG,
+    };
+    let variantes = [("mul_mm", k)];
+    let pstate = phys
+        .pci
+        .as_deref()
+        .and_then(|p| crate::pstate::Pstate::novo(p, "bancada"));
+    eprintln!("mul_mm Q4_K, {cols} colunas, {REPS} reps, pstate peak do prefill");
+    for (nome, n_in, n_out) in &FORMAS[..6] {
+        let (n_in, n_out) = (*n_in, *n_out);
+        let w = pesos_q4k(n_in, n_out, 7);
+        let x = ativacao(n_in * cols, 3);
+        let mut ys = Vec::new();
+        for (rot, kern) in &variantes {
+            let mut y = Vec::new();
+            let us = (0..3)
+                .map(|_| {
+                    if let Some(p) = &pstate {
+                        p.em_uso(true);
+                    }
+                    let (t, yy) = medir(&ctx, phys, &dev, kern, &w, &x, n_in, n_out, cols);
+                    y = yy;
+                    t
+                })
+                .fold(f64::MAX, f64::min);
+            ys.push(y);
+            let tops = 2.0 * (n_in * n_out * cols) as f64 / (us * 1e6);
+            eprintln!(
+                "{nome:<12} {rot:<6} {n_in:>6}->{n_out:<6} {us:>8.1} µs {tops:>6.2} TOPS \
+                 {:>4.1}% do pico int8",
+                100.0 * tops / 51.0
+            );
+        }
+        for (i, y) in ys.iter().enumerate().skip(1) {
+            let dif = ys[0]
+                .iter()
+                .zip(y)
+                .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+                .fold(0f32, f32::max);
+            assert!(
+                dif < 1e-4,
+                "{nome}: {} diverge do atual ({dif:e})",
+                variantes[i].0
+            );
+        }
     }
 }

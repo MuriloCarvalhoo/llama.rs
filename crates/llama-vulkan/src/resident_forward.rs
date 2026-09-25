@@ -32,15 +32,17 @@ pub(crate) const NORM_P1_WG: u32 = 32;
 /// passa a ser a pressão de registrador: são `ROWS_PER_WAVE * COLS` acumuladores vivos por
 /// lane, e em algum ponto a ocupância cai mais do que o reuso do peso rende. **Onde fica
 /// esse ponto é empírico**: medido em 2026-08-21 com o GEMM ligado, a curva faz
-/// 8→21,8, 16→14,6, **24→10,8**, 32→13,2 ms por token de prefill — o padrão é 24
-/// (ver `docs/prefill-em-batch.md`).
+/// 8→21,8, 16→14,6, **24→10,8**, 32→13,2 ms por token de prefill. O 32 perdia por conflito
+/// de banco na LDS do GEMM (ver `mul_mm.comp`); corrigido em 2026-09-25, 24→8,98 e
+/// **32→8,47** ms/token — o padrão virou 32, mesmo com o matvec Q5_K/Q6_K do prefill
+/// dobrando de 47 para 92 ms por bloco (ver `docs/prefill-em-batch.md`).
 ///
 /// `LLAMA_RS_BATCH=n` sobrescreve; `1` desliga o batch (prefill volta a ser token a token).
 pub(crate) fn batch_size() -> usize {
     std::env::var("LLAMA_RS_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(24)
+        .unwrap_or(32)
         .clamp(1, 32)
 }
 
