@@ -3428,7 +3428,7 @@ impl<'ctx> ResidentForward<'ctx> {
         }
         self.record_mtp(cmd, hidden_idx);
         if let Some(p) = &self.pstate {
-            p.em_uso();
+            p.em_uso(false);
         }
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
@@ -5210,7 +5210,7 @@ impl<'ctx> ResidentForward<'ctx> {
             ..Default::default()
         };
         if let Some(p) = &self.pstate {
-            p.em_uso();
+            p.em_uso(modo == Modo::Batch);
         }
         // SAFETY: fence resetado antes do submit; cmd válido.
         unsafe {

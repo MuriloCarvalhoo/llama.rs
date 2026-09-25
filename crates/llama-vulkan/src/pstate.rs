@@ -17,6 +17,9 @@
 //! - **temperatura**: com a junction em [`QUENTE`] ou mais, desce um degrau (`peak` →
 //!   `standard` → automático) por pelo menos [`ESFRIAR`] e até esfriar para [`FRIO`].
 //!
+//! O prefill é limitado por compute, não por banda, e roda em `peak` qualquer que seja o modo
+//! (menos `auto`): o `standard` o deixava 17% mais lento.
+//!
 //! `LLAMA_RS_PSTATE`: `standard` (padrão), `peak`, ou `auto` para não mexer.
 
 use std::fs::File;
@@ -116,6 +119,8 @@ struct Estado {
     quente_ate: Option<Instant>,
     avisou: bool,
     ultimo_uso: Instant,
+    /// O último submit foi de prefill (limitado por compute) ou de decode (por banda).
+    prefill: bool,
 }
 
 struct Comum {
@@ -135,12 +140,15 @@ impl Comum {
     /// Leva o device ao pstate que o estado pede: automático se ocioso, um degrau abaixo se
     /// quente, o modo configurado no resto. Só faz a ioctl quando muda.
     fn ajustar(&self, e: &mut Estado) {
+        // O prefill é limitado por compute e o `standard` trava o núcleo em 1316 MHz: medido
+        // 12,35 ms/token contra 10,00 em `peak` e 10,56 no automático (1700 prompts de 24).
+        let base = if e.prefill { PSTATE_PEAK } else { self.modo };
         let alvo = if e.ultimo_uso.elapsed() >= OCIOSO {
             PSTATE_NONE
         } else if e.quente_ate.is_some() {
-            degrau_abaixo(self.modo)
+            degrau_abaixo(base)
         } else {
-            self.modo
+            base
         };
         if alvo != e.aplicado && self.aplicar(alvo) {
             e.aplicado = alvo;
@@ -178,6 +186,7 @@ impl Pstate {
                 quente_ate: None,
                 avisou: false,
                 ultimo_uso: Instant::now(),
+                prefill: false,
             }),
         });
         if !comum.aplicar(modo) {
@@ -198,14 +207,15 @@ impl Pstate {
         })
     }
 
-    /// Chamado antes de cada submit do token: marca o uso e, se o device tinha voltado ao
-    /// automático por ociosidade, fixa o clock de novo — uma ioctl por requisição, não por
-    /// token.
-    pub(crate) fn em_uso(&self) {
+    /// Chamado antes de cada submit: marca o uso e a fase, e ajusta o clock se ela mudou ou se
+    /// o device tinha voltado ao automático por ociosidade — umas poucas ioctls por
+    /// requisição, não uma por token.
+    pub(crate) fn em_uso(&self, prefill: bool) {
         let Ok(mut e) = self.comum.estado.lock() else {
             return;
         };
         e.ultimo_uso = Instant::now();
+        e.prefill = prefill;
         self.comum.ajustar(&mut e);
     }
 }

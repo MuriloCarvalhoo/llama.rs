@@ -375,7 +375,7 @@ fn bancada_q4k() {
         let us = (0..3)
             .map(|_| {
                 if let Some(p) = &pstate {
-                    p.em_uso();
+                    p.em_uso(false);
                 }
                 medir(&ctx, phys, &dev, &k, &w, &x, n_in, n_out).0
             })
