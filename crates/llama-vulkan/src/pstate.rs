@@ -14,8 +14,9 @@
 //! o desfaz quando o fd fecha, inclusive se o processo morrer. Duas salvaguardas por cima:
 //! - **ociosidade**: sem submit há [`OCIOSO`], o device volta ao automático — um servidor
 //!   parado não fica esquentando com clock fixo. O próximo submit fixa de novo.
-//! - **temperatura**: com a junction em [`QUENTE`] ou mais, desce um degrau (`peak` →
-//!   `standard` → automático) por pelo menos [`ESFRIAR`] e até esfriar para [`FRIO`].
+//! - **temperatura**: com a junction em [`QUENTE`] ou mais, desce a [`ESCADA`] (`peak` →
+//!   `standard` → `min_sclk`), um degrau a cada [`ENTRE_DEGRAUS`] enquanto não esfriar, e
+//!   sobe um degrau a cada [`ESFRIAR`] com a junction em [`FRIO`].
 //!
 //! O prefill é limitado por compute, não por banda, e roda em `peak` qualquer que seja o modo
 //! (menos `auto`): o `standard` o deixava 17% mais lento.
@@ -42,6 +43,7 @@ const AMDGPU_CTX_OP_ALLOC_CTX: u32 = 1;
 const AMDGPU_CTX_OP_SET_STABLE_PSTATE: u32 = 6;
 const PSTATE_NONE: u32 = 0;
 const PSTATE_STANDARD: u32 = 1;
+const PSTATE_MIN_SCLK: u32 = 2;
 const PSTATE_PEAK: u32 = 4;
 
 /// `union drm_amdgpu_ctx`: na ida `{op, flags, ctx_id, priority}`, na volta do ALLOC o
@@ -98,25 +100,31 @@ fn sensor_junction(pci: &str) -> Option<PathBuf> {
     None
 }
 
-/// Um degrau abaixo, para quando a junction passa de [`QUENTE`]: `peak` cai para `standard`
-/// e `standard` para o automático.
-fn degrau_abaixo(modo: u32) -> u32 {
-    if modo == PSTATE_PEAK {
-        PSTATE_STANDARD
-    } else {
-        PSTATE_NONE
-    }
+/// A escada de quando a junction passa de [`QUENTE`]: `peak` → `standard` → `min_sclk`. O
+/// automático **não** é degrau: sob carga contínua o DPM sobe o núcleo a 1700 MHz como o
+/// `peak`. Medido num prefill de 7k tokens: descer só até `standard` ainda levou a card1 de 95
+/// a 100 °C.
+const ESCADA: [u32; 3] = [PSTATE_PEAK, PSTATE_STANDARD, PSTATE_MIN_SCLK];
+
+fn degraus_abaixo(modo: u32, n: usize) -> u32 {
+    let i = ESCADA.iter().position(|&m| m == modo).unwrap_or(0);
+    ESCADA[(i + n).min(ESCADA.len() - 1)]
 }
 
 /// Mínimo no degrau de baixo depois de esquentar: a junction esfria em segundos e, sem isso, o
 /// clock alterna entre os degraus a cada leitura do sensor.
 const ESFRIAR: Duration = Duration::from_secs(10);
+/// Espera antes de descer mais um degrau: o sensor leva alguns segundos para sentir o anterior.
+const ENTRE_DEGRAUS: Duration = Duration::from_secs(3);
 
 struct Estado {
     /// O pstate pedido ao kernel agora.
     aplicado: u32,
-    /// Até quando ficar no degrau de baixo, desde a última leitura em [`QUENTE`] ou mais.
+    /// Até quando ficar nos degraus de baixo, desde a última leitura em [`QUENTE`] ou mais.
     quente_ate: Option<Instant>,
+    /// Quantos degraus da [`ESCADA`] abaixo do modo, e quando foi a última descida.
+    descer: usize,
+    desceu_em: Instant,
     avisou: bool,
     ultimo_uso: Instant,
     /// O último submit foi de prefill (limitado por compute) ou de decode (por banda).
@@ -146,7 +154,7 @@ impl Comum {
         let alvo = if e.ultimo_uso.elapsed() >= OCIOSO {
             PSTATE_NONE
         } else if e.quente_ate.is_some() {
-            degrau_abaixo(base)
+            degraus_abaixo(base, e.descer)
         } else {
             base
         };
@@ -184,6 +192,8 @@ impl Pstate {
             estado: Mutex::new(Estado {
                 aplicado: PSTATE_NONE,
                 quente_ate: None,
+                descer: 0,
+                desceu_em: Instant::now(),
                 avisou: false,
                 ultimo_uso: Instant::now(),
                 prefill: false,
@@ -231,18 +241,25 @@ fn vigiar(c: &Comum, sensor: Option<&Path>, parar: &Receiver<()>) {
         };
         match temp {
             Some(t) if t >= QUENTE => {
+                if e.descer == 0 || e.desceu_em.elapsed() >= ENTRE_DEGRAUS {
+                    e.descer = (e.descer + 1).min(ESCADA.len() - 1);
+                    e.desceu_em = Instant::now();
+                }
                 e.quente_ate = Some(Instant::now() + ESFRIAR);
                 if !e.avisou {
                     e.avisou = true;
                     eprintln!(
-                        "[pstate] {}: junction {t} °C — clock um degrau abaixo até esfriar para \
+                        "[pstate] {}: junction {t} °C — clock descendo degraus até esfriar para \
                          {FRIO} °C (aviso único)",
                         c.nome
                     );
                 }
             }
+            // Sobe **um** degrau por vez: voltar direto ao `peak` levava a junction de 85 a
+            // 98-100 °C em menos de meio segundo, a cada ciclo.
             Some(t) if t <= FRIO && e.quente_ate.is_some_and(|ate| Instant::now() >= ate) => {
-                e.quente_ate = None;
+                e.descer = e.descer.saturating_sub(1);
+                e.quente_ate = (e.descer > 0).then(|| Instant::now() + ESFRIAR);
             }
             _ => {}
         }
