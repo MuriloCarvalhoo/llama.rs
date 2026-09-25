@@ -17,6 +17,8 @@ fn main() {
         ("attention.comp", "ATTENTION_SPV"),
         // Atenção com o KV fatiado entre workgroups (contexto longo) + a redução.
         ("attention_split.comp", "ATTENTION_SPLIT_SPV"),
+        // A mesma, com um grupo de lanes por posição do KV (head_dim potência de 2).
+        ("attention_split16.comp", "ATTENTION_SPLIT16_SPV"),
         ("attn_reduce.comp", "ATTN_REDUCE_SPV"),
         ("swiglu_quant.comp", "SWIGLU_QUANT_SPV"),
         ("add.comp", "ADD_SPV"),

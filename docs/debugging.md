@@ -50,6 +50,7 @@ comparáveis com os de uma execução normal (clock diferente).
 | `LLAMA_RS_SPLIT=N` | Fixa a fronteira do layer-split na camada N, em vez de derivar da VRAM livre |
 | `LLAMA_RS_PSTATE=standard\|peak\|auto` | Clock da GPU durante a geração (`pstate.rs`). `standard` (padrão) fixa núcleo em 1316 MHz e HBM em 1000; `peak` fixa o núcleo em 1700 e desce para `standard` com a junction em 95 °C; `auto` deixa o DPM do driver |
 | `LLAMA_RS_PROFILE=1` | Liga a coleta de timestamps de GPU |
+| `LLAMA_RS_ATTN16=0` | Volta a atenção de contexto longo ao `attention_split.comp` (uma posição do KV por wave) em vez do `attention_split16.comp` |
 | `LLAMA_RS_TRACE_TOKENS=N` | Quantos tokens entram no `--trace` (padrão 8) |
 | `LLAMA_RS_MATVEC_GEOM=wg,linhas` | Geometria do matvec K-quant (padrão 256,2) — ver `scripts/tune-matvec.sh` |
 | `LLAMA_RS_STOP_LAYER=N` | Executa só as N primeiras camadas do shard (diagnóstico) |

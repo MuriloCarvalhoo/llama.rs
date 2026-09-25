@@ -20,6 +20,17 @@ pub(crate) const MATVEC_WG: u32 = 64;
 /// soma todas em cada lane — então subir muito custa mais no passo 2 do que rende no 1.
 pub(crate) const NORM_P1_WG: u32 = 32;
 
+/// O `attention_split16.comp` serve este `head_dim`? Ele põe `head_dim/16` lanes por posição
+/// do KV, então precisa de potência de 2 entre 16 e 256. `LLAMA_RS_ATTN16=0` volta ao
+/// `attention_split.comp`.
+///
+/// Medido em 2026-09-25 (Qwen3.8-27B, 24 cabeças, head_dim 256): ver o cabeçalho do shader.
+pub(crate) fn atencao16_serve(head_dim: usize) -> bool {
+    head_dim.is_power_of_two()
+        && (16..=256).contains(&head_dim)
+        && std::env::var("LLAMA_RS_ATTN16").map_or(true, |v| v != "0")
+}
+
 /// Tokens por bloco do prefill em batch.
 ///
 /// Vira a specialization constant `COLS` dos matvec, então é fixa na criação das
@@ -918,6 +929,8 @@ pub struct ResidentForward<'ctx> {
     /// Atenção com o KV fatiado entre workgroups + a redução dos parciais. Só entram
     /// com contexto longo, onde a cadeia serial do `attention` domina o token.
     pub(crate) attention_split: ComputePipeline,
+    /// O mesmo contrato com um grupo de lanes por posição do KV — ver [`atencao16_serve`].
+    pub(crate) attention_split16: ComputePipeline,
     pub(crate) attn_reduce: ComputePipeline,
     pub(crate) swiglu_quant: ComputePipeline,
     pub(crate) add: ComputePipeline,
@@ -1114,6 +1127,15 @@ impl<'ctx> ResidentForward<'ctx> {
         Ok(out)
     }
 
+    /// A pipeline da atenção fatiada para este `head_dim` (ver [`atencao16_serve`]).
+    fn pipe_split(&self, head_dim: usize) -> &ComputePipeline {
+        if atencao16_serve(head_dim) {
+            &self.attention_split16
+        } else {
+            &self.attention_split
+        }
+    }
+
     /// Constrói só device + pipelines + descriptor pool (sem pesos/buffers). Para micro-testes.
     /// Índice do device com mais VRAM livre; `LLAMA_RS_GPU` força um valor.
     ///
@@ -1228,6 +1250,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let kv_pack = ComputePipeline::with(d, crate::KV_PACK_SPV, 4, 8, &[])?;
         let attention = ComputePipeline::with(d, crate::ATTENTION_SPV, 4, 28, &[])?;
         let attention_split = ComputePipeline::with(d, crate::ATTENTION_SPLIT_SPV, 4, 28, &[])?;
+        let attention_split16 = ComputePipeline::with(d, crate::ATTENTION_SPLIT16_SPV, 4, 28, &[])?;
         let attn_reduce = ComputePipeline::with(d, crate::ATTN_REDUCE_SPV, 2, 12, &[])?;
         // (gate, up, act inout, xq, xd) + n.
         let swiglu_quant = ComputePipeline::with(d, crate::SWIGLU_QUANT_SPV, 5, 4, &[])?;
@@ -1286,6 +1309,7 @@ impl<'ctx> ResidentForward<'ctx> {
             kv_pack,
             attention,
             attention_split,
+            attention_split16,
             attn_reduce,
             swiglu_quant,
             add,
@@ -2120,9 +2144,10 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         // SAFETY: P é #[repr(C)] de 7 u32 contíguos; 28 bytes é o push range da pipeline.
         let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
-        let set = self.alloc_set(&self.attention_split)?;
+        let pipe = self.pipe_split(head_dim);
+        let set = self.alloc_set(pipe)?;
         self.dispatch_xyz(
-            &self.attention_split,
+            pipe,
             set,
             &[
                 (qb.buffer, 0, qb.size),
@@ -2222,7 +2247,7 @@ impl<'ctx> ResidentForward<'ctx> {
         let pb = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), 28) };
         let usa_split = n_split > 1;
         let pipe = if usa_split {
-            &self.attention_split
+            self.pipe_split(head_dim)
         } else {
             &self.attention
         };
@@ -3496,7 +3521,9 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::Rope => &self.rope,
             PipeId::KvPack => &self.kv_pack,
             PipeId::Attention => &self.attention,
-            PipeId::AttentionSplit => &self.attention_split,
+            PipeId::AttentionSplit => {
+                self.pipe_split(self.state.as_ref().map_or(0, |st| st.cfg.head_dim))
+            }
             PipeId::AttnReduce => &self.attn_reduce,
             PipeId::SwigluQuant => &self.swiglu_quant,
             PipeId::Add => &self.add,

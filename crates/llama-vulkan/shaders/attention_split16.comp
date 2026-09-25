@@ -1,0 +1,174 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+layout(local_size_x = 512) in;
+
+// Atenção com o KV fatiado (`attention_split.comp`), reorganizada para o contexto longo:
+// **um grupo de G = head_dim/16 lanes por posição do KV**, várias posições por wave.
+//
+// No kernel original cada wave faz uma posição por vez com as 64 lanes: cada lane lê um
+// `uint` (dois f16) e usa só a metade dele, e cada posição paga um `subgroupAdd` de 64 lanes
+// mais duas `exp` — a cadeia que o deixava limitado por VALU (medido em 2026-08-22: metade
+// dos bytes com o KV em f16 e o mesmo tempo). Aqui cada lane lê 16 dimensões contíguas
+// (dois `uvec4`, 32 B), a redução é sobre G lanes (4 passos de shuffle com head_dim 256) e
+// feita de uma vez para 64/G posições, e as `exp` também. Os f16 do cache entram direto na
+// FMA (`unpackHalf2x16` + `fma` vira `v_fma_mix_f32` no ACO: f16 na entrada, f32 na soma).
+//
+// Medido em 2026-09-25 (Qwen3.8-27B: 24 cabeças, 4 de KV, head_dim 256, 16 fatias): 2,5 ->
+// 1,1 ms com 26k posições no cache (`atencao_fatiada_e_mais_rapida_com_kv_longo`); num decode
+// com 7k de contexto a atenção das duas GPUs foi de 11,0 para 4,0 ms/token e o decode de 18,5
+// para 21,2 tok/s, saída greedy idêntica.
+//
+// Exige head_dim potência de 2 entre 16 e 256 (G divide as 64 lanes) e o layout do cache
+// alinhado a 8 elementos — o plano cai no `attention_split.comp` fora disso.
+//
+// A saída é o mesmo registro parcial [m, l, acc[head_dim]] por (t, h, split), sem dividir
+// por l: o `attn_reduce.comp` não muda.
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; } qb;
+// KV-cache em f16 empacotado, lido de 8 em 8 elementos.
+layout(set = 0, binding = 1) readonly buffer KBuf { uvec4 k4[]; } kb;
+layout(set = 0, binding = 2) readonly buffer VBuf { uvec4 v4[]; } vb;
+layout(set = 0, binding = 3) writeonly buffer PBuf { float p[]; } pbuf;
+
+layout(push_constant) uniform PC {
+    uint n_head; uint n_head_kv; uint head_dim;
+    uint total_len; uint kv_dim; uint kv_layer_off; // offset em elementos (nao em pares)
+    uint q_stride;
+} pc;
+
+const uint NWAVE = 8u;   // waves por workgroup — local_size_x / 64
+const uint DPL = 16u;    // dimensões por lane
+const uint MAX_HD = 256u;
+
+shared float s_m[NWAVE];
+shared float s_l[NWAVE];
+shared float s_acc[NWAVE * MAX_HD];
+
+// Soma `s` com os 8 pares f16 de `w` contra `q[o..o+8)`.
+float dot8(uvec4 w, float qd[DPL], uint o, float s) {
+    vec2 a = unpackHalf2x16(w.x);
+    vec2 b = unpackHalf2x16(w.y);
+    vec2 c = unpackHalf2x16(w.z);
+    vec2 d = unpackHalf2x16(w.w);
+    s = fma(a.x, qd[o + 0u], s);
+    s = fma(a.y, qd[o + 1u], s);
+    s = fma(b.x, qd[o + 2u], s);
+    s = fma(b.y, qd[o + 3u], s);
+    s = fma(c.x, qd[o + 4u], s);
+    s = fma(c.y, qd[o + 5u], s);
+    s = fma(d.x, qd[o + 6u], s);
+    s = fma(d.y, qd[o + 7u], s);
+    return s;
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_head) { return; }
+
+    uint t = gl_WorkGroupID.y;
+    uint n_tok = gl_NumWorkGroups.y;
+    uint split = gl_WorkGroupID.z;
+    uint n_split = gl_NumWorkGroups.z;
+
+    // Máscara causal: o token t do bloco só vê 0..pos0+t.
+    uint total_len_t = pc.total_len - (n_tok - 1u) + t;
+    uint q_base = t * pc.n_head * pc.q_stride;
+
+    uint por_split = (total_len_t + n_split - 1u) / n_split;
+    uint ini = split * por_split;
+    uint fim = min(ini + por_split, total_len_t);
+
+    uint w = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint G = pc.head_dim / DPL;      // lanes por posição
+    uint NG = 64u / G;               // posições por wave de cada vez
+    uint li = lane % G;
+    uint g = lane / G;
+    uint n_rep = pc.n_head / pc.n_head_kv;
+    uint kv_h = h / n_rep;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    // As 16 dimensões desta lane, já com a escala: o produto sai pronto do laço.
+    float qd[DPL];
+    for (uint i = 0u; i < DPL; i++) {
+        qd[i] = qb.q[q_base + h * pc.q_stride + li * DPL + i] * scale;
+    }
+
+    float acc[DPL];
+    for (uint i = 0u; i < DPL; i++) { acc[i] = 0.0; }
+    float m = -1.0e30;
+    float l = 0.0;
+    for (uint j = ini + w * NG + g; j < fim; j += NWAVE * NG) {
+        uint base4 = (pc.kv_layer_off + j * pc.kv_dim + kv_h * pc.head_dim + li * DPL) >> 3u;
+        uvec4 k0 = kb.k4[base4];
+        uvec4 k1 = kb.k4[base4 + 1u];
+        uvec4 v0 = vb.v4[base4];
+        uvec4 v1 = vb.v4[base4 + 1u];
+
+        float s = dot8(k1, qd, 8u, dot8(k0, qd, 0u, 0.0));
+        // Todas as lanes de um grupo estão no mesmo `j`: o xor com offset < G não sai dele.
+        for (uint o = 1u; o < G; o <<= 1u) { s += subgroupShuffleXor(s, o); }
+
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float p = exp(s - m_new);
+        l = l * corr + p;
+        vec2 va[8];
+        va[0] = unpackHalf2x16(v0.x); va[1] = unpackHalf2x16(v0.y);
+        va[2] = unpackHalf2x16(v0.z); va[3] = unpackHalf2x16(v0.w);
+        va[4] = unpackHalf2x16(v1.x); va[5] = unpackHalf2x16(v1.y);
+        va[6] = unpackHalf2x16(v1.z); va[7] = unpackHalf2x16(v1.w);
+        for (uint i = 0u; i < 8u; i++) {
+            acc[2u * i] = fma(p, va[i].x, acc[2u * i] * corr);
+            acc[2u * i + 1u] = fma(p, va[i].y, acc[2u * i + 1u] * corr);
+        }
+        m = m_new;
+    }
+
+    // Junta os NG grupos da wave pela mesma álgebra do softmax online (associativa em
+    // (m, l, acc)). Grupo sem posição sai com l = 0 e m = -1e30: peso zero.
+    for (uint o = G; o < 64u; o <<= 1u) {
+        float mo = subgroupShuffleXor(m, o);
+        float lo = subgroupShuffleXor(l, o);
+        float m2 = max(m, mo);
+        float w1 = exp(m - m2);
+        float w2 = exp(mo - m2);
+        l = l * w1 + lo * w2;
+        for (uint i = 0u; i < DPL; i++) {
+            float ao = subgroupShuffleXor(acc[i], o);
+            acc[i] = acc[i] * w1 + ao * w2;
+        }
+        m = m2;
+    }
+
+    if (lane == 0u) { s_m[w] = m; s_l[w] = l; }
+    if (g == 0u) {
+        for (uint i = 0u; i < DPL; i++) { s_acc[w * pc.head_dim + li * DPL + i] = acc[i]; }
+    }
+    barrier();
+
+    // A wave 0 junta as NWAVE parciais e publica **uma** parcial do split.
+    if (w == 0u) {
+        uint reg = ((t * pc.n_head + h) * n_split + split) * (pc.head_dim + 2u);
+        float m_all = -1.0e30;
+        for (uint kk = 0u; kk < NWAVE; kk++) { m_all = max(m_all, s_m[kk]); }
+        float peso[NWAVE];
+        float l_all = 0.0;
+        for (uint kk = 0u; kk < NWAVE; kk++) {
+            peso[kk] = exp(s_m[kk] - m_all);
+            l_all += s_l[kk] * peso[kk];
+        }
+        if (lane == 0u) {
+            pbuf.p[reg] = m_all;
+            pbuf.p[reg + 1u] = l_all;
+        }
+        for (uint d = lane; d < pc.head_dim; d += 64u) {
+            float o = 0.0;
+            for (uint kk = 0u; kk < NWAVE; kk++) {
+                o += peso[kk] * s_acc[kk * pc.head_dim + d];
+            }
+            pbuf.p[reg + 2u + d] = o;
+        }
+    }
+}

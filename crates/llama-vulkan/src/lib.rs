@@ -39,6 +39,8 @@ pub(crate) const KV_PACK_SPV: &[u8] = include_bytes!(concat!(env!("KV_PACK_SPV")
 #[allow(dead_code)]
 pub(crate) const ATTENTION_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPV")));
 pub(crate) const ATTENTION_SPLIT_SPV: &[u8] = include_bytes!(concat!(env!("ATTENTION_SPLIT_SPV")));
+pub(crate) const ATTENTION_SPLIT16_SPV: &[u8] =
+    include_bytes!(concat!(env!("ATTENTION_SPLIT16_SPV")));
 pub(crate) const ATTN_REDUCE_SPV: &[u8] = include_bytes!(concat!(env!("ATTN_REDUCE_SPV")));
 #[allow(dead_code)]
 pub(crate) const SWIGLU_QUANT_SPV: &[u8] = include_bytes!(concat!(env!("SWIGLU_QUANT_SPV")));
