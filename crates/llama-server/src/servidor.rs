@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 
 use crate::api::{self, Parada, Pedido};
 use crate::http::{self, Requisicao};
-use crate::motor::Motor;
+use crate::motor::{Motor, MotorError};
 use crate::saida::Evento;
 
 /// Aceita conexões em série: o modelo é um só, e uma requisição já ocupa as GPUs.
@@ -101,8 +101,8 @@ pub fn responder_chat<W: Write>(
         let r = match motor.responder(pedido, |_| true) {
             Ok(r) => r,
             Err(e) => {
-                let corpo = api::erro_json(&e.to_string());
-                http::responder(escritor, 500, "application/json", &corpo)?;
+                let (status, corpo) = erro_do_motor(&e);
+                http::responder(escritor, status, "application/json", &corpo)?;
                 return Ok(());
             }
         };
@@ -121,10 +121,20 @@ pub fn responder_chat<W: Write>(
         return Ok(());
     }
 
+    // O que o pedido pode fazer falhar é conferido antes do cabeçalho: depois do 200 do SSE
+    // o erro só pode sair como evento, e o cliente já achou que a geração começou.
+    let preparado = match motor.preparar(pedido) {
+        Ok(p) => p,
+        Err(e) => {
+            let (status, corpo) = erro_do_motor(&e);
+            http::responder(escritor, status, "application/json", &corpo)?;
+            return Ok(());
+        }
+    };
     http::abrir_sse(escritor)?;
     let mut chamadas = 0usize;
     let mut erro_de_envio = None;
-    let saida = motor.responder(pedido, |evento| {
+    let saida = motor.gerar(pedido, preparado, |evento| {
         if erro_de_envio.is_some() {
             return false;
         }
@@ -163,12 +173,21 @@ pub fn responder_chat<W: Write>(
             http::evento(escritor, &serde_json::to_string(&fim)?)?;
         }
         Err(e) => {
-            let payload = String::from_utf8(api::erro_json(&e.to_string()))?;
+            let payload = String::from_utf8(erro_do_motor(&e).1)?;
             http::evento(escritor, &payload)?;
         }
     }
     http::evento(escritor, "[DONE]")?;
     Ok(())
+}
+
+/// Status e corpo de um erro do motor: 400 para o que o pedido causou, 500 para o resto.
+fn erro_do_motor(e: &MotorError) -> (u16, Vec<u8>) {
+    if e.do_pedido() {
+        (400, api::erro_json(&e.to_string()))
+    } else {
+        (500, api::erro_interno_json(&e.to_string()))
+    }
 }
 
 /// Log com prefill e decode separados: numa taxa só, um prompt longo faz o decode

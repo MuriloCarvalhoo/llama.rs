@@ -21,6 +21,24 @@ pub enum MotorError {
     Backend(String),
 }
 
+impl MotorError {
+    /// O pedido causou o erro (responde 4xx) ou foi falha interna (5xx)? Um cliente decide
+    /// se tenta de novo pelo status: repetir um prompt que não cabe no contexto não adianta.
+    pub fn do_pedido(&self) -> bool {
+        matches!(
+            self,
+            MotorError::Chat(_) | MotorError::ContextoEstourado(..)
+        )
+    }
+}
+
+/// O prompt do pedido renderizado, tokenizado e já conferido contra o contexto. Separado da
+/// geração para o servidor recusar um pedido que não cabe **antes** de abrir o stream.
+pub struct Preparado {
+    ids: Vec<u32>,
+    t_req: std::time::Instant,
+}
+
 /// O que a geração produziu, já separado nos campos da resposta.
 #[derive(Debug, Default, Clone)]
 pub struct Resultado {
@@ -85,8 +103,15 @@ impl<'a> Motor<'a> {
     pub fn responder(
         &mut self,
         pedido: &Pedido,
-        mut emitir: impl FnMut(&Evento) -> bool,
+        emitir: impl FnMut(&Evento) -> bool,
     ) -> Result<Resultado, MotorError> {
+        let preparado = self.preparar(pedido)?;
+        self.gerar(pedido, preparado, emitir)
+    }
+
+    /// A parte de [`Self::responder`] que só depende do pedido: render do template,
+    /// tokenização e o limite do contexto. Não toca na GPU.
+    pub fn preparar(&self, pedido: &Pedido) -> Result<Preparado, MotorError> {
         // O relógio do TTFT começa aqui: o cliente espera o render e a tokenização junto
         // com o prefill.
         let t_req = std::time::Instant::now();
@@ -105,6 +130,18 @@ impl<'a> Motor<'a> {
         if ids.len() >= self.ctx {
             return Err(MotorError::ContextoEstourado(ids.len(), self.ctx));
         }
+        Ok(Preparado { ids, t_req })
+    }
+
+    /// Gera a resposta de um pedido já [preparado](Self::preparar) — `preparado` tem de
+    /// ter saído do mesmo `pedido`.
+    pub fn gerar(
+        &mut self,
+        pedido: &Pedido,
+        preparado: Preparado,
+        mut emitir: impl FnMut(&Evento) -> bool,
+    ) -> Result<Resultado, MotorError> {
+        let Preparado { ids, t_req } = preparado;
         let ja_no_cache = prefixo_comum(self.sessao.tokens(), &ids, self.sessao.marca());
         let t0 = std::time::Instant::now();
         let mut logits = self

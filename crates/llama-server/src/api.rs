@@ -244,7 +244,16 @@ pub fn lista_de_modelos(nome: &str, criado: u64) -> Value {
 }
 
 pub fn erro_json(mensagem: &str) -> Vec<u8> {
-    let v = json!({"error": {"message": mensagem, "type": "invalid_request_error"}});
+    erro_json_de_tipo(mensagem, "invalid_request_error")
+}
+
+/// Como [`erro_json`], para falha do servidor: o `type` é o que a OpenAI usa nos 5xx.
+pub fn erro_interno_json(mensagem: &str) -> Vec<u8> {
+    erro_json_de_tipo(mensagem, "server_error")
+}
+
+fn erro_json_de_tipo(mensagem: &str, tipo: &str) -> Vec<u8> {
+    let v = json!({"error": {"message": mensagem, "type": tipo}});
     serde_json::to_vec(&v).unwrap_or_default()
 }
 

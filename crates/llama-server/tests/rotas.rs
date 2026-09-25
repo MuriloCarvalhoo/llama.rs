@@ -125,6 +125,55 @@ fn chat_com_stream_manda_sse_ate_o_done() {
     );
 }
 
+/// Prompt que não cabe no contexto é erro do pedido: 400, e no streaming **antes** de abrir
+/// o SSE — um 200 seguido de evento de erro faz o cliente achar que a geração começou.
+/// A requisição seguinte, que cabe, continua sendo atendida.
+#[test]
+fn prompt_maior_que_o_contexto_responde_400_antes_do_stream() {
+    let tok = tokenizer_de_teste();
+    let normal = r#"{"model":"m","messages":[{"role":"user","content":"oi"}],"temperature":0}"#;
+    let curto = llama_server::api::parse_pedido(normal.as_bytes()).unwrap();
+    let gpu = cenario(&curto, "</think>ok<|im_end|>", &tok);
+    // Cabe o prompt curto e a resposta; não cabe o longo.
+    let ctx = comum::tokens_do_prompt(&curto, &tok) + 16;
+    let mut motor = Motor::novo(&tok, &gpu, ctx, EOS);
+    let longo = "palavra ".repeat(200);
+
+    for stream in [false, true] {
+        let corpo = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": longo}],
+            "stream": stream,
+            "temperature": 0
+        });
+        let mut saida: Vec<u8> = Vec::new();
+        rotear(
+            &req("POST", "/v1/chat/completions", &corpo.to_string()),
+            "modelo-teste",
+            &mut motor,
+            &mut saida,
+        )
+        .unwrap();
+        let r = String::from_utf8(saida).unwrap();
+
+        assert!(r.starts_with("HTTP/1.1 400"), "stream={stream}: {r}");
+        assert!(!r.contains("text/event-stream"), "stream={stream}: {r}");
+        assert_eq!(corpo_json(&r)["error"]["type"], "invalid_request_error");
+    }
+
+    let mut saida: Vec<u8> = Vec::new();
+    rotear(
+        &req("POST", "/v1/chat/completions", normal),
+        "modelo-teste",
+        &mut motor,
+        &mut saida,
+    )
+    .unwrap();
+    let r = String::from_utf8(saida).unwrap();
+    assert!(r.starts_with("HTTP/1.1 200 OK"), "{r}");
+    assert_eq!(corpo_json(&r)["choices"][0]["message"]["content"], "ok");
+}
+
 #[test]
 fn stream_com_tool_call_manda_o_delta_de_tool_calls() {
     let ferramenta = json!({
