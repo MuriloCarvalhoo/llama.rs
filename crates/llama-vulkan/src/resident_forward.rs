@@ -1834,6 +1834,19 @@ impl<'ctx> ResidentForward<'ctx> {
             st.prof = prof;
         }
         me.gravar_rollback()?;
+        // Com tudo alocado, a margem vira garantia: a GPU do monitor fica com 2 GiB livres e
+        // a outra com 500 MiB, ou a carga falha e o `Drop` devolve a VRAM. Sem
+        // `VK_EXT_memory_budget` não há o que medir.
+        let phys = &ctx.amd_compute_devices()[me.phys_idx];
+        if let Some(livre) = phys.free_device_memory(ctx)
+            && livre < phys.margem_vram()
+        {
+            return Err(MatmulError::MargemVram {
+                gpu: format!("GPU{} ({})", me.phys_idx, phys.name()),
+                livre_mib: livre >> 20,
+                margem_mib: phys.margem_vram() >> 20,
+            });
+        }
         Ok(me)
     }
 

@@ -72,19 +72,16 @@ impl<'ctx> LayerSplitForward<'ctx> {
         {
             Some(n) => vec![(0, n), (n, config.n_layer)],
             None => {
-                // Reserva fixa por device antes de proporcionalizar: essas duas MI50 também
-                // dirigem o display (uma tem um monitor 34" 3440x1440 ligado), e um device
-                // sem VRAM livre nenhuma pode travar a sessão gráfica. 1.5 GiB é a margem
-                // mais alta pedida (a GPU do monitor grande); aplicar nas duas é simples e
-                // nunca half-fills a menor — não há como identificar de dentro do Vulkan
-                // qual physical device é qual card do X sem VK_EXT_pci_bus_info.
-                const MARGEM_VRAM: u64 = 1536 * 1024 * 1024;
+                // Reserva por device antes de proporcionalizar: 2 GiB na GPU que dirige o
+                // monitor, 500 MiB na outra (`VulkanPhysicalDevice::margem_vram`) — um device
+                // sem VRAM livre nenhuma pode travar a sessão gráfica. Aqui a margem só pesa
+                // na proporção; quem a garante é a conferência no fim de `new_shard_com`.
                 let free: Vec<u64> = devs
                     .iter()
                     .map(|p| {
                         p.free_device_memory(ctx)
                             .unwrap_or(1)
-                            .saturating_sub(MARGEM_VRAM)
+                            .saturating_sub(p.margem_vram())
                             .max(1)
                     })
                     .collect();

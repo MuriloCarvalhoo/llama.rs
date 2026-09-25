@@ -16,6 +16,55 @@ pub enum VulkanError {
 
 const AMD_VENDOR_ID: u32 = 0x1002;
 
+/// VRAM que o llama-rs deixa livre num device: **2 GiB** na GPU que dirige um monitor e
+/// 500 MiB nas outras. Sem VRAM livre a GPU do display trava a sessão gráfica (o compositor
+/// não consegue alocar, ou o driver reseta a GPU). Sem como saber se há monitor, vale a maior.
+const MARGEM_COM_MONITOR: u64 = 2 << 30;
+const MARGEM_SEM_MONITOR: u64 = 500 << 20;
+
+fn margem_vram_de(tem_monitor: Option<bool>) -> u64 {
+    match tem_monitor {
+        Some(false) => MARGEM_SEM_MONITOR,
+        _ => MARGEM_COM_MONITOR,
+    }
+}
+
+/// Algum conector do card DRM no endereço PCI `pci` (`dddd:bb:dd.f`) está `connected`?
+/// `None` quando o sysfs não diz (sem DRM, outro SO). `raiz` é `/sys/bus/pci/devices` fora
+/// dos testes.
+///
+/// Não há como perguntar isso ao Vulkan: o RADV não diz qual physical device é qual card do
+/// DRM, só o endereço PCI (`VK_EXT_pci_bus_info`) — e é por ele que se chega aos conectores.
+fn tem_monitor(raiz: &std::path::Path, pci: &str) -> Option<bool> {
+    let mut algum_card = false;
+    for card in std::fs::read_dir(raiz.join(pci).join("drm"))
+        .ok()?
+        .flatten()
+    {
+        let card_nome = card.file_name().to_string_lossy().into_owned();
+        if !card_nome.starts_with("card") {
+            continue;
+        }
+        algum_card = true;
+        // Conectores são `cardN-<tipo>-<n>/status`; o resto do diretório (`device`,
+        // `power`, ...) não tem `status` de conector.
+        let prefixo = format!("{card_nome}-");
+        for con in std::fs::read_dir(card.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if con.file_name().to_string_lossy().starts_with(&prefixo)
+                && std::fs::read_to_string(con.path().join("status"))
+                    .is_ok_and(|s| s.trim() == "connected")
+            {
+                return Some(true);
+            }
+        }
+    }
+    algum_card.then_some(false)
+}
+
 pub struct VulkanContext {
     #[allow(dead_code)] // mantido para garantir que Entry não seja dropada antes de Instance
     pub(crate) entry: Entry,
@@ -28,11 +77,18 @@ pub struct VulkanPhysicalDevice {
     name: String,
     subgroup_size: u32,
     pub(crate) queue_family: u32,
+    margem_vram: u64,
 }
 
 impl VulkanPhysicalDevice {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Bytes de VRAM que têm de sobrar livres neste device depois da carga: 2 GiB se ele
+    /// dirige um monitor, 500 MiB se não (ver `MARGEM_COM_MONITOR`).
+    pub fn margem_vram(&self) -> u64 {
+        self.margem_vram
     }
 
     /// Bytes livres nos heaps DEVICE_LOCAL, via `VK_EXT_memory_budget`.
@@ -140,14 +196,41 @@ impl VulkanContext {
                 continue;
             };
 
+            // A struct de PCI só pode entrar na cadeia se o device anunciar a extensão.
+            // SAFETY: `pd` é um handle válido retornado por `enumerate_physical_devices`.
+            let tem_pci_info = unsafe { instance.enumerate_device_extension_properties(pd) }
+                .is_ok_and(|exts| {
+                    exts.iter().any(|e| {
+                        // SAFETY: extension_name é nul-terminado pela spec Vulkan.
+                        let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                        n.to_bytes() == b"VK_EXT_pci_bus_info"
+                    })
+                });
+            let mut pci_props = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
             let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+            if tem_pci_info {
+                subgroup_props.p_next = std::ptr::from_mut(&mut pci_props).cast();
+            }
             let mut props2 = vk::PhysicalDeviceProperties2 {
                 p_next: &mut subgroup_props as *mut _ as *mut std::ffi::c_void,
                 ..Default::default()
             };
-            // SAFETY: `pd` é válido; `p_next` aponta para `subgroup_props` que vive na mesma
-            // stack frame durante toda a chamada, satisfazendo o requisito de validade do ponteiro.
+            // SAFETY: `pd` é válido; `p_next` aponta para `subgroup_props` (e este, com a
+            // extensão, para `pci_props`), que vivem na mesma stack frame durante toda a
+            // chamada, satisfazendo o requisito de validade do ponteiro.
             unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+            let monitor = tem_pci_info
+                .then(|| {
+                    let pci = format!(
+                        "{:04x}:{:02x}:{:02x}.{:x}",
+                        pci_props.pci_domain,
+                        pci_props.pci_bus,
+                        pci_props.pci_device,
+                        pci_props.pci_function
+                    );
+                    tem_monitor(std::path::Path::new("/sys/bus/pci/devices"), &pci)
+                })
+                .flatten();
 
             // SAFETY: `device_name` é garantido nul-terminado pela spec Vulkan
             // (VkPhysicalDeviceProperties.deviceName tem VK_MAX_PHYSICAL_DEVICE_NAME_SIZE bytes
@@ -162,6 +245,7 @@ impl VulkanContext {
                 name,
                 subgroup_size: subgroup_props.subgroup_size,
                 queue_family: qfam_idx as u32,
+                margem_vram: margem_vram_de(monitor),
             });
         }
         Ok(result)
@@ -236,5 +320,53 @@ impl Drop for VulkanDevice {
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `raiz/<pci>/drm/card<N>/card<N>-<con>/status` num diretório temporário próprio.
+    fn sysfs(nome: &str, conectores: &[(&str, &str)]) -> std::path::PathBuf {
+        let raiz =
+            std::env::temp_dir().join(format!("llama-rs-sysfs-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raiz);
+        let card = raiz.join("0000:85:00.0/drm/card2");
+        std::fs::create_dir_all(card.join("power")).unwrap();
+        for (con, status) in conectores {
+            let d = card.join(format!("card2-{con}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("status"), format!("{status}\n")).unwrap();
+        }
+        raiz
+    }
+
+    #[test]
+    fn conector_ligado_e_monitor() {
+        let raiz = sysfs("ligado", &[("DP-7", "disconnected"), ("DP-8", "connected")]);
+        assert_eq!(tem_monitor(&raiz, "0000:85:00.0"), Some(true));
+        std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn card_sem_conector_ligado_nao_e_monitor() {
+        let raiz = sysfs("desligado", &[("DP-7", "disconnected")]);
+        assert_eq!(tem_monitor(&raiz, "0000:85:00.0"), Some(false));
+        std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn pci_desconhecido_nao_decide() {
+        let raiz = sysfs("ausente", &[]);
+        assert_eq!(tem_monitor(&raiz, "0000:05:00.0"), None);
+        std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn sem_saber_do_monitor_vale_a_margem_maior() {
+        assert_eq!(margem_vram_de(Some(true)), 2 << 30);
+        assert_eq!(margem_vram_de(None), 2 << 30);
+        assert_eq!(margem_vram_de(Some(false)), 500 << 20);
     }
 }

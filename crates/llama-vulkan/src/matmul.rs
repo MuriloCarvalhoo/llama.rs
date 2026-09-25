@@ -14,6 +14,15 @@ pub enum MatmulError {
     Pipeline(#[from] PipelineError),
     #[error("Vulkan: {0}")]
     Vulkan(#[from] vk::Result),
+    #[error(
+        "{gpu}: só {livre_mib} MiB de VRAM livres depois da carga, abaixo da margem de \
+         {margem_mib} MiB — libere VRAM (ex.: `ollama ps`) ou use um --ctx menor"
+    )]
+    MargemVram {
+        gpu: String,
+        livre_mib: u64,
+        margem_mib: u64,
+    },
 }
 
 /// Argumentos para `dispatch_inner`, agrupados para evitar `too_many_arguments`.

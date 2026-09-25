@@ -41,7 +41,10 @@ descartou tensor-parallel/row-split neste hardware.
 Se uma das GPUs também dirige o display, o driver AMD pode realocar em GTT (memória do host, via
 PCIe) o excedente do que não coube na VRAM dela — silenciosamente, sem erro. O sintoma é banda
 efetiva muito abaixo do esperado, não uma falha de alocação. O backend seleciona a GPU com mais
-VRAM livre via `VK_EXT_memory_budget` (não pelo índice do device) e reserva uma margem fixa antes
-de calcular o layer-split, para não deixar a GPU do display sem VRAM livre nenhuma.
+VRAM livre via `VK_EXT_memory_budget` (não pelo índice do device) e reserva uma margem por device
+antes de calcular o layer-split: **2 GiB na GPU que dirige o monitor, 500 MiB na outra**. Qual é a
+do monitor sai do endereço PCI (`VK_EXT_pci_bus_info`) cruzado com os conectores `connected` em
+`/sys/bus/pci/devices/<pci>/drm/card*/`. Depois da carga a margem é conferida de novo e, se
+faltar, a carga falha com `MargemVram` em vez de deixar o display sem VRAM.
 
 `LLAMA_RS_GPU=N` força um índice específico se a seleção automática não for o que se quer.
