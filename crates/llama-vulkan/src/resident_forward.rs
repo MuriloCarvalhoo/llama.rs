@@ -3388,8 +3388,17 @@ impl<'ctx> ResidentForward<'ctx> {
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
         let faltando = || MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         let m = st.mtp.as_ref().ok_or_else(faltando)?;
-        if st.mtp_plan.is_empty() || emb.len() != st.cfg.n_embd || *m.len.borrow() >= st.cfg.ctx {
+        if st.mtp_plan.is_empty() || emb.len() != st.cfg.n_embd {
             return Err(faltando());
+        }
+        // O cache da cabeça anda duas posições por passo (as duas propostas, aceitas ou
+        // não) e só zera no `reset_len`: numa sessão que reaproveita o prefixo entre
+        // requisições, ele enche muito antes do cache do modelo, e recusar aqui derrubava a
+        // geração no meio. Cheio, recomeça do zero — o mesmo estado de logo depois do
+        // primeiro prefill. Quem decide o token é o verify, então só a taxa de aceitação
+        // sente, por alguns passos.
+        if *m.len.borrow() >= st.cfg.ctx {
+            *m.len.borrow_mut() = 0;
         }
         let d = &self.dev.device;
         let bytes = (st.cfg.n_embd * 4) as vk::DeviceSize;

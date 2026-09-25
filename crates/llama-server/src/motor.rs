@@ -1,7 +1,7 @@
 //! O laço de geração: prompt renderizado, prefill com reuso, amostragem, parada.
 
 use llama_chat::{Opcoes, render};
-use llama_model::{GpuResidentDecode, ModelError, Sessao};
+use llama_model::{GpuResidentDecode, ModelError, Sessao, VERIFY_TOK};
 use llama_sampling::Sampler;
 use llama_tokenizer::Tokenizer;
 use rand::SeedableRng;
@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 
 use crate::api::{ChamadaPronta, Parada, Pedido};
 use crate::detok::Detok;
-use crate::saida::{Evento, Saida};
+use crate::saida::{Evento, Saida, cauda_ambigua};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MotorError {
@@ -137,6 +137,7 @@ impl<'a> Motor<'a> {
 
         let mut detok = Detok::novo();
         let mut saida = Saida::nova(pedido.pensar, pedido.ferramentas.clone());
+        let mut paradas = FiltroParada::novo(&pedido.stop);
         let mut querem_mais = true;
         let usar_mtp = self.gpu.tem_mtp();
         // Tokens que um passo de MTP já validou (aceitos + o `seguinte` amostrado dentro
@@ -162,20 +163,30 @@ impl<'a> Motor<'a> {
 
             let texto = detok.empurrar(&self.tokenizer.decode_bytes(&[token]));
             for evento in saida.empurrar(&texto) {
-                if res.ms_ttft.is_none() {
-                    res.ms_ttft = Some(t_req.elapsed().as_secs_f64() * 1e3);
+                for evento in paradas.filtrar(evento) {
+                    if res.ms_ttft.is_none() {
+                        res.ms_ttft = Some(t_req.elapsed().as_secs_f64() * 1e3);
+                    }
+                    querem_mais &= registrar(&mut res, &evento, &mut emitir);
                 }
-                querem_mais &= registrar(&mut res, &evento, &mut emitir);
             }
-            if parou_em_sequencia(&res.conteudo, &pedido.stop) {
+            if paradas.parou {
                 res.parada = Some(Parada::Fim);
+                break;
+            }
+            // Terminou antes do próximo passo, não depois: o passo seguinte processaria um
+            // token que ninguém vai ler — e, perto do fim do contexto, um verify de MTP
+            // que o backend recusa.
+            if res.tokens_saida >= teto || !querem_mais {
                 break;
             }
             if !pendentes.is_empty() {
                 // Um aceito do passo anterior: já está no cache, nada a decodificar.
                 continue;
             }
-            if usar_mtp {
+            // O verify escreve `VERIFY_TOK` posições a partir da de `token`; sem espaço para
+            // todas, o resto da geração segue token a token.
+            if usar_mtp && self.sessao.tokens().len() + VERIFY_TOK <= self.ctx {
                 let passo = self
                     .sessao
                     .passo_mtp(self.gpu, &sampler, &mut rng, token)
@@ -194,12 +205,16 @@ impl<'a> Motor<'a> {
         res.ms_decode = t_decode.elapsed().as_secs_f64() * 1e3;
 
         let resto = detok.finalizar();
-        if !resto.is_empty() {
-            for evento in saida.empurrar(&resto) {
-                registrar(&mut res, &evento, &mut emitir);
-            }
+        let mut finais = if resto.is_empty() {
+            Vec::new()
+        } else {
+            saida.empurrar(&resto)
+        };
+        finais.extend(saida.finalizar());
+        for evento in finais.into_iter().flat_map(|e| paradas.filtrar(e)) {
+            registrar(&mut res, &evento, &mut emitir);
         }
-        for evento in saida.finalizar() {
+        for evento in paradas.descarregar() {
             registrar(&mut res, &evento, &mut emitir);
         }
         if !querem_mais {
@@ -255,9 +270,74 @@ fn registrar(
     emitir(evento)
 }
 
-fn parou_em_sequencia(conteudo: &str, stop: &[String]) -> bool {
-    stop.iter()
-        .any(|s| !s.is_empty() && conteudo.contains(s.as_str()))
+/// Aplica o `stop` do cliente **antes** da emissão. Cortar depois não serve: no streaming
+/// o que já saiu por SSE não volta, e o delimitador chegaria ao cliente.
+///
+/// Só o conteúdo passa pelo filtro — é o texto da resposta; raciocínio e chamadas seguem
+/// direto. Do conteúdo, fica retido o sufixo que ainda pode ser o começo de uma parada.
+struct FiltroParada<'a> {
+    stop: &'a [String],
+    pendente: String,
+    /// Uma parada fechou: nada mais sai, nem o que os buffers soltarem no fim.
+    parou: bool,
+}
+
+impl<'a> FiltroParada<'a> {
+    fn novo(stop: &'a [String]) -> FiltroParada<'a> {
+        FiltroParada {
+            stop,
+            pendente: String::new(),
+            parou: false,
+        }
+    }
+
+    /// Os eventos que já podem sair em troca de `evento`.
+    fn filtrar(&mut self, evento: Evento) -> Vec<Evento> {
+        if self.parou {
+            return Vec::new();
+        }
+        let Evento::Conteudo(texto) = evento else {
+            // Outro evento fecha o trecho de conteúdo: o retido já não tem como continuar
+            // numa parada, e sai antes dele para manter a ordem.
+            let mut eventos = self.descarregar();
+            eventos.push(evento);
+            return eventos;
+        };
+        self.pendente.push_str(&texto);
+        // Vale a parada que começa primeiro no texto, não a primeira da lista.
+        let corte = self
+            .stop
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| self.pendente.find(s.as_str()))
+            .min();
+        if let Some(corte) = corte {
+            self.pendente.truncate(corte);
+            self.parou = true;
+            return self.descarregar();
+        }
+        let reter = self
+            .stop
+            .iter()
+            .map(|s| cauda_ambigua(&self.pendente, s))
+            .max()
+            .unwrap_or(0);
+        let pronto: String = self.pendente.drain(..self.pendente.len() - reter).collect();
+        conteudo(pronto)
+    }
+
+    /// Fim da geração por outro motivo: o que estava retido era conteúdo.
+    fn descarregar(&mut self) -> Vec<Evento> {
+        conteudo(std::mem::take(&mut self.pendente))
+    }
+}
+
+fn conteudo(texto: String) -> Vec<Evento> {
+    if texto.is_empty() {
+        Vec::new()
+    } else {
+        vec![Evento::Conteudo(texto)]
+    }
 }
 
 fn sampler_de(pedido: &Pedido) -> Sampler {
@@ -273,5 +353,88 @@ fn sampler_de(pedido: &Pedido) -> Sampler {
         },
         p: pedido.top_p,
         temp: pedido.temperatura,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FiltroParada;
+    use crate::saida::Evento;
+
+    /// Empurra os pedaços como conteúdo e devolve o texto que saiu, com o que o fim soltar.
+    fn filtrar(stop: &[&str], pedacos: &[&str]) -> (String, bool) {
+        let stop: Vec<String> = stop.iter().map(|&s| s.to_owned()).collect();
+        let mut f = FiltroParada::novo(&stop);
+        let mut eventos = Vec::new();
+        for p in pedacos {
+            eventos.extend(f.filtrar(Evento::Conteudo((*p).to_owned())));
+            if f.parou {
+                break;
+            }
+        }
+        eventos.extend(f.descarregar());
+        let texto = eventos
+            .iter()
+            .map(|e| match e {
+                Evento::Conteudo(t) => t.as_str(),
+                _ => "",
+            })
+            .collect();
+        (texto, f.parou)
+    }
+
+    #[test]
+    fn parada_partida_entre_pedacos_corta_no_delimitador() {
+        assert_eq!(
+            filtrar(&["PARE"], &["xxP", "AR", "Eyy"]),
+            ("xx".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn texto_depois_da_parada_no_mesmo_pedaco_nao_sai() {
+        assert_eq!(filtrar(&["PARE"], &["xxPAREyy"]), ("xx".to_owned(), true));
+    }
+
+    /// A retenção é por caractere: "ç" tem dois bytes, e reter só um cortaria no meio dele.
+    #[test]
+    fn retencao_nao_corta_caractere_multibyte() {
+        assert_eq!(
+            filtrar(&["ção"], &["a", "ç", "ã", "o!"]),
+            ("a".to_owned(), true)
+        );
+        assert_eq!(
+            filtrar(&["ção"], &["a", "ç", "ões"]),
+            ("ações".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn sem_parada_tudo_sai_sem_reter() {
+        let stop: Vec<String> = Vec::new();
+        let mut f = FiltroParada::novo(&stop);
+        assert_eq!(
+            f.filtrar(Evento::Conteudo("abc".to_owned())),
+            vec![Evento::Conteudo("abc".to_owned())]
+        );
+    }
+
+    /// Um evento que não é conteúdo solta o retido antes dele, na ordem em que veio.
+    #[test]
+    fn chamada_depois_de_conteudo_retido_preserva_a_ordem() {
+        let stop = vec!["PARE".to_owned()];
+        let mut f = FiltroParada::novo(&stop);
+        assert_eq!(
+            f.filtrar(Evento::Conteudo("xP".to_owned())),
+            vec![Evento::Conteudo("x".to_owned())]
+        );
+        let chamada = Evento::Chamada {
+            nome: "f".to_owned(),
+            argumentos: serde_json::json!({}),
+        };
+        assert_eq!(
+            f.filtrar(chamada.clone()),
+            vec![Evento::Conteudo("P".to_owned()), chamada]
+        );
     }
 }

@@ -195,7 +195,8 @@ impl Saida {
 }
 
 /// Quantos bytes do fim de `buf` ainda podem virar `marcador` com o próximo pedaço.
-fn cauda_ambigua(buf: &str, marcador: &str) -> usize {
+/// Sempre numa fronteira de caractere: `buf.get` recusa cortar no meio de um.
+pub(crate) fn cauda_ambigua(buf: &str, marcador: &str) -> usize {
     // `..=max`: com `buf` terminando em "<" e o marcador "</think>", reter 1 byte é o
     // que impede o "<" de vazar como texto e o marcador de nunca ser reconhecido.
     let max = marcador.len().min(buf.len());
