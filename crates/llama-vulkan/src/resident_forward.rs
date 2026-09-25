@@ -928,6 +928,8 @@ pub struct ResidentForward<'ctx> {
     pub(crate) gate_quant: ComputePipeline,
     pub(crate) desc_pool: vk::DescriptorPool,
     pub(crate) state: Option<ResidentState<'ctx>>,
+    /// Clock fixo enquanto houver geração (ver `pstate.rs`). Só no backend carregado.
+    pstate: Option<crate::pstate::Pstate>,
 }
 
 impl<'ctx> ResidentForward<'ctx> {
@@ -1293,6 +1295,7 @@ impl<'ctx> ResidentForward<'ctx> {
             gate_quant,
             desc_pool,
             state: None,
+            pstate: None,
         })
     }
 
@@ -1847,6 +1850,10 @@ impl<'ctx> ResidentForward<'ctx> {
                 margem_mib: phys.margem_vram() >> 20,
             });
         }
+        me.pstate = phys
+            .pci
+            .as_deref()
+            .and_then(|pci| crate::pstate::Pstate::novo(pci, &format!("GPU{}", me.phys_idx)));
         Ok(me)
     }
 
@@ -3420,6 +3427,9 @@ impl<'ctx> ResidentForward<'ctx> {
             d.begin_command_buffer(cmd, &begin)?;
         }
         self.record_mtp(cmd, hidden_idx);
+        if let Some(p) = &self.pstate {
+            p.em_uso();
+        }
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
@@ -5199,6 +5209,9 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
+        if let Some(p) = &self.pstate {
+            p.em_uso();
+        }
         // SAFETY: fence resetado antes do submit; cmd válido.
         unsafe {
             d.reset_fences(&[st.token_fence])?;

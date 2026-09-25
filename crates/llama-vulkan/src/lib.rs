@@ -1,11 +1,14 @@
 pub mod alloc;
 mod backend;
+#[cfg(test)]
+mod bancada;
 mod device;
 mod dual_gpu;
 mod layer_split;
 pub mod matmul;
 mod model_gpu;
 pub(crate) mod pipeline;
+mod pstate;
 mod resident;
 mod resident_forward;
 #[cfg(test)]

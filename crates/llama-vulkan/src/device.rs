@@ -78,6 +78,8 @@ pub struct VulkanPhysicalDevice {
     subgroup_size: u32,
     pub(crate) queue_family: u32,
     margem_vram: u64,
+    /// `dddd:bb:dd.f`, de `VK_EXT_pci_bus_info` — liga o device ao sysfs.
+    pub(crate) pci: Option<String>,
 }
 
 impl VulkanPhysicalDevice {
@@ -219,18 +221,18 @@ impl VulkanContext {
             // extensão, para `pci_props`), que vivem na mesma stack frame durante toda a
             // chamada, satisfazendo o requisito de validade do ponteiro.
             unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
-            let monitor = tem_pci_info
-                .then(|| {
-                    let pci = format!(
-                        "{:04x}:{:02x}:{:02x}.{:x}",
-                        pci_props.pci_domain,
-                        pci_props.pci_bus,
-                        pci_props.pci_device,
-                        pci_props.pci_function
-                    );
-                    tem_monitor(std::path::Path::new("/sys/bus/pci/devices"), &pci)
-                })
-                .flatten();
+            let pci = tem_pci_info.then(|| {
+                format!(
+                    "{:04x}:{:02x}:{:02x}.{:x}",
+                    pci_props.pci_domain,
+                    pci_props.pci_bus,
+                    pci_props.pci_device,
+                    pci_props.pci_function
+                )
+            });
+            let monitor = pci
+                .as_deref()
+                .and_then(|pci| tem_monitor(std::path::Path::new("/sys/bus/pci/devices"), pci));
 
             // SAFETY: `device_name` é garantido nul-terminado pela spec Vulkan
             // (VkPhysicalDeviceProperties.deviceName tem VK_MAX_PHYSICAL_DEVICE_NAME_SIZE bytes
@@ -246,6 +248,7 @@ impl VulkanContext {
                 subgroup_size: subgroup_props.subgroup_size,
                 queue_family: qfam_idx as u32,
                 margem_vram: margem_vram_de(monitor),
+                pci,
             });
         }
         Ok(result)
