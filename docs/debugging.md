@@ -51,6 +51,8 @@ comparáveis com os de uma execução normal (clock diferente).
 | `LLAMA_RS_PSTATE=standard\|peak\|auto` | Clock da GPU durante a geração (`pstate.rs`). `standard` (padrão) fixa núcleo em 1316 MHz e HBM em 1000; `peak` fixa o núcleo em 1700 e desce para `standard` com a junction em 95 °C; `auto` deixa o DPM do driver |
 | `LLAMA_RS_PROFILE=1` | Liga a coleta de timestamps de GPU |
 | `LLAMA_RS_ATTN16=0` | Volta a atenção de contexto longo ao `attention_split.comp` (uma posição do KV por wave) em vez do `attention_split16.comp` |
+| `LLAMA_RS_GEMM_K56=0` | Devolve o Q5_K do prefill ao matvec-COLS (o GEMM `mul_mm.comp` com `TIPO=1` é o padrão desde 2026-09-26) |
+| `LLAMA_RS_GEMM_Q6K=1` | Manda também o Q6_K do prefill pelo GEMM (`TIPO=2`); no bloco 32 ele é mais lento que o matvec-COLS |
 | `LLAMA_RS_TRACE_TOKENS=N` | Quantos tokens entram no `--trace` (padrão 8) |
 | `LLAMA_RS_MATVEC_GEOM=wg,linhas` | Geometria do matvec K-quant (padrão 256,2) — ver `scripts/tune-matvec.sh` |
 | `LLAMA_RS_STOP_LAYER=N` | Executa só as N primeiras camadas do shard (diagnóstico) |

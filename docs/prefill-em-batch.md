@@ -108,6 +108,11 @@ qualquer bloco. Com passo 9 na LDS, linhas intercaladas e buffer duplo em regist
 Padrão virou 32. O próximo gargalo é o matvec-COLS do Q5_K/Q6_K, que dobra em 32 por
 pressão de registrador — um GEMM para esses dois tipos é o passo seguinte.
 
+**Atualização 2026-09-26:** o `mul_mm.comp` ganhou `TIPO` (0 = Q4_K, 1 = Q5_K, 2 = Q6_K). Com o
+mesmo prompt de 1,7k tokens: Q5_K de 52 para 14,7 ms/bloco, e prefill de 7,76 para **6,57
+ms/token**. O Q6_K pelo GEMM ficou mais lento que o matvec-COLS no bloco 32 (39,5 contra 35 ms)
+e segue opcional (`LLAMA_RS_GEMM_Q6K=1`).
+
 ## O que mais precisa virar batch
 
 O matvec não é o único: **todo o resto do plano assume um vetor**. Os que precisam de uma

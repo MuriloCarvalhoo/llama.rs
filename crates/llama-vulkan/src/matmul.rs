@@ -469,6 +469,81 @@ pub fn dispatch_mul_mm_q4k(
     )
 }
 
+/// GEMM Q5_K (`mul_mm.comp` com `TIPO = 1`). Mesmo contrato de [`dispatch_mul_mm_q4k`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mul_mm_q5k(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        w_bytes,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, cols_u32), (1, 1)],
+    )
+}
+
+/// GEMM Q6_K (`mul_mm.comp` com `TIPO = 2`). Os superblocos sobem alinhados em 212 bytes,
+/// como no [`dispatch_q6_k_matvec`].
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_mul_mm_q6k(
+    ctx: &VulkanContext,
+    phys: &VulkanPhysicalDevice,
+    dev: &VulkanDevice,
+    w_bytes: &[u8],
+    x_f32: &[f32],
+    n_in: usize,
+    n_out: usize,
+    cols: usize,
+) -> Result<Vec<f32>, MatmulError> {
+    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+        return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+    }
+    let n_sb = w_bytes.len() / 210;
+    let mut padded = vec![0u8; n_sb * 212];
+    for (dst, src) in padded
+        .as_chunks_mut::<212>()
+        .0
+        .iter_mut()
+        .zip(w_bytes.as_chunks::<210>().0)
+    {
+        dst[..210].copy_from_slice(src);
+    }
+    let cols_u32 =
+        u32::try_from(cols).map_err(|_| MatmulError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+    dispatch_k_matvec(
+        ctx,
+        phys,
+        dev,
+        crate::MUL_MM_SPV,
+        &padded,
+        x_f32,
+        n_in,
+        n_out,
+        cols,
+        crate::resident_forward::GEMM_LINHAS_POR_WG,
+        &[(0, cols_u32), (1, 2)],
+    )
+}
+
 /// Caminho comum dos matvecs K-quant: sobe pesos e ativação, despacha
 /// `n_out / rows_por_wg` workgroups e lê o resultado. `w_bytes` já vem no layout que o
 /// shader espera.

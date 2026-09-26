@@ -142,8 +142,21 @@ fn gemm_largura_ok(cols: usize) -> bool {
 }
 
 /// Se este matvec vai pelo GEMM em vez do matvec-COLS.
+///
+/// Q5_K entra desde 2026-09-26: com o bloco 32 o matvec-COLS dele levava 52 ms por bloco
+/// de prefill contra 14,8 do GEMM (1,7k tokens, as duas GPUs). O Q6_K tem o caminho pronto
+/// (`TIPO = 2` no shader, testado), mas no bloco 32 o GEMM dele ficou **mais lento** que o
+/// matvec-COLS (39,5 contra 35,1 ms): só com `LLAMA_RS_GEMM_Q6K=1`. `LLAMA_RS_GEMM_K56=0`
+/// devolve os dois ao matvec-COLS.
 fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
-    gemm_prefill() && matches!(ty, gguf::GgmlType::Q4_K) && gemm_largura_ok(cols)
+    let k56 = std::env::var("LLAMA_RS_GEMM_K56").map_or(true, |v| v != "0");
+    let tipo_ok = match ty {
+        gguf::GgmlType::Q4_K => true,
+        gguf::GgmlType::Q5_K => k56,
+        gguf::GgmlType::Q6_K => k56 && std::env::var("LLAMA_RS_GEMM_Q6K").is_ok_and(|v| v == "1"),
+        _ => false,
+    };
+    gemm_prefill() && tipo_ok && gemm_largura_ok(cols)
 }
 
 /// Slot de KV-cache de cada camada local e o total de slots.
@@ -461,6 +474,8 @@ pub(crate) enum PipeId {
     MatvecQ4KB,
     /// GEMM Q4_K com tiling em LDS — experimental, ver [`gemm_prefill`].
     MulMmQ4K,
+    MulMmQ5K,
+    MulMmQ6K,
     /// As mesmas quatro com `COLS = VERIFY_TOK`: só o plano de verify do MTP as usa.
     MatvecV,
     MatvecQ5KV,
@@ -502,6 +517,8 @@ impl PipeId {
             PipeId::MatvecQ6KB => "matvec_q6k_b",
             PipeId::MatvecQ4KB => "matvec_q4k_b",
             PipeId::MulMmQ4K => "mul_mm_q4k",
+            PipeId::MulMmQ5K => "mul_mm_q5k",
+            PipeId::MulMmQ6K => "mul_mm_q6k",
             PipeId::MatvecV => "matvec_v",
             PipeId::MatvecQ5KV => "matvec_q5k_v",
             PipeId::MatvecQ6KV => "matvec_q6k_v",
@@ -545,6 +562,8 @@ impl PipeId {
             | PipeId::MatvecQ6KB
             | PipeId::MatvecQ4KB
             | PipeId::MulMmQ4K
+            | PipeId::MulMmQ5K
+            | PipeId::MulMmQ6K
             | PipeId::MatvecV
             | PipeId::MatvecQ5KV
             | PipeId::MatvecQ6KV
@@ -915,6 +934,9 @@ pub struct ResidentForward<'ctx> {
     /// GEMM Q4_K com tiling em LDS, para o prefill. Criada sempre; só entra no plano com
     /// `LLAMA_RS_PREFILL_GEMM=1` — ver [`gemm_prefill`].
     pub(crate) mul_mm_q4k: ComputePipeline,
+    /// O mesmo GEMM para Q5_K e Q6_K (`TIPO` = 1 e 2 no shader).
+    pub(crate) mul_mm_q5k: ComputePipeline,
+    pub(crate) mul_mm_q6k: ComputePipeline,
     // As mesmas quatro com COLS = VERIFY_TOK, para o plano de verify do MTP.
     pub(crate) matvec_v: ComputePipeline,
     pub(crate) matvec_q5k_v: ComputePipeline,
@@ -1211,6 +1233,10 @@ impl<'ctx> ResidentForward<'ctx> {
         };
         let mul_mm_q4k =
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols)])?;
+        let mul_mm_q5k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 1)])?;
+        let mul_mm_q6k =
+            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 2)])?;
         // Verify do MTP: `COLS = 2` fixo, com a geometria do **decode** e não a do prefill.
         // O que decide a ocupância é `ROWS_PER_WAVE * COLS` acumuladores vivos por lane, e
         // com duas colunas isso fica perto do decode (COLS=1) e longe das oito do bloco de
@@ -1298,6 +1324,8 @@ impl<'ctx> ResidentForward<'ctx> {
             matvec_q6k_b,
             matvec_q4k_b,
             mul_mm_q4k,
+            mul_mm_q5k,
+            mul_mm_q6k,
             matvec_v,
             matvec_q5k_v,
             matvec_q6k_v,
@@ -3505,6 +3533,8 @@ impl<'ctx> ResidentForward<'ctx> {
             PipeId::MatvecQ6KB => &self.matvec_q6k_b,
             PipeId::MatvecQ4KB => &self.matvec_q4k_b,
             PipeId::MulMmQ4K => &self.mul_mm_q4k,
+            PipeId::MulMmQ5K => &self.mul_mm_q5k,
+            PipeId::MulMmQ6K => &self.mul_mm_q6k,
             PipeId::MatvecV => &self.matvec_v,
             PipeId::MatvecQ5KV => &self.matvec_q5k_v,
             PipeId::MatvecQ6KV => &self.matvec_q6k_v,
@@ -3759,7 +3789,12 @@ impl<'ctx> ResidentForward<'ctx> {
             // shaders Q8_0 e Q6_K. O GEMM, quando ligado, só entra no bloco de prefill
             // (modo Batch) e cobre `BM` linhas por workgroup — o verify fica no matvec.
             let (pipe, rows_por_wg) = if matches!(largura, Modo::Batch) && gemm_para(cols, w.ty) {
-                (PipeId::MulMmQ4K, GEMM_LINHAS_POR_WG as usize)
+                let gemm = match w.ty {
+                    gguf::GgmlType::Q5_K => PipeId::MulMmQ5K,
+                    gguf::GgmlType::Q6_K => PipeId::MulMmQ6K,
+                    _ => PipeId::MulMmQ4K,
+                };
+                (gemm, GEMM_LINHAS_POR_WG as usize)
             } else {
                 match w.ty {
                     gguf::GgmlType::Q8_0 => (

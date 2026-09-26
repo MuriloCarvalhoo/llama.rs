@@ -54,6 +54,14 @@ layout(local_size_x = 256) in;
 // Colunas do tile = tokens do bloco de prefill. Multiplo de 8 (a grade de threads tem 8
 // grupos de coluna) e no maximo 64 (acima disso TN passa de 8 e os acumuladores estouram).
 layout(constant_id = 0) const uint COLS = 32u;
+// Tipo do peso: 0 = Q4_K, 1 = Q5_K, 2 = Q6_K. Só a carga e o desempacotamento do tile de
+// peso mudam — na LDS os três viram int8 com escala por sub-bloco, e o laço de conta é o
+// mesmo (o Q6_K com duas escalas por passo de K, porque o sub-bloco dele tem 16 elementos,
+// e sem termo de mínimo: o -32 já sai no desempacotamento).
+layout(constant_id = 1) const uint TIPO = 0u;
+const uint Q4K = 0u;
+const uint Q5K = 1u;
+const uint Q6K = 2u;
 
 const uint BM = 128u;          // linhas de saida por workgroup
 const uint BK = 32u;           // elementos de K por passo — o sub-bloco do Q4_K
@@ -68,6 +76,9 @@ const uint TN = COLS / COL_GRUPOS;               // colunas por thread
 const uint LDS_PASSO = 9u;
 
 layout(set = 0, binding = 0) readonly buffer WeightBuf { uvec4 w4[]; } weight_buf;
+// O mesmo buffer lido de 4 em 4 bytes: o superbloco Q6_K sobe alinhado em 212 bytes (53
+// uints), que não é múltiplo de 16.
+layout(set = 0, binding = 0) readonly buffer WeightBufU { uint w[]; } weight_u;
 // Ativacao quantizada: 8 ints por bloco de 32 (4 i8 empacotados cada).
 layout(set = 0, binding = 1) readonly buffer XqBuf { int xq[]; } xq_buf;
 layout(set = 0, binding = 2) readonly buffer XdBuf { float xd[]; } xd_buf;
@@ -81,12 +92,15 @@ layout(push_constant) uniform PC {
     uint tem_bias;
 } pc;
 
-const uint UVEC4_PER_SB = 9u;   // 144 bytes por superbloco Q4_K
+// uvec4 por superbloco: 144 bytes no Q4_K, 176 no Q5_K. O Q6_K conta em uints.
+const uint UVEC4_PER_SB = TIPO == Q5K ? 11u : 9u;
+const uint UINTS_PER_SB_Q6K = 53u;
 
 // Tile de peso: BM linhas x 32 int8, empacotados 4 por uint.
 shared uint lw[BM * LDS_PASSO];
-shared float lwsc[BM];    // d * sc do sub-bloco
-shared float lwoff[BM];   // -dmin * m do sub-bloco
+shared float lwsc[BM];    // d * sc do sub-bloco (no Q6_K, da primeira metade de 16)
+shared float lwsc2[BM];   // Q6_K: d * sc da segunda metade de 16
+shared float lwoff[BM];   // -dmin * m do sub-bloco (Q4_K/Q5_K)
 // Tile de ativacao: COLS colunas x 32 int8, mais escala e soma dos int8 por coluna.
 shared int lx[COLS * LDS_PASSO];
 shared float lxd[COLS];
@@ -115,19 +129,47 @@ uint wpack(uint qsw, bool hi) {
     return (hi ? (qsw >> 4u) : qsw) & 0x0F0F0F0Fu;
 }
 
-// Os loads globais de um passo de K para os registradores da thread: peso (cabeçalho do
-// superbloco e o uvec4 de `qs` da metade dela), ativação (um uint) e, nas COLS primeiras
-// threads, escala e os 8 uints do bloco para a soma do termo do `dmin`.
+// Os loads globais de um passo de K para os registradores da thread: peso (os bytes da
+// metade dela no passo, e o que for preciso para a escala), ativação (um uint) e, nas COLS
+// primeiras threads, escala e os 8 uints do bloco para a soma do termo do `dmin`.
+//
+// Q4_K/Q5_K: `hdr` = d|dmin + scales, `qs` = o uvec4 dos nibbles, `qh` = o uvec4 do 5º bit
+// (Q5_K). Q6_K: `qs` = 4 uints de `ql`, `qh` = 4 uints de `qh`, `hdr.x` = d, `hdr.y` = o
+// uint com a escala i8 do sub-bloco de 16 desta thread.
 void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, uint x_u,
-            uint t, inout uvec4 hdr, inout uvec4 qs, inout int xq, inout float xd,
-            inout int xs[8]) {
+            uint t, inout uvec4 hdr, inout uvec4 qs, inout uvec4 qh, inout int xq,
+            inout float xd, inout int xs[8]) {
     uint sb = k0 >> 8u;
     uint j = (k0 >> 5u) & 7u;
     uint blk = k0 >> 5u;
     if (lg < pc.n_out) {
-        uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
-        hdr = weight_buf.w4[b4];
-        qs = weight_buf.w4[b4 + 1u + (j >> 1u) * 2u + (w_alta ? 1u : 0u)];
+        if (TIPO == Q6K) {
+            // `linha4` conta uints aqui. O passo j cobre os sub-blocos de 16 `2j` e `2j+1`;
+            // no layout do ggml ficam na metade j/4 do superbloco, no quarto j%4 (ver
+            // `q6_k_matvec.comp`), com 16 bytes contíguos de `ql` e de `qh` para cada um.
+            uint bu = lg * linha4 + sb * UINTS_PER_SB_Q6K;
+            uint metade = j >> 2u;
+            uint quarto = j & 3u;
+            uint idx16 = w_alta ? 16u : 0u;
+            uint ql_u0 = (metade * 64u + (quarto & 1u) * 32u + idx16) >> 2u;
+            uint qh_u0 = (128u + metade * 32u + idx16) >> 2u;
+            qs = uvec4(weight_u.w[bu + ql_u0], weight_u.w[bu + ql_u0 + 1u],
+                       weight_u.w[bu + ql_u0 + 2u], weight_u.w[bu + ql_u0 + 3u]);
+            qh = uvec4(weight_u.w[bu + qh_u0], weight_u.w[bu + qh_u0 + 1u],
+                       weight_u.w[bu + qh_u0 + 2u], weight_u.w[bu + qh_u0 + 3u]);
+            uint sub = 2u * j + (w_alta ? 1u : 0u);
+            hdr.x = weight_u.w[bu + 52u];              // d nos bytes 208..209
+            hdr.y = weight_u.w[bu + ((192u + sub) >> 2u)];
+        } else {
+            uint b4 = lg * linha4 + sb * UVEC4_PER_SB;
+            hdr = weight_buf.w4[b4];
+            // No Q5_K `qh` são os uvec4 1..2 (os 32 bytes do 5º bit) e `qs` começa no 3.
+            uint qs0 = TIPO == Q5K ? 3u : 1u;
+            qs = weight_buf.w4[b4 + qs0 + (j >> 1u) * 2u + (w_alta ? 1u : 0u)];
+            if (TIPO == Q5K) {
+                qh = weight_buf.w4[b4 + 1u + (w_alta ? 1u : 0u)];
+            }
+        }
     }
     if (x_col < COLS) {
         xq = xq_buf.xq[(x_col * n_blk + blk) * 8u + x_u];
@@ -135,8 +177,18 @@ void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, 
     if (t < COLS) {
         uint cb = t * n_blk + blk;
         xd = xd_buf.xd[cb];
-        for (uint u = 0u; u < 8u; u++) { xs[u] = xq_buf.xq[cb * 8u + u]; }
+        // O Q6_K não tem termo de mínimo: a soma dos int8 da ativação não entra.
+        if (TIPO != Q6K) {
+            for (uint u = 0u; u < 8u; u++) { xs[u] = xq_buf.xq[cb * 8u + u]; }
+        }
     }
+}
+
+// Os 4 pesos de 6 bits do Q6_K menos 32, em int8 com sinal, sem borrow entre bytes: com o
+// bit 7 de cada byte ligado a subtração não empresta do vizinho, e o xor final desfaz o
+// bit — para b em 0..63, (b | 0x80) - 0x20 fica em 96..159, e o xor dá b - 32 mod 256.
+uint menos32(uint v) {
+    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
 }
 
 void main() {
@@ -144,7 +196,8 @@ void main() {
     uint linha0 = gl_WorkGroupID.x * BM;
 
     uint n_sb = pc.n_in / 256u;
-    uint linha4 = n_sb * UVEC4_PER_SB;   // uvec4 por linha de peso
+    // Tamanho da linha de peso: em uvec4 (Q4_K/Q5_K) ou em uints (Q6_K).
+    uint linha4 = n_sb * (TIPO == Q6K ? UINTS_PER_SB_Q6K : UVEC4_PER_SB);
     uint n_blk = pc.n_in / 32u;          // blocos de ativacao por coluna
 
     // Carga do tile de peso: duas threads por linha, uma para cada metade dos 32 elementos.
@@ -168,11 +221,12 @@ void main() {
     uint lg = linha0 + w_linha;
     uvec4 r_hdr = uvec4(0u);
     uvec4 r_qs = uvec4(0u);
+    uvec4 r_qh = uvec4(0u);
     int r_xq = 0;
     float r_xd = 0.0;
     int r_xs[8];
     for (uint u = 0u; u < 8u; u++) { r_xs[u] = 0; }
-    buscar(0u, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_xq, r_xd, r_xs);
+    buscar(0u, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_qh, r_xq, r_xd, r_xs);
 
     for (uint k0 = 0u; k0 < pc.n_in; k0 += BK) {
         uint j = (k0 >> 5u) & 7u;    // sub-bloco de 32 dentro do superbloco
@@ -180,13 +234,32 @@ void main() {
         // Fecha as leituras do passo anterior antes de sobrescrever a LDS.
         barrier();
 
-        if (lg < pc.n_out) {
+        uint dst = w_linha * LDS_PASSO + (w_alta ? 4u : 0u);
+        if (lg < pc.n_out && TIPO == Q6K) {
+            // Quarto j%4 do layout: nibble alto de `ql` nos quartos 2 e 3, e o par de bits
+            // de `qh` deslocado de 2*(j%4).
+            uint quarto = j & 3u;
+            bool hi = quarto >= 2u;
+            uint sh = quarto * 2u;
+            for (uint u = 0u; u < 4u; u++) {
+                uint v = ((hi ? (r_qs[u] >> 4u) : r_qs[u]) & 0x0F0F0F0Fu)
+                       | (((r_qh[u] >> sh) & 0x03030303u) << 4u);
+                lw[dst + u] = menos32(v);
+            }
+            uint sub = 2u * j + (w_alta ? 1u : 0u);
+            float ds = unpackHalf2x16(r_hdr.x).x
+                     * float(int(((r_hdr.y >> (8u * (sub & 3u))) & 0xFFu) << 24u) >> 24);
+            if (w_alta) { lwsc2[w_linha] = ds; } else { lwsc[w_linha] = ds; }
+        } else if (lg < pc.n_out) {
             bool hi = (j & 1u) != 0u;
-            uint dst = w_linha * LDS_PASSO + (w_alta ? 4u : 0u);
-            lw[dst + 0u] = wpack(r_qs.x, hi);
-            lw[dst + 1u] = wpack(r_qs.y, hi);
-            lw[dst + 2u] = wpack(r_qs.z, hi);
-            lw[dst + 3u] = wpack(r_qs.w, hi);
+            for (uint u = 0u; u < 4u; u++) {
+                uint v = wpack(r_qs[u], hi);
+                if (TIPO == Q5K) {
+                    // O 5º bit do elemento i do sub-bloco j é o bit j do byte i de `qh`.
+                    v |= ((r_qh[u] >> j) & 0x01010101u) << 4u;
+                }
+                lw[dst + u] = v;
+            }
             if (!w_alta) {
                 vec2 dm = unpackHalf2x16(r_hdr.x);   // .x = d, .y = dmin
                 uint sc, m;
@@ -197,6 +270,7 @@ void main() {
         } else if (!w_alta) {
             // Linha fora da matriz: zera a escala para o resultado dela ser inofensivo.
             lwsc[w_linha] = 0.0;
+            lwsc2[w_linha] = 0.0;
             lwoff[w_linha] = 0.0;
         }
         if (x_col < COLS) {
@@ -206,8 +280,10 @@ void main() {
             lxd[t] = r_xd;
             // Soma dos int8 do bloco, para o termo do `dmin`. So depende da coluna.
             int isx = 0;
-            for (uint u = 0u; u < 8u; u++) {
-                isx = dotPacked4x8AccSatEXT(0x01010101, r_xs[u], isx);
+            if (TIPO != Q6K) {
+                for (uint u = 0u; u < 8u; u++) {
+                    isx = dotPacked4x8AccSatEXT(0x01010101, r_xs[u], isx);
+                }
             }
             lxs[t] = float(isx);
         }
@@ -215,7 +291,8 @@ void main() {
         barrier();
 
         if (k0 + BK < pc.n_in) {
-            buscar(k0 + BK, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_xq, r_xd, r_xs);
+            buscar(k0 + BK, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_qh, r_xq, r_xd,
+                   r_xs);
         }
 
         // As colunas desta thread saem da LDS uma vez e servem as TM linhas.
@@ -235,14 +312,26 @@ void main() {
             uint rr = r * LINHA_GRUPOS + ti;
             float sc = lwsc[rr];
             float off = lwoff[rr];
+            float sc2 = TIPO == Q6K ? lwsc2[rr] : 0.0;
             int w[8];
             for (uint u = 0u; u < 8u; u++) { w[u] = int(lw[rr * LDS_PASSO + u]); }
             for (uint c = 0u; c < TN; c++) {
-                int isum = 0;
-                for (uint u = 0u; u < 8u; u++) {
-                    isum = dotPacked4x8AccSatEXT(w[u], xr[c * 8u + u], isum);
+                if (TIPO == Q6K) {
+                    // Duas metades de 16, cada uma com a sua escala.
+                    int i0 = 0;
+                    int i1 = 0;
+                    for (uint u = 0u; u < 4u; u++) {
+                        i0 = dotPacked4x8AccSatEXT(w[u], xr[c * 8u + u], i0);
+                        i1 = dotPacked4x8AccSatEXT(w[u + 4u], xr[c * 8u + u + 4u], i1);
+                    }
+                    acc[r * TN + c] += xd_c[c] * (sc * float(i0) + sc2 * float(i1));
+                } else {
+                    int isum = 0;
+                    for (uint u = 0u; u < 8u; u++) {
+                        isum = dotPacked4x8AccSatEXT(w[u], xr[c * 8u + u], isum);
+                    }
+                    acc[r * TN + c] += xd_c[c] * (sc * float(isum) + off * xs_c[c]);
                 }
-                acc[r * TN + c] += xd_c[c] * (sc * float(isum) + off * xs_c[c]);
             }
         }
     }

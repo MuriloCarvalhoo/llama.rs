@@ -1407,36 +1407,40 @@ fn gemm_em_lds_bate_com_o_matvec_q4k() {
     let dev = llama_vulkan::VulkanDevice::create(&ctx, &phys[0]).unwrap();
 
     let n_in = 1024usize;
-    let w = QuantK::Q4.pesos(300, n_in / 256);
+    // Os três K-quants que o prefill manda pelo GEMM (Q5_K e Q6_K desde 2026-09-26): o
+    // laço de conta é o mesmo, muda o desempacotamento do tile de peso.
+    for q in [QuantK::Q4, QuantK::Q5, QuantK::Q6] {
+        let w = q.pesos(300, n_in / 256);
+        // 300 linhas: dois workgroups cheios (128 + 128) e um de 44, que exercita a guarda.
+        for n_out in [128usize, 300] {
+            for cols in [8usize, 16, 32] {
+                let x: Vec<f32> = (0..cols * n_in)
+                    .map(|i| ((i % 37) as f32 - 18.0) * 0.021)
+                    .collect();
+                let gemm = q.gemm(&ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols);
+                let mv = q.dispatch(&ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols);
 
-    // 300 linhas: dois workgroups cheios (128 + 128) e um de 44, que exercita a guarda.
-    for n_out in [128usize, 300] {
-        for cols in [8usize, 16, 32] {
-            let x: Vec<f32> = (0..cols * n_in)
-                .map(|i| ((i % 37) as f32 - 18.0) * 0.021)
-                .collect();
-            let gemm = llama_vulkan::matmul::dispatch_mul_mm_q4k(
-                &ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols,
-            )
-            .expect("dispatch mul_mm");
-            let mv = QuantK::Q4.dispatch(&ctx, &phys[0], &dev, &w, &x, n_in, n_out, cols);
-
-            assert_eq!(gemm.len(), mv.len());
-            let escala = mv.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
-            let (i_pior, pior) = gemm
-                .iter()
-                .zip(&mv)
-                .enumerate()
-                .map(|(i, (a, b))| (i, (a - b).abs() / escala))
-                .fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
-            eprintln!("mul_mm n_out={n_out} cols={cols}: erro rel máx {pior:.3e}");
-            assert!(
-                pior < 1e-5,
-                "GEMM divergiu do matvec em n_out={n_out} cols={cols}: \
-                 índice {i_pior}, rel {pior} (gemm={} mv={})",
-                gemm[i_pior],
-                mv[i_pior]
-            );
+                assert_eq!(gemm.len(), mv.len());
+                let escala = mv.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                let (i_pior, pior) = gemm
+                    .iter()
+                    .zip(&mv)
+                    .enumerate()
+                    .map(|(i, (a, b))| (i, (a - b).abs() / escala))
+                    .fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+                eprintln!(
+                    "mul_mm {} n_out={n_out} cols={cols}: erro rel máx {pior:.3e}",
+                    q.nome()
+                );
+                assert!(
+                    pior < 1e-5,
+                    "GEMM {} divergiu do matvec em n_out={n_out} cols={cols}: \
+                     índice {i_pior}, rel {pior} (gemm={} mv={})",
+                    q.nome(),
+                    gemm[i_pior],
+                    mv[i_pior]
+                );
+            }
         }
     }
 }
@@ -1491,6 +1495,28 @@ impl QuantK {
             }
         }
         w
+    }
+
+    /// O GEMM do prefill (`mul_mm.comp`) para este tipo.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(
+        self,
+        ctx: &llama_vulkan::VulkanContext,
+        phys: &llama_vulkan::VulkanPhysicalDevice,
+        dev: &llama_vulkan::VulkanDevice,
+        w: &[u8],
+        x: &[f32],
+        n_in: usize,
+        n_out: usize,
+        cols: usize,
+    ) -> Vec<f32> {
+        use llama_vulkan::matmul::{dispatch_mul_mm_q4k, dispatch_mul_mm_q5k, dispatch_mul_mm_q6k};
+        let r = match self {
+            Self::Q4 => dispatch_mul_mm_q4k(ctx, phys, dev, w, x, n_in, n_out, cols),
+            Self::Q5 => dispatch_mul_mm_q5k(ctx, phys, dev, w, x, n_in, n_out, cols),
+            Self::Q6 => dispatch_mul_mm_q6k(ctx, phys, dev, w, x, n_in, n_out, cols),
+        };
+        r.unwrap_or_else(|e| panic!("mul_mm {} cols={cols} falhou: {e:?}", self.nome()))
     }
 
     #[allow(clippy::too_many_arguments)]
