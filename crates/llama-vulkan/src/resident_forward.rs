@@ -116,6 +116,27 @@ fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
 /// estouram os registradores, e o prefill tem de ir pelo GEMM.
 const MATVEC_COLS_MAX: usize = 32;
 
+/// Pico e atual de RAM do processo (`VmHWM`/`VmRSS` de `/proc/self/status`), no perfil.
+/// Inclui o mmap do GGUF que foi tocado, que é a maior parte num modelo grande.
+pub(crate) fn imprimir_ram_do_processo() {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    let kb = |chave: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(chave))
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+    };
+    if let (Some(pico), Some(atual)) = (kb("VmHWM:"), kb("VmRSS:")) {
+        eprintln!(
+            "[prof] RAM do processo: pico {} MiB, atual {} MiB",
+            pico >> 10,
+            atual >> 10
+        );
+    }
+}
+
 /// Largura do plano do **resto**: com o bloco de prefill maior que isto, o que sobra de um
 /// prompt depois dos blocos cheios vai em blocos de 32 antes de cair token a token. Sem ele,
 /// com o bloco de 256 até 255 tokens iriam pelo decode, a ~40 ms cada — 10 s num turno.
@@ -4858,6 +4879,22 @@ impl<'ctx> ResidentForward<'ctx> {
         let Some(st) = self.state.as_ref() else {
             return;
         };
+        if st.prof.is_some() {
+            let phys = self.phys();
+            let mib = |b: Option<u64>| b.map_or("?".to_owned(), |b| (b >> 20).to_string());
+            eprintln!(
+                "[prof] VRAM GPU{}: {} MiB deste processo, {} MiB livres (margem {} MiB)",
+                self.phys_idx,
+                mib(phys.vram_do_processo(self.ctx)),
+                mib(phys.free_device_memory(self.ctx)),
+                phys.margem_vram() >> 20
+            );
+            // Um shard só é o modelo inteiro: aqui é o processo todo. No layer-split quem
+            // imprime é o `LayerSplitForward`, depois dos shards.
+            if st.cfg.shard.is_first() && st.cfg.shard.is_last() {
+                imprimir_ram_do_processo();
+            }
+        }
         self.perfil_de(st, Modo::Decode);
         self.perfil_de(st, Modo::Batch);
         self.perfil_de(st, Modo::Verify);

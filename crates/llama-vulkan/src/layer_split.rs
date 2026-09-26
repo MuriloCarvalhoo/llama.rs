@@ -177,6 +177,9 @@ impl<'ctx> LayerSplitForward<'ctx> {
             );
             s.print_profile();
         }
+        if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
+            crate::resident_forward::imprimir_ram_do_processo();
+        }
     }
 
     /// Rótulos das ops do plano do shard `s`.

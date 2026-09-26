@@ -8,6 +8,8 @@ LLAMA_RS_PROFILE=1 ./target/release/llama-cli -m modelo.gguf -p "..." --gpu-laye
 
 Imprime ms/token por operação de GPU (matvec, attention, norm, ...) e o custo de host por fase
 (gravação do command buffer, submit+fence, leitura do resultado) — ver `LayerSplitForward::print_profile`.
+Também a VRAM que o processo ocupa em cada GPU (e a livre, contra a margem de
+`VulkanPhysicalDevice::margem_vram`) e o pico e o atual de RAM do processo (`VmHWM`/`VmRSS`).
 
 ## Timeline cronológica CPU + GPU
 

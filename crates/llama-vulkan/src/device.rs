@@ -119,6 +119,17 @@ impl VulkanPhysicalDevice {
     /// PCIe) e a banda efetiva do matvec despenca — medimos 95 GB/s contra 714 GB/s
     /// para o mesmo modelo na GPU sem display.
     pub fn free_device_memory(&self, ctx: &VulkanContext) -> Option<u64> {
+        self.orcamento_vram(ctx).map(|(_, livre)| livre)
+    }
+
+    /// VRAM que **este processo** ocupa nos heaps DEVICE_LOCAL, pelo mesmo
+    /// `VK_EXT_memory_budget` (é o `heapUsage`, que conta só as alocações do processo).
+    pub fn vram_do_processo(&self, ctx: &VulkanContext) -> Option<u64> {
+        self.orcamento_vram(ctx).map(|(usada, _)| usada)
+    }
+
+    /// `(usada pelo processo, livre para ele)` nos heaps DEVICE_LOCAL.
+    fn orcamento_vram(&self, ctx: &VulkanContext) -> Option<(u64, u64)> {
         let exts = unsafe {
             ctx.instance
                 .enumerate_device_extension_properties(self.handle)
@@ -144,15 +155,17 @@ impl VulkanPhysicalDevice {
         };
         let mem = props2.memory_properties;
         let mut free = 0u64;
+        let mut usada = 0u64;
         for i in 0..mem.memory_heap_count as usize {
             if mem.memory_heaps[i]
                 .flags
                 .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
             {
                 free += budget.heap_budget[i].saturating_sub(budget.heap_usage[i]);
+                usada += budget.heap_usage[i];
             }
         }
-        Some(free)
+        Some((usada, free))
     }
     pub fn subgroup_size(&self) -> u32 {
         self.subgroup_size
