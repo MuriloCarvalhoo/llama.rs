@@ -821,7 +821,16 @@ fn atencao_com_split_bate_com_a_de_um_workgroup() {
         (14, 2, 64, 5, 2),
         (14, 2, 64, 9, 2),
     ] {
-        attention_caso_split(&fwd, n_head, n_head_kv, head_dim, total_len, n_split);
+        attention_caso_split(&fwd, n_head, n_head_kv, head_dim, total_len, n_split, 1);
+    }
+    // Blocos de tokens (o verify do MTP tem 3, o prefill 32 ou 256): cada token tem a sua
+    // máscara causal, e com isso a sua fatia do KV.
+    for (n_head, n_head_kv, head_dim, total_len, n_split, n_tok) in [
+        (24, 4, 256, 3000, 16, 3),
+        (24, 4, 256, 70, 16, 3), // fatias de 5 posições: o fim do ladrilho muda por token
+        (40, 8, 128, 300, 4, 5),
+    ] {
+        attention_caso_split(&fwd, n_head, n_head_kv, head_dim, total_len, n_split, n_tok);
     }
 }
 
@@ -832,9 +841,10 @@ fn attention_caso_split(
     head_dim: usize,
     total_len: usize,
     n_split: usize,
+    n_tok: usize,
 ) {
     let kv_dim = n_head_kv * head_dim;
-    let q: Vec<f32> = (0..n_head * head_dim)
+    let q: Vec<f32> = (0..n_tok * n_head * head_dim)
         .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
         .collect();
     let kc: Vec<f32> = (0..total_len * kv_dim)
@@ -845,11 +855,11 @@ fn attention_caso_split(
         .collect();
 
     let base = fwd
-        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1)
+        .dbg_attention(&q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_tok)
         .unwrap();
     let split = fwd
         .dbg_attention_split(
-            &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, 1, n_split,
+            &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_tok, n_split,
         )
         .unwrap();
 
@@ -861,7 +871,8 @@ fn attention_caso_split(
         .fold(0.0f32, f32::max);
     assert!(
         pior < 1e-5,
-        "split={n_split} total_len={total_len} head_dim={head_dim}: pior diferença {pior:.2e}"
+        "split={n_split} total_len={total_len} head_dim={head_dim} n_tok={n_tok}: \
+         pior diferença {pior:.2e}"
     );
 }
 
@@ -2158,4 +2169,56 @@ fn atencao_fatiada_e_mais_rapida_com_kv_longo() {
         fatiado * 1e3,
         curto * 1e3
     );
+}
+
+/// Bancada: a atenção relê o KV uma vez por cabeça de **query**. Compara `n_head_kv = 4` (6
+/// cabeças por KV, como o Qwen3.8-27B) com `n_head_kv = 24` (6× mais KV, nenhum
+/// compartilhado), com várias fatias. Rodar com o pstate fixo (`segura_pstate.py peak`): com
+/// o DPM automático a GPU ociosa entre despachos mede o clock baixo.
+///
+/// Medido em 2026-09-26, 29k posições: 0,66–0,72 ms com 4 cabeças KV contra 1,08 com 24 —
+/// a L2 já segura boa parte das releituras (os bytes por cabeça passam de 1 TB/s). O piso é
+/// ~0,2 ms (o KV único a ~700 GB/s, e a conta do softmax dá o mesmo), mas nem juntar as
+/// cabeças do grupo num workgroup nem buscar o K/V do passo seguinte antes o aproximaram:
+/// ver `docs/planos/2026-09-26-decisoes-autonomas.md`.
+#[test]
+#[ignore = "bancada de desempenho: ocupa a GPU e só imprime"]
+fn bancada_atencao_gqa() {
+    use llama_vulkan::{ResidentForward, VulkanContext};
+
+    let Ok(ctx) = VulkanContext::new() else {
+        return;
+    };
+    if ctx.amd_compute_devices().is_empty() {
+        return;
+    }
+    let fwd = ResidentForward::new_pipelines_only(&ctx).unwrap();
+    let (n_head, head_dim, total_len) = (24, 256, 29000);
+    let q: Vec<f32> = (0..n_head * head_dim)
+        .map(|i| ((i % 19) as f32) * 0.05 - 0.4)
+        .collect();
+    for (n_head_kv, n_split) in [(4usize, 16usize), (4, 32), (4, 64), (4, 96), (24, 16)] {
+        let kv_dim = n_head_kv * head_dim;
+        let kc: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+            .collect();
+        let vc: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 29) as f32) * 0.02 - 0.2)
+            .collect();
+        let t = fwd
+            .dbg_attention_bench(
+                &q, &kc, &vc, n_head, n_head_kv, head_dim, total_len, n_split, 20,
+            )
+            .unwrap();
+        let unico = (2 * total_len * kv_dim * 2) as f64;
+        let lido = (2 * total_len * n_head * head_dim * 2) as f64;
+        eprintln!(
+            "n_head_kv={n_head_kv} n_split={n_split}: {:.3} ms | KV único {:.0} MB ({:.0} GB/s) | lido por cabeça {:.0} MB ({:.0} GB/s)",
+            t * 1e3,
+            unico / 1e6,
+            unico / t / 1e9,
+            lido / 1e6,
+            lido / t / 1e9
+        );
+    }
 }

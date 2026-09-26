@@ -79,6 +79,25 @@ e como desfazer.
    1e-5 por matriz. A diferença é a requantização em int8 de cada camada virando outro
    arredondamento. Tolerância passou a 2e-2, com o argmax igual ainda exigido.
 
+10. **Atenção do contexto fundo: medi, tentei dois kernels, nenhum ficou.** O perfil a 29k
+    mostra a atenção em 27% do decode, 39% do verify do MTP (2,8× a do decode, porque cada
+    um dos 3 tokens relê o KV) e 49–54% do prefill. Hipótese: cada uma das 24 cabeças relê o
+    KV da sua cabeça KV, que é o mesmo das outras 5 do grupo (GQA). A bancada nova
+    (`bancada_atencao_gqa`, com o pstate fixo em `peak`) desmentiu metade: o split16 com 4
+    cabeças KV leva 0,66–0,72 ms, contra 1,08 com 24, e os bytes lidos por cabeça passam de
+    1 TB/s, ou seja, a L2 já segura boa parte das releituras. O piso seria ~0,2 ms.
+    - Kernel com as cabeças do grupo lendo um ladrilho de K/V da LDS: 1,1–1,3 ms (uma wave
+      por cabeça percorria a fatia inteira em série).
+    - Kernel com até 4 cabeças por wave, lendo K/V da memória: 0,9 ms no melhor número de
+      fatias. Com o `head_dim` do push constant ele gerava 700 desvios e levava 7,9 ms.
+    - Buscar o K/V do passo seguinte antes da conta no split16: 0,70–0,76 ms, sem ganho —
+      então não é latência de memória.
+    **Não entrou nada.** Descobrir o que limita o split16 pede o RGP, não mais tentativas.
+    Ficaram a bancada e casos de 3 e 5 tokens no teste de correção da atenção fatiada.
+    Achado de passagem: os dois GEMM do prefill com 16 KB de LDS usam 256 VGPRs e derramam
+    115–123 registradores (15 KB de scratch cada) — `RADV_DEBUG=shaderstats,nocache` com
+    `MESA_SHADER_CACHE_DISABLE=true`. Candidato forte para o 1.2.
+
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao
