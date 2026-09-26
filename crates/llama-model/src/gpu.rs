@@ -620,25 +620,64 @@ pub fn gerar_streaming_residente(
     // onde o perfil por fase (`LLAMA_RS_LOAD_PROFILE=1`) tem o que dizer.
     crate::perfil_carga::imprimir();
     let prompt_ids = tokenizer.encode(prompt, config.add_bos);
+    gerar_ids_residente(
+        config,
+        &prompt_ids,
+        n_tokens,
+        sampler,
+        rng,
+        gpu,
+        &mut |id| {
+            on_token(&tokenizer.decode(&[id]));
+        },
+    )
+}
+
+/// O laço de [`gerar_streaming_residente`] sobre ids, sem tokenizer — é o que os testes
+/// exercitam com um backend simulado.
+///
+/// Respeita o fim do contexto como o motor do servidor: no máximo `ctx - prompt` tokens
+/// emitidos, o laço termina **antes** do passo que processaria um token que ninguém vai
+/// ler, e o MTP só roda com espaço para as [`VERIFY_TOK`] posições do verify — sem ele, o
+/// resto segue token a token. Antes, perto do fim do contexto, o verify ou o decode
+/// passavam de `ctx` e o backend recusava no meio da geração.
+fn gerar_ids_residente(
+    config: &LlamaConfig,
+    prompt_ids: &[u32],
+    n_tokens: usize,
+    sampler: &llama_sampling::Sampler,
+    rng: &mut impl rand::Rng,
+    gpu: &dyn GpuResidentDecode,
+    on_id: &mut impl FnMut(u32),
+) -> Result<(), ModelError> {
     if prompt_ids.is_empty() {
         return Err(ModelError::Gpu("prompt vazio".into()));
     }
+    if prompt_ids.len() >= config.ctx {
+        return Err(ModelError::ContextOverflow(prompt_ids.len(), config.ctx));
+    }
     gpu.reset();
-    let (mut logits, mut pos, mut hidden) = prefill_residente(gpu, &prompt_ids)?;
+    let (mut logits, mut pos, mut hidden) = prefill_residente(gpu, prompt_ids)?;
     let first_idx = sampler.sample(&logits, rng);
     let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
     let usar_mtp = gpu.tem_mtp();
+    // O último token emitido não passa pelo modelo, então `ctx - prompt` emitidos nunca
+    // escrevem além da posição `ctx - 1`.
+    let teto = n_tokens.min(config.ctx - prompt_ids.len());
 
     let mut count = 0usize;
-    while count < n_tokens {
+    while count < teto {
         if next == config.eos_id {
             break;
         }
-        let piece = tokenizer.decode(&[next]);
-        on_token(&piece);
+        on_id(next);
         count += 1;
+        if count >= teto {
+            break;
+        }
 
-        if usar_mtp {
+        // `next` vai para a posição `pos`; o verify escreve dali até `pos + VERIFY_TOK - 1`.
+        if usar_mtp && pos + VERIFY_TOK <= config.ctx {
             let passo = passo_mtp(gpu, sampler, rng, next, hidden, pos, config.vocab)?;
             pos = passo.pos;
             hidden = passo.hidden;
@@ -646,10 +685,10 @@ pub fn gerar_streaming_residente(
                 if aceito == config.eos_id {
                     return Ok(());
                 }
-                if count >= n_tokens {
+                if count >= teto {
                     return Ok(());
                 }
-                on_token(&tokenizer.decode(&[aceito]));
+                on_id(aceito);
                 count += 1;
             }
             next = passo.seguinte;
@@ -1259,6 +1298,151 @@ mod tests {
 
         assert_eq!(cpu_out, gpu_out, "saída GPU(mock) deve igualar CPU");
         eprintln!("generate_streaming_gpu(mock) == CPU: {gpu_out:?}");
+    }
+
+    /// Backend simulado para o laço de geração: o próximo token é sempre `1` (não é EOS) e
+    /// ele recusa escrever além do contexto como o `ResidentForward` — `pos >= ctx` no
+    /// decode, `pos0 + VERIFY_TOK > ctx` no verify. `aceita` decide se a cabeça acerta.
+    struct FimDoContexto {
+        ctx: usize,
+        mtp: bool,
+        aceita: bool,
+    }
+
+    impl FimDoContexto {
+        const VOCAB: usize = 4;
+        fn logits() -> Vec<f32> {
+            let mut v = vec![0.0; Self::VOCAB];
+            v[1] = 1.0;
+            v
+        }
+    }
+
+    impl GpuResidentDecode for FimDoContexto {
+        fn decode(&self, _token: u32, pos: usize) -> Result<Vec<f32>, ModelError> {
+            if pos >= self.ctx {
+                return Err(ModelError::ContextOverflow(pos, self.ctx));
+            }
+            Ok(Self::logits())
+        }
+        fn reset(&self) {}
+        fn tem_mtp(&self) -> bool {
+            self.mtp
+        }
+        fn propor_mtp(&self, _token: u32, _hidden_idx: usize) -> Result<u32, ModelError> {
+            Ok(if self.aceita { 1 } else { 2 })
+        }
+        fn decode_verify(
+            &self,
+            _tokens: &[u32; VERIFY_TOK],
+            pos0: usize,
+        ) -> Result<Vec<f32>, ModelError> {
+            if pos0 + VERIFY_TOK > self.ctx {
+                return Err(ModelError::ContextOverflow(pos0 + VERIFY_TOK, self.ctx));
+            }
+            Ok((0..VERIFY_TOK).flat_map(|_| Self::logits()).collect())
+        }
+        fn rollback_verify(&self, _manter: usize) -> Result<(), ModelError> {
+            Ok(())
+        }
+    }
+
+    fn cfg_teste(ctx: usize) -> LlamaConfig {
+        LlamaConfig {
+            n_embd: 8,
+            n_layer: 1,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 8,
+            n_ff: 8,
+            rope_dim: 8,
+            rms_eps: 1e-6,
+            freq_base: 10_000.0,
+            vocab: FimDoContexto::VOCAB,
+            ctx,
+            bos_id: 0,
+            eos_id: 3,
+            delta_net: None,
+            n_layer_nextn: 0,
+            add_bos: false,
+        }
+    }
+
+    /// O E01 do servidor, no laço do CLI: perto do fim do contexto a geração termina com o
+    /// cache cheio, sem o backend recusar um verify ou um decode além de `ctx`.
+    #[test]
+    fn geracao_para_no_fim_do_contexto_com_e_sem_mtp() {
+        use rand::{SeedableRng, rngs::SmallRng};
+        let prompt = [0u32, 2, 2, 2, 2];
+        for folga in [1usize, 2, 3, 4, 10] {
+            let ctx = prompt.len() + folga;
+            for (mtp, aceita) in [(false, false), (true, true), (true, false)] {
+                let gpu = FimDoContexto { ctx, mtp, aceita };
+                let mut rng = SmallRng::seed_from_u64(0);
+                let mut saida = Vec::new();
+                gerar_ids_residente(
+                    &cfg_teste(ctx),
+                    &prompt,
+                    1000,
+                    &make_greedy_sampler(),
+                    &mut rng,
+                    &gpu,
+                    &mut |id| saida.push(id),
+                )
+                .unwrap_or_else(|e| panic!("folga {folga}, mtp {mtp}, aceita {aceita}: {e}"));
+                assert_eq!(
+                    saida.len(),
+                    folga,
+                    "folga {folga}, mtp {mtp}, aceita {aceita}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn geracao_respeita_n_tokens_antes_do_contexto() {
+        use rand::{SeedableRng, rngs::SmallRng};
+        let gpu = FimDoContexto {
+            ctx: 64,
+            mtp: true,
+            aceita: true,
+        };
+        let mut saida = Vec::new();
+        gerar_ids_residente(
+            &cfg_teste(64),
+            &[0, 2],
+            7,
+            &make_greedy_sampler(),
+            &mut SmallRng::seed_from_u64(0),
+            &gpu,
+            &mut |id| saida.push(id),
+        )
+        .unwrap();
+        assert_eq!(saida.len(), 7);
+    }
+
+    #[test]
+    fn prompt_que_enche_o_contexto_e_erro_e_nao_panico() {
+        use rand::{SeedableRng, rngs::SmallRng};
+        let gpu = FimDoContexto {
+            ctx: 4,
+            mtp: false,
+            aceita: false,
+        };
+        let r = gerar_ids_residente(
+            &cfg_teste(4),
+            &[0, 2, 2, 2],
+            8,
+            &make_greedy_sampler(),
+            &mut SmallRng::seed_from_u64(0),
+            &gpu,
+            &mut |_| {},
+        );
+        assert!(
+            matches!(r, Err(ModelError::ContextOverflow(4, 4))),
+            "{:?}",
+            r.err()
+        );
     }
 
     #[test]
