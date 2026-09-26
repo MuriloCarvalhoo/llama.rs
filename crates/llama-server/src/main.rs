@@ -1,7 +1,9 @@
 //! Servidor OpenAI-compatível para o backend residente.
 //!
-//! Uma requisição por vez, de propósito: os pesos são residentes e o decode ocupa as
+//! Uma geração por vez, de propósito: os pesos são residentes e o decode ocupa as
 //! duas GPUs inteiras: paralelizar requisições só disputaria a mesma banda de memória.
+//! As outras esperam numa fila curta, e `/health` responde durante a geração — ver
+//! `servidor.rs`.
 
 use std::path::PathBuf;
 
@@ -21,9 +23,22 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: String,
 
-    /// Teto do contexto (KV-cache). Custa VRAM: ~136 KB por token no Qwen3.8-27B.
+    /// Teto do contexto (KV-cache). Custa VRAM: 64 KiB por token no Qwen3.8-27B (16 camadas
+    /// de atenção × kv_dim 1024 × K e V × 2 B do f16), 2 GiB em 32k — mais os snapshots do
+    /// MTP com `--mtp`.
     #[arg(long, default_value_t = 32768)]
     ctx: usize,
+
+    /// Segundos sem receber nada do cliente enquanto ele manda a requisição, antes do 408.
+    /// Protege a thread do HTTP de conexão que abre e não fala (o prazo é por leitura, não
+    /// da requisição inteira).
+    #[arg(long = "timeout-leitura", default_value_t = 30)]
+    timeout_leitura: u64,
+
+    /// Segundos que uma escrita no socket pode ficar bloqueada. Cliente que para de ler o
+    /// stream estoura esse prazo, e a geração dele é cancelada em vez de travar a fila.
+    #[arg(long = "timeout-escrita", default_value_t = 60)]
+    timeout_escrita: u64,
 
     /// Nome do modelo exposto na API (o padrão é o nome do arquivo).
     #[arg(long)]
@@ -59,8 +74,13 @@ fn servir(_args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "gpu")]
 fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     use llama_server::motor::Motor;
-    use llama_server::servidor::laco;
+    use llama_server::servidor::{Prazos, laco};
     use llama_vulkan::{LayerSplitForward, ResidentForward, VulkanContext};
+
+    let prazos = Prazos {
+        leitura: std::time::Duration::from_secs(args.timeout_leitura),
+        escrita: std::time::Duration::from_secs(args.timeout_escrita),
+    };
 
     // SAFETY: mapeamento read-only de um arquivo tratado como imutável enquanto o
     // servidor roda — mesma premissa do mmap do llama.cpp e do llama-cli.
@@ -105,6 +125,7 @@ fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             &args.bind,
             &nome,
             Motor::novo(&tokenizer, &backend, cfg.ctx, cfg.eos_id),
+            prazos,
         )
     } else {
         let backend =
@@ -114,6 +135,7 @@ fn servir(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             &args.bind,
             &nome,
             Motor::novo(&tokenizer, &backend, cfg.ctx, cfg.eos_id),
+            prazos,
         )
     }
 }

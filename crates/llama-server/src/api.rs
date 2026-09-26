@@ -17,6 +17,9 @@ pub enum ApiError {
     SemMensagens,
     #[error("{0}")]
     Chat(String),
+    /// Parâmetro que muda a resposta e chegou fora do que o servidor atende.
+    #[error("{0}")]
+    Parametro(String),
 }
 
 #[derive(Debug, Clone)]
@@ -77,12 +80,48 @@ pub fn parse_pedido(corpo: &[u8]) -> Result<Pedido, ApiError> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ApiError::Chat(e.to_string()))?;
 
-    let numero = |campo: &str| v.get(campo).and_then(Value::as_f64);
-    let inteiro = |campo: &str| {
-        v.get(campo)
-            .and_then(Value::as_u64)
+    // Parâmetro que muda a resposta e chega inválido é erro, não default silencioso: antes
+    // `max_tokens: -1` virava "sem limite" e `temperature: 5` passava direto. `null` vale
+    // como ausente — é como vários clientes mandam os campos opcionais.
+    let campo = |nome: &str| v.get(nome).filter(|x| !x.is_null());
+    let numero =
+        |nome: &str, faixa: &str, ok: fn(f64) -> bool| match campo(nome) {
+            None => Ok(None),
+            Some(x) => x.as_f64().filter(|&n| ok(n)).map(Some).ok_or_else(|| {
+                ApiError::Parametro(format!("`{nome}` tem de ser um número {faixa}"))
+            }),
+        };
+    let inteiro = |nome: &str, minimo: usize| match campo(nome) {
+        None => Ok(None),
+        Some(x) => x
+            .as_u64()
             .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n >= minimo)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::Parametro(format!("`{nome}` tem de ser um inteiro >= {minimo}"))
+            }),
     };
+    let max_tokens = inteiro("max_tokens", 1)?;
+    let max_completion_tokens = inteiro("max_completion_tokens", 1)?;
+    let temperatura = numero("temperature", "entre 0 e 2", |t| (0.0..=2.0).contains(&t))?;
+    let top_p = numero("top_p", "em (0, 1]", |p| p > 0.0 && p <= 1.0)?;
+    let top_k = inteiro("top_k", 0)?;
+    // Uma escolha por pedido e texto livre: aceitar `n: 2` ou `json_object` e devolver uma
+    // escolha em texto livre parece atendido e não é.
+    if campo("n").is_some_and(|n| n.as_u64() != Some(1)) {
+        return Err(ApiError::Parametro(
+            "`n` só aceita 1: o servidor gera uma escolha por pedido".to_owned(),
+        ));
+    }
+    if let Some(formato) = campo("response_format") {
+        let tipo = formato.get("type").and_then(Value::as_str).unwrap_or("?");
+        if tipo != "text" {
+            return Err(ApiError::Parametro(format!(
+                "`response_format` `{tipo}` não é suportado; só `text`"
+            )));
+        }
+    }
     Ok(Pedido {
         modelo: v
             .get("model")
@@ -96,12 +135,12 @@ pub fn parse_pedido(corpo: &[u8]) -> Result<Pedido, ApiError> {
             .cloned()
             .unwrap_or_default(),
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        max_tokens: inteiro("max_tokens").or_else(|| inteiro("max_completion_tokens")),
+        max_tokens: max_tokens.or(max_completion_tokens),
         #[allow(clippy::cast_possible_truncation)]
-        temperatura: numero("temperature").map_or(TEMP_PADRAO, |t| t as f32),
+        temperatura: temperatura.map_or(TEMP_PADRAO, |t| t as f32),
         #[allow(clippy::cast_possible_truncation)]
-        top_p: numero("top_p").map_or(TOP_P_PADRAO, |t| t as f32),
-        top_k: inteiro("top_k").unwrap_or(TOP_K_PADRAO),
+        top_p: top_p.map_or(TOP_P_PADRAO, |t| t as f32),
+        top_k: top_k.unwrap_or(TOP_K_PADRAO),
         seed: v.get("seed").and_then(Value::as_u64),
         stop: paradas(v.get("stop")),
         esforco: match v.get("reasoning_effort").and_then(Value::as_str) {
@@ -243,6 +282,24 @@ pub fn lista_de_modelos(nome: &str, criado: u64) -> Value {
     })
 }
 
+/// O `model` do pedido é o servido? Ausente vale (clientes locais costumam omitir), e a caixa
+/// não importa. Qualquer outro nome é 404: responder com outro modelo sem avisar esconde erro
+/// de configuração do cliente.
+pub fn modelo_confere(pedido: &str, servido: &str) -> bool {
+    pedido.is_empty() || pedido.eq_ignore_ascii_case(servido)
+}
+
+/// O 404 de modelo inexistente, com o `code` que a OpenAI usa.
+pub fn erro_modelo_json(pedido: &str, servido: &str) -> Vec<u8> {
+    let v = json!({"error": {
+        "message": format!("modelo `{pedido}` não existe neste servidor; o servido é `{servido}`"),
+        "type": "invalid_request_error",
+        "param": "model",
+        "code": "model_not_found",
+    }});
+    serde_json::to_vec(&v).unwrap_or_default()
+}
+
 pub fn erro_json(mensagem: &str) -> Vec<u8> {
     erro_json_de_tipo(mensagem, "invalid_request_error")
 }
@@ -331,6 +388,75 @@ mod tests {
             parse_pedido(br#"{"model":"x","messages":[]}"#).unwrap_err(),
             ApiError::SemMensagens
         );
+    }
+
+    fn com(extra: &str) -> Result<Pedido, ApiError> {
+        let corpo = format!(r#"{{"messages":[{{"role":"user","content":"Oi"}}],{extra}}}"#);
+        parse_pedido(corpo.as_bytes())
+    }
+
+    /// Parâmetro que muda a resposta e chega inválido é erro do pedido, não default
+    /// silencioso: `max_tokens: -1` virava "sem limite" sem o cliente saber.
+    #[test]
+    fn max_tokens_tem_de_ser_inteiro_positivo() {
+        for ruim in ["0", "-1", "1.5", "\"10\""] {
+            assert!(
+                matches!(
+                    com(&format!(r#""max_tokens":{ruim}"#)),
+                    Err(ApiError::Parametro(_))
+                ),
+                "max_tokens={ruim}"
+            );
+        }
+        assert!(matches!(
+            com(r#""max_completion_tokens":0"#),
+            Err(ApiError::Parametro(_))
+        ));
+        assert_eq!(com(r#""max_tokens":null"#).unwrap().max_tokens, None);
+    }
+
+    #[test]
+    fn temperature_e_top_p_fora_da_faixa_sao_erro() {
+        for ruim in [
+            r#""temperature":-0.1"#,
+            r#""temperature":2.5"#,
+            r#""temperature":"alta""#,
+            r#""top_p":0"#,
+            r#""top_p":1.1"#,
+            r#""top_k":-1"#,
+        ] {
+            assert!(matches!(com(ruim), Err(ApiError::Parametro(_))), "{ruim}");
+        }
+        let p = com(r#""temperature":2,"top_p":1,"top_k":0"#).unwrap();
+        assert_eq!((p.temperatura, p.top_p, p.top_k), (2.0, 1.0, 0));
+        assert_eq!(com(r#""temperature":0"#).unwrap().temperatura, 0.0);
+    }
+
+    /// O servidor gera uma escolha só e não força formato: pedir `n > 1` ou `json_object`
+    /// e receber texto livre parece atendido e não é.
+    #[test]
+    fn n_maior_que_um_e_response_format_nao_texto_sao_recusados() {
+        assert!(matches!(com(r#""n":2"#), Err(ApiError::Parametro(_))));
+        assert!(matches!(
+            com(r#""response_format":{"type":"json_object"}"#),
+            Err(ApiError::Parametro(_))
+        ));
+        assert!(com(r#""n":1,"response_format":{"type":"text"}"#).is_ok());
+    }
+
+    #[test]
+    fn modelo_confere_aceita_ausente_e_ignora_caixa() {
+        assert!(modelo_confere("", "qwen3.8-27b"));
+        assert!(modelo_confere("Qwen3.8-27B", "qwen3.8-27b"));
+        assert!(!modelo_confere("gpt-4o", "qwen3.8-27b"));
+    }
+
+    #[test]
+    fn erro_de_modelo_tem_o_codigo_da_openai() {
+        let v: Value = serde_json::from_slice(&erro_modelo_json("gpt-4o", "qwen")).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_found");
+        assert_eq!(v["error"]["param"], "model");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[test]

@@ -1,78 +1,158 @@
 //! Roteamento e resposta: o que acontece entre o socket e o motor.
+//!
+//! Duas threads. A do HTTP (`aceitar`) lê cada requisição com prazo e limites, responde
+//! sozinha o que não precisa do motor — `/health`, `/v1/models`, pedidos inválidos — e põe as
+//! gerações numa fila curta. O worker (`trabalhar`) é a thread que criou o backend: o
+//! Vulkan e a `Sessao` nunca saem dela (objetos com ponteiros mapeados), e as gerações
+//! seguem uma por vez, porque uma já ocupa as duas GPUs.
 
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::time::Duration;
 
 use crate::api::{self, Parada, Pedido};
 use crate::http::{self, Requisicao};
 use crate::motor::{Motor, MotorError};
 use crate::saida::Evento;
 
-/// Aceita conexões em série: o modelo é um só, e uma requisição já ocupa as GPUs.
+/// Gerações que esperam o worker. Uma já ocupa as GPUs por segundos a minutos; mais que
+/// isso na fila é cliente que desistiria antes de ser atendido, e ouvir 503 com
+/// `Retry-After` é melhor que esperar sem prazo.
+pub const FILA: usize = 4;
+
+/// Quanto o cliente que achou a fila cheia deve esperar antes de tentar de novo.
+const RETRY_AFTER_S: u32 = 5;
+
+/// Prazos do socket. O de leitura corta o cliente que abre a conexão e não termina a
+/// requisição; o de escrita, o que para de ler o stream — no worker isso vira erro de envio
+/// e cancela a geração em vez de travar a fila.
+#[derive(Debug, Clone, Copy)]
+pub struct Prazos {
+    pub leitura: Duration,
+    pub escrita: Duration,
+}
+
+/// Um pedido de geração já validado, esperando o worker. O socket vai junto: a resposta sai
+/// dele.
+pub struct Trabalho {
+    pedido: Pedido,
+    fluxo: TcpStream,
+}
+
+/// Sobe a thread do HTTP e vira o worker na thread atual — a que é dona do motor.
 pub fn laco(
     bind: &str,
     nome: &str,
     mut motor: Motor<'_>,
+    prazos: Prazos,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let escuta = TcpListener::bind(bind)?;
     eprintln!("[http] {bind} — modelo `{nome}`");
+    let (fila, trabalhos) = sync_channel(FILA);
+    let nome_http = nome.to_owned();
+    std::thread::Builder::new()
+        .name("llama-http".into())
+        .spawn(move || aceitar(&escuta, &nome_http, &fila, prazos))?;
+    trabalhar(trabalhos.iter(), nome, &mut motor);
+    Ok(())
+}
+
+/// A thread do HTTP: atende o que não precisa do motor e enfileira as gerações.
+pub fn aceitar(escuta: &TcpListener, nome: &str, fila: &SyncSender<Trabalho>, prazos: Prazos) {
     for conexao in escuta.incoming() {
         match conexao {
             Ok(fluxo) => {
-                if let Err(e) = atender(fluxo, nome, &mut motor) {
+                if let Err(e) = triar(fluxo, nome, fila, prazos) {
                     eprintln!("[http] conexão encerrada: {e}");
                 }
             }
             Err(e) => eprintln!("[http] accept falhou: {e}"),
         }
     }
+}
+
+/// O worker: atende a fila em ordem, com o motor (e o backend por trás dele) desta thread.
+pub fn trabalhar(trabalhos: impl Iterator<Item = Trabalho>, nome: &str, motor: &mut Motor<'_>) {
+    for t in trabalhos {
+        let mut escritor = BufWriter::new(t.fluxo);
+        if let Err(e) = responder_chat(&t.pedido, nome, motor, &mut escritor) {
+            eprintln!("[http] conexão encerrada: {e}");
+        }
+    }
+}
+
+fn triar(
+    fluxo: TcpStream,
+    nome: &str,
+    fila: &SyncSender<Trabalho>,
+    prazos: Prazos,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fluxo.set_read_timeout(Some(prazos.leitura))?;
+    fluxo.set_write_timeout(Some(prazos.escrita))?;
+    let mut leitor = BufReader::new(fluxo.try_clone()?);
+    let pedido = {
+        let mut escritor = &fluxo;
+        let req = match http::ler_requisicao(&mut leitor) {
+            Ok(r) => r,
+            Err(e) => {
+                let corpo = api::erro_json(&e.to_string());
+                http::responder(&mut escritor, e.status(), "application/json", &corpo)?;
+                return Ok(());
+            }
+        };
+        if rota_rapida(&req, nome, &mut escritor)? {
+            return Ok(());
+        }
+        match validar_chat(&req.corpo, nome) {
+            Ok(p) => p,
+            Err((status, corpo)) => {
+                http::responder(&mut escritor, status, "application/json", &corpo)?;
+                return Ok(());
+            }
+        }
+    };
+    if let Err(TrySendError::Full(t) | TrySendError::Disconnected(t)) =
+        fila.try_send(Trabalho { pedido, fluxo })
+    {
+        let corpo = api::erro_interno_json("fila de geração cheia; tente de novo em instantes");
+        http::ocupado(&mut &t.fluxo, RETRY_AFTER_S, &corpo)?;
+    }
     Ok(())
 }
 
-pub fn atender(
-    fluxo: TcpStream,
-    nome: &str,
-    motor: &mut Motor<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut leitor = BufReader::new(fluxo.try_clone()?);
-    let mut escritor = BufWriter::new(fluxo);
-    let req = match http::ler_requisicao(&mut leitor) {
-        Ok(r) => r,
-        Err(e) => {
-            http::responder(
-                &mut escritor,
-                400,
-                "application/json",
-                &api::erro_json(&e.to_string()),
-            )?;
-            return Ok(());
-        }
-    };
-    rotear(&req, nome, motor, &mut escritor)
-}
-
+/// Tudo numa thread só: o caminho dos testes de rota, com as mesmas regras da fila.
 pub fn rotear<W: Write>(
     req: &Requisicao,
     nome: &str,
     motor: &mut Motor<'_>,
     escritor: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if rota_rapida(req, nome, escritor)? {
+        return Ok(());
+    }
+    match validar_chat(&req.corpo, nome) {
+        Ok(pedido) => responder_chat(&pedido, nome, motor, escritor)?,
+        Err((status, corpo)) => http::responder(escritor, status, "application/json", &corpo)?,
+    }
+    Ok(())
+}
+
+/// Responde o que não precisa do motor. `false` é geração — fica para o worker.
+fn rota_rapida<W: Write>(
+    req: &Requisicao,
+    nome: &str,
+    escritor: &mut W,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let json = "application/json";
     match (req.metodo.as_str(), caminho_base(&req.caminho)) {
+        ("POST", "/v1/chat/completions" | "/chat/completions") => return Ok(false),
         ("OPTIONS", _) => http::responder(escritor, 200, json, b"")?,
         ("GET", "/v1/models" | "/models") => {
             let corpo = serde_json::to_vec(&api::lista_de_modelos(nome, agora()))?;
             http::responder(escritor, 200, json, &corpo)?;
         }
         ("GET", "/health") => http::responder(escritor, 200, json, br#"{"status":"ok"}"#)?,
-        ("POST", "/v1/chat/completions" | "/chat/completions") => {
-            match api::parse_pedido(&req.corpo) {
-                Ok(pedido) => responder_chat(&pedido, nome, motor, escritor)?,
-                Err(e) => {
-                    http::responder(escritor, 400, json, &api::erro_json(&e.to_string()))?;
-                }
-            }
-        }
         _ => http::responder(
             escritor,
             404,
@@ -80,7 +160,18 @@ pub fn rotear<W: Write>(
             &api::erro_json(&format!("sem rota para {} {}", req.metodo, req.caminho)),
         )?,
     }
-    Ok(())
+    Ok(true)
+}
+
+/// O corpo de um chat vira pedido, ou status e corpo do erro: 400 para parâmetro inválido,
+/// 404 para modelo que não é o servido. O que depende do tokenizer (o contexto) fica para o
+/// `Motor::preparar`, no worker.
+fn validar_chat(corpo: &[u8], nome: &str) -> Result<Pedido, (u16, Vec<u8>)> {
+    let pedido = api::parse_pedido(corpo).map_err(|e| (400, api::erro_json(&e.to_string())))?;
+    if !api::modelo_confere(&pedido.modelo, nome) {
+        return Err((404, api::erro_modelo_json(&pedido.modelo, nome)));
+    }
+    Ok(pedido)
 }
 
 /// Ignora a query string: `/v1/models?x=1` é a mesma rota.
