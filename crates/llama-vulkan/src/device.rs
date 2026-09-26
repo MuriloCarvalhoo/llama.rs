@@ -29,6 +29,24 @@ fn margem_vram_de(tem_monitor: Option<bool>) -> u64 {
     }
 }
 
+/// A margem de cada device a partir do que o sysfs diz de todos. Com o monitor em repouso o
+/// DisplayPort passa a `disconnected` e **nenhuma** GPU parece dirigir tela — mas uma delas
+/// volta a dirigir quando ele acordar, e o compositor precisa de VRAM nela. Sem saber qual,
+/// vale a margem maior em todas.
+fn margens_vram(monitores: &[Option<bool>]) -> Vec<u64> {
+    let algum = monitores.contains(&Some(true));
+    monitores
+        .iter()
+        .map(|&m| {
+            if algum {
+                margem_vram_de(m)
+            } else {
+                MARGEM_COM_MONITOR
+            }
+        })
+        .collect()
+}
+
 /// Algum conector do card DRM no endereço PCI `pci` (`dddd:bb:dd.f`) está `connected`?
 /// `None` quando o sysfs não diz (sem DRM, outro SO). `raiz` é `/sys/bus/pci/devices` fora
 /// dos testes.
@@ -181,6 +199,7 @@ impl VulkanContext {
         // SAFETY: `instance` é válida — foi criada com sucesso pela função chamadora.
         let phys_devs = unsafe { instance.enumerate_physical_devices()? };
         let mut result = Vec::new();
+        let mut monitores = Vec::new();
 
         for pd in phys_devs {
             // SAFETY: `pd` é um handle válido retornado por `enumerate_physical_devices`.
@@ -233,6 +252,7 @@ impl VulkanContext {
             let monitor = pci
                 .as_deref()
                 .and_then(|pci| tem_monitor(std::path::Path::new("/sys/bus/pci/devices"), pci));
+            monitores.push(monitor);
 
             // SAFETY: `device_name` é garantido nul-terminado pela spec Vulkan
             // (VkPhysicalDeviceProperties.deviceName tem VK_MAX_PHYSICAL_DEVICE_NAME_SIZE bytes
@@ -247,9 +267,13 @@ impl VulkanContext {
                 name,
                 subgroup_size: subgroup_props.subgroup_size,
                 queue_family: qfam_idx as u32,
-                margem_vram: margem_vram_de(monitor),
+                // Preenchida depois do laço: depende do que os outros devices disserem.
+                margem_vram: 0,
                 pci,
             });
+        }
+        for (p, m) in result.iter_mut().zip(margens_vram(&monitores)) {
+            p.margem_vram = m;
         }
         Ok(result)
     }
@@ -364,6 +388,15 @@ mod tests {
         let raiz = sysfs("ausente", &[]);
         assert_eq!(tem_monitor(&raiz, "0000:05:00.0"), None);
         std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn monitor_em_repouso_vale_a_margem_maior_em_todas() {
+        let g = 2 << 30;
+        let p = 500 << 20;
+        assert_eq!(margens_vram(&[Some(true), Some(false)]), vec![g, p]);
+        assert_eq!(margens_vram(&[Some(false), Some(false)]), vec![g, g]);
+        assert_eq!(margens_vram(&[None, Some(false)]), vec![g, g]);
     }
 
     #[test]
