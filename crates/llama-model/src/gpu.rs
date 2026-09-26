@@ -385,9 +385,15 @@ pub trait GpuResidentDecode {
     fn batch_size(&self) -> usize {
         1
     }
+    /// Largura de um segundo bloco, menor, que `decode_batch` também aceita — para o resto
+    /// de um prompt depois dos blocos cheios não cair token a token. `0` = não há.
+    fn batch_resto(&self) -> usize {
+        0
+    }
     /// Processa `tokens` nas posições `pos0..pos0 + tokens.len()` de uma vez, retornando
     /// os logits **do último** — os anteriores já ficaram no KV-cache, e é só isso que o
-    /// prefill precisa. `tokens.len()` tem de ser exatamente `batch_size()`.
+    /// prefill precisa. `tokens.len()` tem de ser exatamente `batch_size()` ou
+    /// `batch_resto()`.
     fn decode_batch(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, ModelError> {
         let mut logits = Vec::new();
         for (i, &t) in tokens.iter().enumerate() {

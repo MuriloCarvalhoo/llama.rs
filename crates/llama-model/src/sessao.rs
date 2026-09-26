@@ -284,7 +284,8 @@ mod com_backend {
             Ok(passo)
         }
 
-        /// Prefill de `ids[pos0..]`: blocos de `batch_size()` e o resto token a token.
+        /// Prefill de `ids[pos0..]`: blocos de `batch_size()`, depois de `batch_resto()`, e o
+        /// que sobrar token a token.
         /// Em batch cada peso do modelo sai da VRAM uma vez para N tokens.
         fn processar(
             &mut self,
@@ -292,15 +293,18 @@ mod com_backend {
             ids: &[u32],
             pos0: usize,
         ) -> Result<(), ModelError> {
-            let nb = gpu.batch_size();
             let mut pos = pos0;
-            while nb > 1 && ids.len() - pos >= nb {
-                let Some(bloco) = ids.get(pos..pos + nb) else {
-                    break;
-                };
-                self.logits = gpu.decode_batch(bloco, pos)?;
-                self.hidden = nb - 1;
-                pos += nb;
+            // Blocos cheios, depois blocos do resto (o backend aceita os dois), e o que sobrar
+            // token a token.
+            for nb in [gpu.batch_size(), gpu.batch_resto()] {
+                while nb > 1 && ids.len() - pos >= nb {
+                    let Some(bloco) = ids.get(pos..pos + nb) else {
+                        break;
+                    };
+                    self.logits = gpu.decode_batch(bloco, pos)?;
+                    self.hidden = nb - 1;
+                    pos += nb;
+                }
             }
             for &t in ids.get(pos..).unwrap_or(&[]) {
                 self.logits = gpu.decode(t, pos)?;
@@ -335,6 +339,8 @@ mod testes_de_sessao {
 
     struct BackendFalso {
         nb: usize,
+        /// `batch_resto` do backend: 0 = não há bloco menor.
+        resto: usize,
         /// Se o backend guarda snapshot. `false` reproduz o comportamento de antes desta
         /// frente, que é também o dos backends que não implementam `marcar`.
         snapshot: bool,
@@ -345,6 +351,7 @@ mod testes_de_sessao {
         fn novo(nb: usize) -> BackendFalso {
             BackendFalso {
                 nb,
+                resto: 0,
                 snapshot: false,
                 chamadas: RefCell::new(Vec::new()),
             }
@@ -374,6 +381,9 @@ mod testes_de_sessao {
         }
         fn batch_size(&self) -> usize {
             self.nb
+        }
+        fn batch_resto(&self) -> usize {
+            self.resto
         }
         fn decode_batch(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, ModelError> {
             self.chamadas
@@ -625,5 +635,31 @@ mod testes_de_sessao {
             ]
         );
         assert_eq!(s.marca(), Some(5));
+    }
+
+    /// Com um bloco de resto, o que sobra dos blocos cheios vai em blocos menores antes de
+    /// cair token a token — com o bloco de 256 eram até 255 tokens pelo decode.
+    #[test]
+    fn resto_vai_em_blocos_menores_antes_do_token_a_token() {
+        let gpu = BackendFalso {
+            resto: 2,
+            ..BackendFalso::novo(4)
+        };
+        let mut s = Sessao::nova(&gpu);
+        gpu.chamadas.borrow_mut().clear();
+
+        s.prefill(&gpu, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            .unwrap();
+
+        assert_eq!(
+            gpu.registradas(),
+            vec![
+                "Batch([1, 2, 3, 4], 0)".to_owned(),
+                "Batch([5, 6, 7, 8], 4)".to_owned(),
+                "Batch([9, 10], 8)".to_owned(),
+                "Decode(11, 10)".to_owned()
+            ]
+        );
+        assert_eq!(s.tokens().len(), 11);
     }
 }

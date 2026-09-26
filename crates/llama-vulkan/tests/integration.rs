@@ -1413,7 +1413,8 @@ fn gemm_em_lds_bate_com_o_matvec_q4k() {
         let w = q.pesos(300, n_in / 256);
         // 300 linhas: dois workgroups cheios (128 + 128) e um de 44, que exercita a guarda.
         for n_out in [128usize, 300] {
-            for cols in [8usize, 16, 32] {
+            // 64 e 128: dois e quatro tiles de 32 colunas em `gl_WorkGroupID.y`.
+            for cols in [8usize, 16, 32, 64, 128] {
                 let x: Vec<f32> = (0..cols * n_in)
                     .map(|i| ((i % 37) as f32 - 18.0) * 0.021)
                     .collect();

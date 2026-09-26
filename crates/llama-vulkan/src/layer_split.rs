@@ -236,11 +236,16 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
         carry.ok_or_else(|| llama_model::ModelError::Gpu("nenhum shard".into()))
     }
 
-    /// Todos os shards são construídos com o mesmo `batch_size()`.
+    /// Todos os shards decidem o mesmo bloco (`batch_do_modelo` olha o modelo inteiro).
     fn batch_size(&self) -> usize {
         self.shards
             .first()
             .map_or(1, llama_model::GpuResidentDecode::batch_size)
+    }
+    fn batch_resto(&self) -> usize {
+        self.shards
+            .first()
+            .map_or(0, llama_model::GpuResidentDecode::batch_resto)
     }
 
     fn reset(&self) {

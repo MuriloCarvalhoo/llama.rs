@@ -39,6 +39,12 @@ e como desfazer.
    MMQ do HIP e portar a ideia para os shaders Vulkan, no padrão do repositório (item 1.4 + 1.2).
    Se o pedido era sobre a ferramenta de perfil em si, o `LLAMA_RS_PROFILE` já dá o tempo por op
    e o que falta é o 3.2 (memória).
+6. **Bloco de prefill escolhido pelo modelo** (256 se todas as matrizes das camadas são
+   Q4_K/Q5_K/Q6_K, 32 no resto), em vez de um padrão fixo: o matvec-COLS (Q8_0) não passa de
+   32, e um bloco maior com peso sem GEMM agora falha alto no plano (`[plano] bloco de prefill
+   de N exige GEMM`) em vez de calcular 32 colunas em silêncio. `LLAMA_RS_BATCH` continua
+   mandando. O resto do prompt vai em blocos de 32 (`plan_resto`) — sem isso o bloco 256 perdia
+   até 10 s por turno no token a token. Desfazer: `batch_do_modelo` devolver 32.
 
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 

@@ -64,6 +64,7 @@ histograma de clocks por GPU; o log tem uma linha por GPU e amostra. Sai com 3 q
 | `LLAMA_RS_PSTATE=standard\|peak\|auto` | Clock da GPU durante a geração (`pstate.rs`). `standard` (padrão) fixa núcleo em 1316 MHz e HBM em 1000; `peak` fixa o núcleo em 1700 e desce para `standard` com a junction em 95 °C; `auto` deixa o DPM do driver |
 | `LLAMA_RS_PROFILE=1` | Liga a coleta de timestamps de GPU |
 | `LLAMA_RS_ATTN16=0` | Volta a atenção de contexto longo ao `attention_split.comp` (uma posição do KV por wave) em vez do `attention_split16.comp` |
+| `LLAMA_RS_BATCH=N` | Tokens por bloco de prefill. Padrão: 256 se o modelo é todo K-quant (Q4_K/Q5_K/Q6_K), 32 no resto; acima de 32 arredonda para múltiplo de 32, até 256 |
 | `LLAMA_RS_GEMM_K56=0` | Devolve o Q5_K do prefill ao matvec-COLS (o GEMM `mul_mm.comp` com `TIPO=1` é o padrão desde 2026-09-26) |
 | `LLAMA_RS_GEMM_Q6K=1` | Manda também o Q6_K do prefill pelo GEMM (`TIPO=2`); no bloco 32 ele é mais lento que o matvec-COLS |
 | `LLAMA_RS_TRACE_TOKENS=N` | Quantos tokens entram no `--trace` (padrão 8) |

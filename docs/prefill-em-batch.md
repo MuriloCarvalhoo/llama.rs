@@ -113,6 +113,22 @@ mesmo prompt de 1,7k tokens: Q5_K de 52 para 14,7 ms/bloco, e prefill de 7,76 pa
 ms/token**. O Q6_K pelo GEMM ficou mais lento que o matvec-COLS no bloco 32 (39,5 contra 35 ms)
 e segue opcional (`LLAMA_RS_GEMM_Q6K=1`).
 
+**Atualização 2026-09-26 (o que o llama.cpp faz melhor):** o MMQ do llama.cpp em GCN usa tile de
+128 linhas × 64 colunas e processa o prompt em blocos de 512 tokens, com o grid cobrindo os tiles
+de coluna. O nosso GEMM levava o bloco inteiro num tile só, com 136 workgroups para 60 CUs no
+ffn_gate. Agora o tile tem 32 colunas e blocos maiores viram `COLS/32` tiles em
+`gl_WorkGroupID.y`. O bloco padrão passa a ser **256** quando todas as matrizes do modelo são
+Q4_K/Q5_K/Q6_K (32 no resto). O que sobra de um prompt vai em blocos de 32 (`plan_resto`) antes
+de cair token a token. Prompt real de 1,8k tokens com os blocos 32/64/128/256: saída greedy
+idêntica.
+
+| bloco | GEMM (ms/token, 1,7k tokens) | servidor, 7,5k frio | servidor, turno de 1,3k |
+|---:|---:|---:|---:|
+| 32 | 6,57 | 134,5 tok/s | 105,5 tok/s |
+| 64 | 5,69 | — | — |
+| 128 | 5,51 | — | — |
+| **256** | **4,89** | **159,8 tok/s** | **118,0 tok/s** |
+
 ## O que mais precisa virar batch
 
 O matvec não é o único: **todo o resto do plano assume um vetor**. Os que precisam de uma

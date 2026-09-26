@@ -49,13 +49,77 @@ pub(crate) fn atencao16_serve(head_dim: usize) -> bool {
 /// dobrando de 47 para 92 ms por bloco (ver `docs/prefill-em-batch.md`).
 ///
 /// `LLAMA_RS_BATCH=n` sobrescreve; `1` desliga o batch (prefill volta a ser token a token).
+/// Acima de 32 o bloco vai em tiles de 32 colunas no GEMM (como os tiles de `J` colunas do
+/// MMQ do llama.cpp, que processa o prompt em blocos de 512): arredonda para múltiplo de 32,
+/// até 256, e exige GEMM ligado — o matvec-COLS não passa de 32 (ver `mv_gen`).
 pub(crate) fn batch_size() -> usize {
-    std::env::var("LLAMA_RS_BATCH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32)
-        .clamp(1, 32)
+    batch_pedido().unwrap_or(32)
 }
+
+/// O `LLAMA_RS_BATCH` do ambiente, já ajustado à regra de [`batch_size`].
+fn batch_pedido() -> Option<usize> {
+    let n = std::env::var("LLAMA_RS_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())?
+        .clamp(1, 256);
+    Some(if n > 32 && gemm_prefill() {
+        n / 32 * 32
+    } else {
+        n.min(32)
+    })
+}
+
+/// Bloco de prefill do modelo carregado: o do ambiente, se houver; senão **256** quando todas
+/// as matrizes das camadas vão pelo GEMM (Q4_K, Q5_K, Q6_K), e 32 no resto — o matvec-COLS
+/// (Q8_0, por exemplo) não passa de 32. Decidido pelo modelo inteiro, não pelo shard: os
+/// shards do layer-split têm de concordar.
+///
+/// Medido em 2026-09-26 (Qwen3.8-27B Q4_K_M, com o resto em blocos de 32): prefill frio de
+/// 7,5k tokens de 134,5 para 159,8 tok/s, turno de 1,3k de 105,5 para 118,0 tok/s, saída
+/// greedy idêntica; +~200 MB de VRAM.
+fn batch_do_modelo(raw: &GpuRawWeights) -> usize {
+    if let Some(n) = batch_pedido() {
+        return n;
+    }
+    let tipos = raw.layers.iter().flat_map(|l| {
+        let mixer: Vec<gguf::GgmlType> = match &l.mixer {
+            llama_model::MixerRaw::Attn {
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+            } => vec![attn_q.ty, attn_k.ty, attn_v.ty, attn_output.ty],
+            llama_model::MixerRaw::Delta {
+                attn_qkv,
+                attn_gate,
+                ssm_out,
+            } => vec![attn_qkv.ty, attn_gate.ty, ssm_out.ty],
+        };
+        mixer
+            .into_iter()
+            .chain([l.ffn_gate.ty, l.ffn_up.ty, l.ffn_down.ty])
+    });
+    let todos_gemm = tipos.into_iter().all(|t| {
+        matches!(
+            t,
+            gguf::GgmlType::Q4_K | gguf::GgmlType::Q5_K | gguf::GgmlType::Q6_K
+        )
+    });
+    if gemm_prefill() && todos_gemm {
+        256
+    } else {
+        32
+    }
+}
+
+/// Maior largura do matvec-COLS: acima disso os `ROWS_PER_WAVE * COLS` acumuladores por lane
+/// estouram os registradores, e o prefill tem de ir pelo GEMM.
+const MATVEC_COLS_MAX: usize = 32;
+
+/// Largura do plano do **resto**: com o bloco de prefill maior que isto, o que sobra de um
+/// prompt depois dos blocos cheios vai em blocos de 32 antes de cair token a token. Sem ele,
+/// com o bloco de 256 até 255 tokens iriam pelo decode, a ~40 ms cada — 10 s num turno.
+const RESTO_TOK: usize = 32;
 
 /// Tokens do bloco de **verificação** do MTP: o token já amostrado, a proposta da cabeça
 /// e a proposta encadeada (a cabeça realimentada com o próprio hidden — o experimento da
@@ -137,8 +201,9 @@ fn gemm_prefill() -> bool {
 
 /// Larguras de bloco que o tile do `mul_mm.comp` cobre: múltiplas de 8 (a grade de threads
 /// tem 8 grupos de coluna) e no máximo 64 (acima disso os acumuladores por thread estouram).
-fn gemm_largura_ok(cols: usize) -> bool {
-    (8..=64).contains(&cols) && cols.is_multiple_of(8)
+pub(crate) fn gemm_largura_ok(cols: usize) -> bool {
+    ((8..=32).contains(&cols) && cols.is_multiple_of(8))
+        || ((33..=256).contains(&cols) && cols.is_multiple_of(32))
 }
 
 /// Se este matvec vai pelo GEMM em vez do matvec-COLS.
@@ -153,7 +218,11 @@ fn gemm_para(cols: usize, ty: gguf::GgmlType) -> bool {
     let tipo_ok = match ty {
         gguf::GgmlType::Q4_K => true,
         gguf::GgmlType::Q5_K => k56,
-        gguf::GgmlType::Q6_K => k56 && std::env::var("LLAMA_RS_GEMM_Q6K").is_ok_and(|v| v == "1"),
+        // Acima de 32 colunas o matvec-COLS não existe mais: vai pelo GEMM de qualquer jeito.
+        gguf::GgmlType::Q6_K => {
+            k56 && (cols > MATVEC_COLS_MAX
+                || std::env::var("LLAMA_RS_GEMM_Q6K").is_ok_and(|v| v == "1"))
+        }
         _ => false,
     };
     gemm_prefill() && tipo_ok && gemm_largura_ok(cols)
@@ -858,6 +927,9 @@ pub(crate) struct ResidentState<'w> {
     /// `n_batch == 1`, e aí o prefill usa o plano de decode token a token.
     pub plan_batch: Vec<PlannedOp>,
     pub barreiras_batch: Vec<bool>,
+    /// O mesmo plano de prefill com `RESTO_TOK` tokens (vazio se o bloco não passa disso).
+    pub plan_resto: Vec<PlannedOp>,
+    pub barreiras_resto: Vec<bool>,
     /// O mesmo par para o bloco de dois tokens do verify. Vazio sem MTP.
     pub plan_verify: Vec<PlannedOp>,
     pub barreiras_verify: Vec<bool>,
@@ -1224,18 +1296,20 @@ impl<'ctx> ResidentForward<'ctx> {
         // Variantes de prefill: `COLS` é specialization constant, então cada largura de
         // batch é uma pipeline própria. O Q6_K expõe COLS no id 0 (geometria fixa no shader).
         let cols = batch_size() as u32;
+        // O matvec-COLS para em 32 (`MATVEC_COLS_MAX`); acima disso o plano usa o GEMM.
+        let cols_mv = cols.min(MATVEC_COLS_MAX as u32);
         let (mvb_wg, mvb_rows) = matvec_geom_batch();
-        let geom_b = [(0, mvb_wg), (1, mvb_rows), (2, cols)];
+        let geom_b = [(0, mvb_wg), (1, mvb_rows), (2, cols_mv)];
         let matvec_b = ComputePipeline::with(
             d,
             crate::Q8_0_MATVEC_SPV,
             5,
             push_mv,
-            &[(0, MATVEC_WG), (1, MATVEC_NUM_ROWS), (2, cols)],
+            &[(0, MATVEC_WG), (1, MATVEC_NUM_ROWS), (2, cols_mv)],
         )?;
         let matvec_q5k_b = ComputePipeline::with(d, crate::Q5_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
         let matvec_q6k_b =
-            ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[(0, cols)])?;
+            ComputePipeline::with(d, crate::Q6_K_MATVEC_SPV, 5, push_mv, &[(0, cols_mv)])?;
         let matvec_q4k_b = ComputePipeline::with(d, crate::Q4_K_MATVEC_SPV, 5, push_mv, &geom_b)?;
         // `COLS` do GEMM é a largura do bloco quando ele está ligado; com o knob desligado
         // (ou a largura fora do tile) vale 8, a menor válida, só para a pipeline compilar.
@@ -1463,7 +1537,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 rms_eps: config.rms_eps,
                 shard,
                 delta_net: config.delta_net.clone(),
-                n_batch: batch_size(),
+                n_batch: batch_do_modelo(raw),
             };
             let nbatch = cfg.n_batch;
 
@@ -1817,6 +1891,8 @@ impl<'ctx> ResidentForward<'ctx> {
                 barreiras: Vec::new(),
                 plan_batch: Vec::new(),
                 barreiras_batch: Vec::new(),
+                plan_resto: Vec::new(),
+                barreiras_resto: Vec::new(),
                 plan_verify: Vec::new(),
                 barreiras_verify: Vec::new(),
                 mtp: mtp_bufs,
@@ -1833,9 +1909,16 @@ impl<'ctx> ResidentForward<'ctx> {
         let plan = me.build_plan(Modo::Decode)?;
         // Plano do bloco de prefill. Mesmo código, `n_tok` colunas: os matvec passam a ler
         // cada peso uma vez para os N tokens, que é o ganho do batch.
-        let nbatch = batch_size();
+        let nbatch = me.state.as_ref().map_or(1, |st| st.cfg.n_batch);
         let plan_batch = if nbatch > 1 {
             me.build_plan(Modo::Batch)?
+        } else {
+            Vec::new()
+        };
+        // Os pipelines do GEMM servem a qualquer múltiplo de 32 colunas (o tile é de 32; só o
+        // grid muda), e o matvec-COLS foi criado com 32: o plano do resto não pede nada novo.
+        let plan_resto = if nbatch > RESTO_TOK {
+            me.build_plan_n(Modo::Batch, RESTO_TOK)?
         } else {
             Vec::new()
         };
@@ -1852,7 +1935,11 @@ impl<'ctx> ResidentForward<'ctx> {
         // mais ops que o do decode, porque a recorrência do delta-net vira um dispatch por
         // token do bloco.
         let prof = if std::env::var("LLAMA_RS_PROFILE").is_ok_and(|v| v != "0") {
-            let maior = plan.len().max(plan_batch.len()).max(plan_verify.len());
+            let maior = plan
+                .len()
+                .max(plan_batch.len())
+                .max(plan_resto.len())
+                .max(plan_verify.len());
             let info = vk::QueryPoolCreateInfo {
                 query_type: vk::QueryType::TIMESTAMP,
                 query_count: u32::try_from(maior + 1)
@@ -1889,6 +1976,8 @@ impl<'ctx> ResidentForward<'ctx> {
             st.barreiras = Self::marcar_barreiras(&plan, st);
             st.barreiras_batch = Self::marcar_barreiras(&plan_batch, st);
             st.plan_batch = plan_batch;
+            st.barreiras_resto = Self::marcar_barreiras(&plan_resto, st);
+            st.plan_resto = plan_resto;
             st.barreiras_verify = Self::marcar_barreiras(&plan_verify, st);
             st.plan_verify = plan_verify;
             st.mtp_barreiras = Self::marcar_barreiras(&plan_mtp, st);
@@ -3221,7 +3310,8 @@ impl<'ctx> ResidentForward<'ctx> {
         let total_len = (pos + 1) as u32;
         let (plan, barreiras) = match modo {
             Modo::Decode => (&st.plan, &st.barreiras),
-            Modo::Batch => (&st.plan_batch, &st.barreiras_batch),
+            Modo::Batch if n_tok == c.n_batch => (&st.plan_batch, &st.barreiras_batch),
+            Modo::Batch => (&st.plan_resto, &st.barreiras_resto),
             Modo::Verify => (&st.plan_verify, &st.barreiras_verify),
         };
         // Os dois planos são medidos: cada um tem o seu acumulador, porque as listas de
@@ -3687,13 +3777,18 @@ impl<'ctx> ResidentForward<'ctx> {
     }
 
     fn build_plan(&self, modo: Modo) -> Result<Vec<PlannedOp>, MatmulError> {
+        let n_tok = self.state.as_ref().map_or(1, |st| modo.n_tok(&st.cfg));
+        self.build_plan_n(modo, n_tok)
+    }
+
+    /// [`Self::build_plan`] com a largura do bloco explícita — o plano do resto do prefill.
+    fn build_plan_n(&self, modo: Modo, n_tok: usize) -> Result<Vec<PlannedOp>, MatmulError> {
         use crate::pipeline::PushConstants;
         let st = self
             .state
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
         let c = &st.cfg;
-        let n_tok = modo.n_tok(c);
         let nt = u32::try_from(n_tok).unwrap_or(1);
         let mut plan = Vec::new();
 
@@ -3802,7 +3897,16 @@ impl<'ctx> ResidentForward<'ctx> {
             // workgroup cobre sai de `matvec_geom` (Q5_K/Q4_K) ou da geometria fixa dos
             // shaders Q8_0 e Q6_K. O GEMM, quando ligado, só entra no bloco de prefill
             // (modo Batch) e cobre `BM` linhas por workgroup — o verify fica no matvec.
-            let (pipe, rows_por_wg) = if matches!(largura, Modo::Batch) && gemm_para(cols, w.ty) {
+            let usa_gemm = matches!(largura, Modo::Batch) && gemm_para(cols, w.ty);
+            if matches!(largura, Modo::Batch) && !usa_gemm && cols > MATVEC_COLS_MAX {
+                eprintln!(
+                    "[plano] bloco de prefill de {cols} exige GEMM, e {:?} não tem: use \
+                     LLAMA_RS_BATCH=32 com este modelo",
+                    w.ty
+                );
+                return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+            }
+            let (pipe, rows_por_wg) = if usa_gemm {
                 let gemm = match w.ty {
                     gguf::GgmlType::Q5_K => PipeId::MulMmQ5K,
                     gguf::GgmlType::Q6_K => PipeId::MulMmQ6K,
@@ -3845,7 +3949,7 @@ impl<'ctx> ResidentForward<'ctx> {
                     ),
                 }
             };
-            mk(
+            let mut op = mk(
                 pipe,
                 &[
                     (w.gpu.buffer, 0, w.gpu.size_bytes),
@@ -3858,7 +3962,12 @@ impl<'ctx> ResidentForward<'ctx> {
                 ],
                 u32::try_from(n_out.div_ceil(rows_por_wg)).unwrap_or(u32::MAX),
                 PushSpec::Static(mv_push(n_in, n_out)),
-            )
+            )?;
+            // O GEMM fatia blocos maiores que 32 em tiles de 32 colunas (`mul_mm.comp`).
+            if usa_gemm && let PlannedOp::Dispatch { groups_y, .. } = &mut op {
+                *groups_y = u32::try_from(cols.div_ceil(32)).unwrap_or(1);
+            }
+            Ok(op)
         };
 
         let mv =
@@ -4942,7 +5051,9 @@ impl<'ctx> ResidentForward<'ctx> {
             .state
             .as_ref()
             .ok_or(MatmulError::Vulkan(vk::Result::ERROR_INITIALIZATION_FAILED))?;
-        if n_tok == 0 || (n_tok > 1 && n_tok != st.cfg.n_batch) || pos0 + n_tok > st.cfg.ctx {
+        let largura_ok =
+            n_tok == st.cfg.n_batch || (n_tok == RESTO_TOK && !st.plan_resto.is_empty());
+        if n_tok == 0 || (n_tok > 1 && !largura_ok) || pos0 + n_tok > st.cfg.ctx {
             return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
         }
         let pos = pos0 + n_tok - 1;
@@ -5298,7 +5409,10 @@ impl<'ctx> ResidentForward<'ctx> {
         self.espera_fence(st)?;
         let t_sub = t1.elapsed();
         let t2 = std::time::Instant::now();
-        self.collect_prof(st, modo)?;
+        // O perfil do prefill acumula o bloco cheio; o do resto tem outra lista de ops.
+        if modo != Modo::Batch || tokens.len() == st.cfg.n_batch {
+            self.collect_prof(st, modo)?;
+        }
 
         let len = if st.cfg.shard.is_last() {
             if modo == Modo::Verify {
@@ -5345,6 +5459,12 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
     }
     fn batch_size(&self) -> usize {
         self.state.as_ref().map_or(1, |st| st.cfg.n_batch)
+    }
+    fn batch_resto(&self) -> usize {
+        self.state
+            .as_ref()
+            .filter(|st| !st.plan_resto.is_empty())
+            .map_or(0, |_| RESTO_TOK)
     }
     fn decode_batch(
         &self,

@@ -449,7 +449,7 @@ pub fn dispatch_mul_mm_q4k(
     n_out: usize,
     cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
-    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+    if !crate::resident_forward::gemm_largura_ok(cols) {
         return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
     }
     let cols_u32 =
@@ -481,7 +481,7 @@ pub fn dispatch_mul_mm_q5k(
     n_out: usize,
     cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
-    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+    if !crate::resident_forward::gemm_largura_ok(cols) {
         return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
     }
     let cols_u32 =
@@ -514,7 +514,7 @@ pub fn dispatch_mul_mm_q6k(
     n_out: usize,
     cols: usize,
 ) -> Result<Vec<f32>, MatmulError> {
-    if cols == 0 || cols > 64 || !cols.is_multiple_of(8) {
+    if !crate::resident_forward::gemm_largura_ok(cols) {
         return Err(MatmulError::Vulkan(vk::Result::ERROR_FEATURE_NOT_PRESENT));
     }
     let n_sb = w_bytes.len() / 210;
@@ -724,7 +724,10 @@ fn dispatch_k_matvec(
                 size_of::<PushConstants>(),
             ),
         );
-        d.cmd_dispatch(cmd, push.n_out.div_ceil(rows_por_wg), 1, 1);
+        // O GEMM fatia blocos maiores que 32 em tiles de 32 colunas, um por grupo em Y; os
+        // matvec-COLS nunca passam de 32, então para eles isto é 1.
+        let tiles_y = u32::try_from(cols.div_ceil(32)).unwrap_or(1).max(1);
+        d.cmd_dispatch(cmd, push.n_out.div_ceil(rows_por_wg), tiles_y, 1);
         d.end_command_buffer(cmd)?;
         let submit = vk::SubmitInfo {
             command_buffer_count: 1,

@@ -21,8 +21,9 @@
 //
 // ## Geometria
 //
-// Workgroup de 256 threads (4 waves), tile **BM=128 linhas x BN=COLS colunas x BK=32**.
-// As 256 threads sao uma grade 32 x 8: cada uma calcula TM=4 linhas por TN=COLS/8 colunas.
+// Workgroup de 256 threads (4 waves), tile **BM=128 linhas x BN=min(COLS, 32) colunas x
+// BK=32**; blocos maiores que 32 viram `COLS/32` tiles de coluna em `gl_WorkGroupID.y`.
+// As 256 threads sao uma grade 32 x 8: cada uma calcula TM=4 linhas por TN=BN/8 colunas.
 // Por passo de K, a thread le TM*8 uints de peso e TN*8 de ativacao da LDS e faz TM*TN*8
 // dots — intensidade TM*TN/(TM+TN) = 2 com COLS=32, que e o ponto do exercicio.
 //
@@ -41,18 +42,17 @@
 //
 // ## Formato
 //
-// So Q4_K. E 53% do tempo de matvec no Qwen3.8-27B (`docs/decode-por-configuracao.md`),
-// contra 18,6% do Q6_K e 5,3% do Q5_K — os outros tipos seguem no matvec-COLS, que o
-// plano escolhe por tipo de peso. O layout do superbloco e o mesmo lido em
-// `q4_k_matvec.comp`, que documenta a extracao de escala e minimo de 6 bits.
+// Q4_K, Q5_K e Q6_K, pela constante `TIPO` (ver abaixo); o plano escolhe por tipo de peso.
+// Os layouts de superbloco sao os de `q4_k_matvec.comp`, `q5_k_matvec.comp` e
+// `q6_k_matvec.comp`, que documentam a extracao de escala e minimo de 6 bits.
 //
 // O termo afim do Q4_K (`- dmin * m * soma(x)`) sobrevive ao tiling porque `soma(x)` so
 // depende da coluna: e calculada uma vez por (coluna, passo de K) e guardada na LDS junto
 // com a escala da ativacao.
 
 layout(local_size_x = 256) in;
-// Colunas do tile = tokens do bloco de prefill. Multiplo de 8 (a grade de threads tem 8
-// grupos de coluna) e no maximo 64 (acima disso TN passa de 8 e os acumuladores estouram).
+// Colunas = tokens do bloco de prefill. Ate 32, multiplo de 8 (a grade de threads tem 8
+// grupos de coluna); acima disso, multiplo de 32 (um tile de 32 por `gl_WorkGroupID.y`).
 layout(constant_id = 0) const uint COLS = 32u;
 // Tipo do peso: 0 = Q4_K, 1 = Q5_K, 2 = Q6_K. Só a carga e o desempacotamento do tile de
 // peso mudam — na LDS os três viram int8 com escala por sub-bloco, e o laço de conta é o
@@ -69,7 +69,13 @@ const uint THREADS = 256u;
 const uint COL_GRUPOS = 8u;
 const uint LINHA_GRUPOS = THREADS / COL_GRUPOS;  // 32
 const uint TM = BM / LINHA_GRUPOS;               // 4 linhas por thread
-const uint TN = COLS / COL_GRUPOS;               // colunas por thread
+// Colunas por tile: o bloco inteiro até 32, e fatias de 32 acima disso, uma por
+// `gl_WorkGroupID.y` — como os tiles de `J` colunas do MMQ do llama.cpp. Acima de 32 as
+// colunas deixariam de caber numa passada de carga (8 uints cada, 256 threads) e TN passaria
+// de 4 acumuladores por linha; fatiar mantém o tile e multiplica os workgroups, que é o que
+// faltava (136 workgroups para 60 CUs no ffn_gate com o bloco de 32).
+const uint BN = COLS < 32u ? COLS : 32u;
+const uint TN = BN / COL_GRUPOS;                 // colunas por thread
 // Passo das linhas (peso) e colunas (ativacao) na LDS: 9 uints, nao 8. Com 8, as linhas que
 // as threads de uma wave leem juntas ficavam a 32 palavras umas das outras — todas no mesmo
 // banco, leitura 8x serializada. 9 e coprimo com os 32 bancos.
@@ -101,10 +107,10 @@ shared uint lw[BM * LDS_PASSO];
 shared float lwsc[BM];    // d * sc do sub-bloco (no Q6_K, da primeira metade de 16)
 shared float lwsc2[BM];   // Q6_K: d * sc da segunda metade de 16
 shared float lwoff[BM];   // -dmin * m do sub-bloco (Q4_K/Q5_K)
-// Tile de ativacao: COLS colunas x 32 int8, mais escala e soma dos int8 por coluna.
-shared int lx[COLS * LDS_PASSO];
-shared float lxd[COLS];
-shared float lxs[COLS];
+// Tile de ativacao: BN colunas x 32 int8, mais escala e soma dos int8 por coluna.
+shared int lx[BN * LDS_PASSO];
+shared float lxd[BN];
+shared float lxs[BN];
 
 // Byte `i` (0..11) de scales[], nos bytes 4..15 do superbloco — ver `q4_k_matvec.comp`.
 uint scale_byte(uvec4 hdr, uint i) {
@@ -137,7 +143,7 @@ uint wpack(uint qsw, bool hi) {
 // (Q5_K). Q6_K: `qs` = 4 uints de `ql`, `qh` = 4 uints de `qh`, `hdr.x` = d, `hdr.y` = o
 // uint com a escala i8 do sub-bloco de 16 desta thread.
 void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, uint x_u,
-            uint t, inout uvec4 hdr, inout uvec4 qs, inout uvec4 qh, inout int xq,
+            uint t, uint col0, inout uvec4 hdr, inout uvec4 qs, inout uvec4 qh, inout int xq,
             inout float xd, inout int xs[8]) {
     uint sb = k0 >> 8u;
     uint j = (k0 >> 5u) & 7u;
@@ -171,11 +177,11 @@ void buscar(uint k0, uint lg, uint linha4, uint n_blk, bool w_alta, uint x_col, 
             }
         }
     }
-    if (x_col < COLS) {
-        xq = xq_buf.xq[(x_col * n_blk + blk) * 8u + x_u];
+    if (x_col < BN) {
+        xq = xq_buf.xq[((col0 + x_col) * n_blk + blk) * 8u + x_u];
     }
-    if (t < COLS) {
-        uint cb = t * n_blk + blk;
+    if (t < BN) {
+        uint cb = (col0 + t) * n_blk + blk;
         xd = xd_buf.xd[cb];
         // O Q6_K não tem termo de mínimo: a soma dos int8 da ativação não entra.
         if (TIPO != Q6K) {
@@ -194,6 +200,7 @@ uint menos32(uint v) {
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint linha0 = gl_WorkGroupID.x * BM;
+    uint col0 = gl_WorkGroupID.y * BN;   // primeira coluna (token) do tile
 
     uint n_sb = pc.n_in / 256u;
     // Tamanho da linha de peso: em uvec4 (Q4_K/Q5_K) ou em uints (Q6_K).
@@ -203,8 +210,8 @@ void main() {
     // Carga do tile de peso: duas threads por linha, uma para cada metade dos 32 elementos.
     uint w_linha = t >> 1u;
     bool w_alta = (t & 1u) != 0u;
-    // Carga do tile de ativacao: uma thread por (coluna, uint). COLS <= 32 garante
-    // COLS * 8 <= 256, entao cabe numa passada.
+    // Carga do tile de ativacao: uma thread por (coluna, uint). BN <= 32 garante
+    // BN * 8 <= 256, entao cabe numa passada.
     uint x_col = t >> 3u;
     uint x_u = t & 7u;
 
@@ -226,7 +233,8 @@ void main() {
     float r_xd = 0.0;
     int r_xs[8];
     for (uint u = 0u; u < 8u; u++) { r_xs[u] = 0; }
-    buscar(0u, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_qh, r_xq, r_xd, r_xs);
+    buscar(0u, lg, linha4, n_blk, w_alta, x_col, x_u, t, col0, r_hdr, r_qs, r_qh, r_xq, r_xd,
+           r_xs);
 
     for (uint k0 = 0u; k0 < pc.n_in; k0 += BK) {
         uint j = (k0 >> 5u) & 7u;    // sub-bloco de 32 dentro do superbloco
@@ -273,10 +281,10 @@ void main() {
             lwsc2[w_linha] = 0.0;
             lwoff[w_linha] = 0.0;
         }
-        if (x_col < COLS) {
+        if (x_col < BN) {
             lx[x_col * LDS_PASSO + x_u] = r_xq;
         }
-        if (t < COLS) {
+        if (t < BN) {
             lxd[t] = r_xd;
             // Soma dos int8 do bloco, para o termo do `dmin`. So depende da coluna.
             int isx = 0;
@@ -291,8 +299,8 @@ void main() {
         barrier();
 
         if (k0 + BK < pc.n_in) {
-            buscar(k0 + BK, lg, linha4, n_blk, w_alta, x_col, x_u, t, r_hdr, r_qs, r_qh, r_xq, r_xd,
-                   r_xs);
+            buscar(k0 + BK, lg, linha4, n_blk, w_alta, x_col, x_u, t, col0, r_hdr, r_qs, r_qh,
+                   r_xq, r_xd, r_xs);
         }
 
         // As colunas desta thread saem da LDS uma vez e servem as TM linhas.
@@ -341,7 +349,7 @@ void main() {
         if (rr >= pc.n_out) { continue; }
         float bias = pc.tem_bias != 0u ? bias_buf.b[rr] : 0.0;
         for (uint c = 0u; c < TN; c++) {
-            out_buf.y[(tj * TN + c) * pc.n_out + rr] = acc[r * TN + c] + bias;
+            out_buf.y[(col0 + tj * TN + c) * pc.n_out + rr] = acc[r * TN + c] + bias;
         }
     }
 }
