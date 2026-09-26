@@ -42,6 +42,19 @@ RADV_THREAD_TRACE_BUFFER_SIZE=134217728 ./target/release/llama-cli ...
 `RADV_PROFILE_PSTATE` é `peak` por padrão nessa captura — os números do RGP **não** são
 comparáveis com os de uma execução normal (clock diferente).
 
+## VRAM, temperatura e clock durante um teste
+
+```bash
+scripts/rodar-limitado.sh ./target/release/llama-cli -m modelo.gguf ... &
+scripts/monitor-gpu.sh $!
+```
+
+Amostra VRAM livre, junction/mem, potência e o nível de `sclk`/`mclk` de cada MI50 a cada 0,25 s
+e mata **o PID** (nunca por nome) se a GPU do monitor ficar com menos de 2048 MiB livres, a outra
+com menos de 500 MiB, a junction passar de 104 °C ou a HBM de 90 °C. Com o monitor em repouso
+(conector `disconnected`) vale 2048 MiB para todas. Ao fim imprime mínimos, máximos e o
+histograma de clocks por GPU; o log tem uma linha por GPU e amostra. Sai com 3 quando matou.
+
 ## Variáveis de ambiente úteis
 
 | Variável | Efeito |
