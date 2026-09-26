@@ -24,6 +24,13 @@ numactl --interleave=all ./target/release/llama-server \
 
 Rotas: `POST /v1/chat/completions` (com e sem `stream`), `GET /v1/models`, `GET /health`.
 
+As gerações são atendidas uma por vez; até 4 esperam na fila, e além disso a resposta é 503
+com `Retry-After`. `/health` e `/v1/models` respondem mesmo durante uma geração. Prazos do
+socket: `--timeout-leitura` (30 s sem receber nada → 408) e `--timeout-escrita` (60 s com a
+escrita bloqueada → a geração é cancelada). Parâmetro inválido (`temperature` fora de
+[0, 2], `n > 1`, `response_format` que não seja `text`...) é 400, e `model` diferente do
+`--nome` é 404 `model_not_found`.
+
 ## Config do opencode
 
 `~/.config/opencode/opencode.json`:
@@ -104,7 +111,8 @@ bate byte a byte e nem isso é preciso.
 ## Custo de contexto em VRAM
 
 O KV-cache só existe nas camadas de atenção (16 das 65 no Qwen3.8-27B; as delta-net têm
-estado de tamanho fixo). São **136 KB por token**:
+estado de tamanho fixo). São **64 KiB por token** (16 camadas × kv_dim 1024 × K e V × 2 B
+do f16):
 
 | ctx | KV-cache |
 |---:|---:|

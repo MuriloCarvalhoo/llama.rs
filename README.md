@@ -74,7 +74,7 @@ contra a VRAM livre — ver `scripts/run.sh -h`.
 | Qwen2 / Qwen2.5 (denso) | ✅ |
 | Qwen3.5 / 3.8 (híbrido atenção + gated delta-net) | ✅ |
 | Servidor HTTP (API OpenAI) com tools e reasoning | ✅ `llama-server` — ver [`docs/servidor-opencode.md`](docs/servidor-opencode.md) |
-| MTP / speculative decoding | ⏳ não implementado — ver [`docs/mtp-e-k80.md`](docs/mtp-e-k80.md) |
+| MTP / speculative decoding | ✅ `--mtp` no `llama-cli` e no `llama-server`, desligado por padrão: +29% de decode com contexto curto e −9% perto de 30k tokens — ver [`docs/benchmark-conversa-longa-2026-09-25.md`](docs/benchmark-conversa-longa-2026-09-25.md) e [`docs/mtp-implementacao.md`](docs/mtp-implementacao.md) |
 
 ## Estrutura do workspace
 
