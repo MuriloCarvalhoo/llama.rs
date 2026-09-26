@@ -128,8 +128,12 @@ def crescer(porta, motor, rotulo):
         for u, a in pares[:k - 1]:
             base += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
         # Turno normal: só a mensagem nova, para o cache crescer em pedaços de ~1,5k tokens.
-        corpo = {"messages": base + [{"role": "user", "content": pares[k - 1][0]}], "max_tokens": 1,
-                 "temperature": 0, "stream": False}
+        # MARCO_NATURAL=1: no marco o próprio turno gera 256 tokens, sem trocar a última
+        # mensagem pela pergunta final — a conversa não ramifica (o llama.rs guarda um
+        # snapshot só; ramificar invalida o cache dele).
+        natural = os.environ.get("MARCO_NATURAL") == "1" and k in marcos
+        corpo = {"messages": base + [{"role": "user", "content": pares[k - 1][0]}],
+                 "max_tokens": MAX_TOKENS if natural else 1, "temperature": 0, "stream": False}
         esfriar(75)
         # HOLD_PREFILL=standard: clock fixo só durante o turno de prefill (o llama.cpp não
         # tem controle térmico e leva a card1 a 101-104 °C em segundos no automático).
@@ -149,7 +153,10 @@ def crescer(porta, motor, rotulo):
         t = j.get("timings", {})
         print(json.dumps({"turno": k, "prompt_tokens": j["usage"]["prompt_tokens"], "prompt_n": t.get("prompt_n"),
                           "prompt_tps": t.get("prompt_per_second")}), flush=True)
-        if k in marcos:
+        if natural:
+            print("MARCO " + json.dumps({"marco": marcos[k], "turnos": k, "prompt_tokens": j["usage"]["prompt_tokens"],
+                                         "saida": j["usage"]["completion_tokens"]}), flush=True)
+        elif k in marcos:
             u, a = pares[k - 1]
             msgs = base + [{"role": "user", "content": u}, {"role": "assistant", "content": a},
                            {"role": "user", "content": PERGUNTA}]

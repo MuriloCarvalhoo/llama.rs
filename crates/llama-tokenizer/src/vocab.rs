@@ -156,6 +156,15 @@ impl Vocab {
         Ok(vocab)
     }
 
+    /// `id` é de controle (type 3) ou user-defined (type 4) — o mesmo critério de
+    /// [`Self::especiais`].
+    pub(crate) fn e_especial(&self, id: u32) -> bool {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.token_types.get(i))
+            .is_some_and(|&t| t == 3 || t == 4)
+    }
+
     /// Tokens de controle (type 3) e user-defined (type 4), do mais longo para o
     /// mais curto — a ordem que `encode_special` precisa para casar o maior primeiro.
     ///

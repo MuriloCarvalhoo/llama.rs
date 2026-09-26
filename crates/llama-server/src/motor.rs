@@ -144,9 +144,16 @@ impl<'a> Motor<'a> {
         let Preparado { ids, t_req } = preparado;
         let ja_no_cache = prefixo_comum(self.sessao.tokens(), &ids, self.sessao.marca());
         let t0 = std::time::Instant::now();
+        // Snapshot logo depois do último token especial (o `<think>` do prompt de geração):
+        // é a última posição que o turno seguinte re-renderiza igual — ver
+        // `Sessao::prefill_com_fronteira`.
+        let fronteira = ids
+            .iter()
+            .rposition(|&t| self.tokenizer.e_especial(t))
+            .map_or(ids.len(), |i| i + 1);
         let mut logits = self
             .sessao
-            .prefill(self.gpu, &ids)
+            .prefill_com_fronteira(self.gpu, &ids, fronteira)
             .map_err(erro_backend)?
             .to_vec();
 

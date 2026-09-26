@@ -5,8 +5,9 @@
 //! comprimento e deixar os tokens novos reescreverem os slots), mas o estado recorrente
 //! é o produto de todos os tokens processados até aqui, em ordem, e não desanda.
 //!
-//! Daí o **snapshot de fronteira de turno**: no fim do prefill de cada requisição a
-//! sessão manda o backend copiar o estado recorrente e o comprimento do KV. Uma
+//! Daí o **snapshot de fronteira de turno**: no prefill de cada requisição a sessão manda
+//! o backend copiar o estado recorrente e o comprimento do KV — logo depois do último token
+//! especial do prompt, não no fim dele (ver `Sessao::prefill_com_fronteira`). Uma
 //! divergência depois dessa posição passa a custar o recuo até ela, não o prompt inteiro.
 //! É exatamente a divergência que aparece na prática — o turno seguinte re-renderiza a
 //! **resposta** que o modelo acabou de gerar (bloco de raciocínio removido, chamada de
@@ -174,43 +175,69 @@ mod com_backend {
         }
 
         /// Processa `ids` aproveitando o que já estiver no cache e devolve os logits
-        /// do último token.
+        /// do último token. O snapshot fica no fim do prompt — ver
+        /// [`Self::prefill_com_fronteira`] para pô-lo antes.
         pub fn prefill(
             &mut self,
             gpu: &dyn GpuResidentDecode,
             ids: &[u32],
         ) -> Result<&[f32], ModelError> {
+            self.prefill_com_fronteira(gpu, ids, ids.len())
+        }
+
+        /// Como [`Self::prefill`], com o snapshot em `ids[..fronteira]` em vez do fim.
+        ///
+        /// O fim do prompt não é uma fronteira estável: o prompt de geração do qwen35
+        /// termina em `<think>` + `\n`, e o turno seguinte re-renderiza a resposta como
+        /// `<think>` + `\n\n</think>` — o BPE funde os dois `\n`, e a divergência cai **um
+        /// token antes** do snapshot, que então não serve (medido em 2026-09-25: `0 do
+        /// cache` em todo turno de uma conversa de 20). Logo depois de um token especial
+        /// a fronteira não se mexe, porque o BPE nunca o funde com o texto ao redor.
+        ///
+        /// Quando o cache já passou de `fronteira` (o prompt novo só cresceu além dela),
+        /// não dá para voltar e fotografar ali: o snapshot vai para o fim, como antes.
+        pub fn prefill_com_fronteira(
+            &mut self,
+            gpu: &dyn GpuResidentDecode,
+            ids: &[u32],
+            fronteira: usize,
+        ) -> Result<&[f32], ModelError> {
             if ids.is_empty() {
                 return Err(ModelError::Gpu("prompt vazio".into()));
             }
-            match planejar_reuso(&self.tokens, ids, self.marca) {
-                Reuso::Completo => {}
-                Reuso::Anexar { pos } => self.processar(gpu, ids, pos)?,
+            let fronteira = fronteira.min(ids.len());
+            let inicio = match planejar_reuso(&self.tokens, ids, self.marca) {
+                Reuso::Completo => None,
+                Reuso::Anexar { pos } => Some(pos),
                 // O snapshot cobre a divergência: restaura e reprocessa só dali.
                 // Se o backend recusar, não sobra alternativa senão o caminho de baixo.
                 Reuso::RecuarPara { pos } if gpu.restaurar() => {
                     self.tokens.truncate(pos);
-                    self.processar(gpu, ids, pos)?;
+                    Some(pos)
                 }
                 Reuso::RecuarPara { .. } | Reuso::Reiniciar => {
-                    self.reiniciar(gpu, ids)?;
+                    gpu.reset();
+                    self.tokens.clear();
+                    self.marca = None;
+                    Some(0)
                 }
+            };
+            let Some(pos) = inicio else {
+                // Nada a processar: o snapshot de antes continua valendo.
+                return Ok(&self.logits);
+            };
+            if pos < fronteira && fronteira < ids.len() {
+                // Fronteira de turno: o que vier depois dela é o prompt de geração e a
+                // resposta, que o turno seguinte re-renderiza (e pode divergir).
+                // `fronteira < ids.len()` no `if`: o `get` nunca cai no `unwrap_or`.
+                self.processar(gpu, ids.get(..fronteira).unwrap_or(ids), pos)?;
+                self.marca = gpu.marcar().then_some(fronteira);
+                self.processar(gpu, ids, fronteira)?;
+            } else {
+                self.processar(gpu, ids, pos)?;
+                self.marca = gpu.marcar().then_some(self.tokens.len());
             }
-            // Fronteira de turno: o que vier depois daqui é resposta gerada, e é ela que o
-            // turno seguinte re-renderiza (e pode divergir). Ver o módulo.
-            self.marca = gpu.marcar().then_some(self.tokens.len());
             Ok(&self.logits)
-        }
-
-        fn reiniciar(
-            &mut self,
-            gpu: &dyn GpuResidentDecode,
-            ids: &[u32],
-        ) -> Result<(), ModelError> {
-            gpu.reset();
-            self.tokens.clear();
-            self.marca = None;
-            self.processar(gpu, ids, 0)
         }
 
         /// Decodifica `token` na posição seguinte à última e devolve os logits.
@@ -526,5 +553,77 @@ mod testes_de_sessao {
         let mut s = Sessao::nova(&gpu);
         s.prefill(&gpu, &[1, 2, 3]).unwrap();
         assert_eq!(s.marca(), None);
+    }
+
+    /// O turno de uma conversa real: o prompt termina no prompt de geração (`<think>`,
+    /// `\n`), e o turno seguinte re-renderiza esse fim de outro jeito (o BPE funde o `\n`
+    /// com o que vem depois). Com a fronteira logo depois do token especial, a divergência
+    /// cai **depois** do snapshot e só o fim é reprocessado.
+    #[test]
+    fn snapshot_na_fronteira_sobrevive_ao_fim_re_renderizado() {
+        let gpu = BackendFalso::com_snapshot(1);
+        let mut s = Sessao::nova(&gpu);
+        // [histórico 1 2 3] [especial 4] [\n 5]
+        s.prefill_com_fronteira(&gpu, &[1, 2, 3, 4, 5], 4).unwrap();
+        assert_eq!(s.marca(), Some(4));
+        s.decode(&gpu, 6).unwrap();
+        gpu.chamadas.borrow_mut().clear();
+
+        // O turno seguinte: o `5` virou `7` (o `\n` fundido), e vem mais conversa.
+        s.prefill_com_fronteira(&gpu, &[1, 2, 3, 4, 7, 8, 9, 4, 5], 8)
+            .unwrap();
+
+        assert_eq!(
+            gpu.registradas(),
+            vec![
+                "Restaurar".to_owned(),
+                "Decode(7, 4)".to_owned(),
+                "Decode(8, 5)".to_owned(),
+                "Decode(9, 6)".to_owned(),
+                "Decode(4, 7)".to_owned(),
+                "Marcar".to_owned(),
+                "Decode(5, 8)".to_owned(),
+            ]
+        );
+        assert_eq!(s.marca(), Some(8));
+        assert_eq!(s.tokens(), &[1, 2, 3, 4, 7, 8, 9, 4, 5]);
+    }
+
+    /// O mesmo turno com o snapshot no fim do prompt (o `prefill` de sempre): a
+    /// divergência no último token o invalida e tudo é reprocessado — o defeito que a
+    /// fronteira resolve.
+    #[test]
+    fn snapshot_no_fim_nao_sobrevive_ao_fim_re_renderizado() {
+        let gpu = BackendFalso::com_snapshot(1);
+        let mut s = Sessao::nova(&gpu);
+        s.prefill(&gpu, &[1, 2, 3, 4, 5]).unwrap();
+        s.decode(&gpu, 6).unwrap();
+        gpu.chamadas.borrow_mut().clear();
+
+        s.prefill(&gpu, &[1, 2, 3, 4, 7, 8]).unwrap();
+
+        assert_eq!(gpu.registradas().first().map(String::as_str), Some("Reset"));
+    }
+
+    /// Cache que já passou da fronteira (o prompt só cresceu): não dá para fotografar
+    /// atrás, o snapshot vai para o fim.
+    #[test]
+    fn fronteira_ja_processada_marca_no_fim() {
+        let gpu = BackendFalso::com_snapshot(1);
+        let mut s = Sessao::nova(&gpu);
+        s.prefill(&gpu, &[1, 2, 3]).unwrap();
+        gpu.chamadas.borrow_mut().clear();
+
+        s.prefill_com_fronteira(&gpu, &[1, 2, 3, 4, 5], 2).unwrap();
+
+        assert_eq!(
+            gpu.registradas(),
+            vec![
+                "Decode(4, 3)".to_owned(),
+                "Decode(5, 4)".to_owned(),
+                "Marcar".to_owned()
+            ]
+        );
+        assert_eq!(s.marca(), Some(5));
     }
 }

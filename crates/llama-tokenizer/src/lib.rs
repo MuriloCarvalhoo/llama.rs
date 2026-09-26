@@ -108,6 +108,13 @@ impl Tokenizer {
         out
     }
 
+    /// `id` é um marcador do chat template (tipo CONTROL ou USER_DEFINED no GGUF) — os
+    /// mesmos que `encode_special` resolve inteiros. O BPE nunca os funde com o texto
+    /// vizinho, então a posição logo depois de um deles é estável entre renderizações.
+    pub fn e_especial(&self, id: u32) -> bool {
+        self.vocab.e_especial(id)
+    }
+
     /// Decodifica ids em texto, revertendo a codificação SPM ou BPE.
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut encoded = String::new();
