@@ -81,8 +81,10 @@ pub fn parse_pedido(corpo: &[u8]) -> Result<Pedido, ApiError> {
         .map_err(|e| ApiError::Chat(e.to_string()))?;
 
     // Parâmetro que muda a resposta e chega inválido é erro, não default silencioso: antes
-    // `max_tokens: -1` virava "sem limite" e `temperature: 5` passava direto. `null` vale
-    // como ausente — é como vários clientes mandam os campos opcionais.
+    // `temperature: 5` passava direto. `null` vale como ausente — é como vários clientes
+    // mandam os campos opcionais — e `max_tokens: -1` também: é como o llama.cpp diz "sem
+    // limite", e clientes feitos para ele mandam assim.
+    let sem_limite = |nome: &str| v.get(nome).and_then(Value::as_i64) == Some(-1);
     let campo = |nome: &str| v.get(nome).filter(|x| !x.is_null());
     let numero =
         |nome: &str, faixa: &str, ok: fn(f64) -> bool| match campo(nome) {
@@ -102,8 +104,16 @@ pub fn parse_pedido(corpo: &[u8]) -> Result<Pedido, ApiError> {
                 ApiError::Parametro(format!("`{nome}` tem de ser um inteiro >= {minimo}"))
             }),
     };
-    let max_tokens = inteiro("max_tokens", 1)?;
-    let max_completion_tokens = inteiro("max_completion_tokens", 1)?;
+    let max_tokens = if sem_limite("max_tokens") {
+        None
+    } else {
+        inteiro("max_tokens", 1)?
+    };
+    let max_completion_tokens = if sem_limite("max_completion_tokens") {
+        None
+    } else {
+        inteiro("max_completion_tokens", 1)?
+    };
     let temperatura = numero("temperature", "entre 0 e 2", |t| (0.0..=2.0).contains(&t))?;
     let top_p = numero("top_p", "em (0, 1]", |p| p > 0.0 && p <= 1.0)?;
     let top_k = inteiro("top_k", 0)?;
@@ -283,21 +293,9 @@ pub fn lista_de_modelos(nome: &str, criado: u64) -> Value {
 }
 
 /// O `model` do pedido é o servido? Ausente vale (clientes locais costumam omitir), e a caixa
-/// não importa. Qualquer outro nome é 404: responder com outro modelo sem avisar esconde erro
-/// de configuração do cliente.
+/// não importa. Outro nome não é recusado — o servidor tem um modelo só —, mas vai para o log.
 pub fn modelo_confere(pedido: &str, servido: &str) -> bool {
     pedido.is_empty() || pedido.eq_ignore_ascii_case(servido)
-}
-
-/// O 404 de modelo inexistente, com o `code` que a OpenAI usa.
-pub fn erro_modelo_json(pedido: &str, servido: &str) -> Vec<u8> {
-    let v = json!({"error": {
-        "message": format!("modelo `{pedido}` não existe neste servidor; o servido é `{servido}`"),
-        "type": "invalid_request_error",
-        "param": "model",
-        "code": "model_not_found",
-    }});
-    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 pub fn erro_json(mensagem: &str) -> Vec<u8> {
@@ -396,10 +394,11 @@ mod tests {
     }
 
     /// Parâmetro que muda a resposta e chega inválido é erro do pedido, não default
-    /// silencioso: `max_tokens: -1` virava "sem limite" sem o cliente saber.
+    /// silencioso. `-1` é a exceção: é o "sem limite" do llama.cpp.
     #[test]
     fn max_tokens_tem_de_ser_inteiro_positivo() {
-        for ruim in ["0", "-1", "1.5", "\"10\""] {
+        assert_eq!(com(r#""max_tokens":-1"#).unwrap().max_tokens, None);
+        for ruim in ["0", "-2", "1.5", "\"10\""] {
             assert!(
                 matches!(
                     com(&format!(r#""max_tokens":{ruim}"#)),
@@ -449,14 +448,6 @@ mod tests {
         assert!(modelo_confere("", "qwen3.8-27b"));
         assert!(modelo_confere("Qwen3.8-27B", "qwen3.8-27b"));
         assert!(!modelo_confere("gpt-4o", "qwen3.8-27b"));
-    }
-
-    #[test]
-    fn erro_de_modelo_tem_o_codigo_da_openai() {
-        let v: Value = serde_json::from_slice(&erro_modelo_json("gpt-4o", "qwen")).unwrap();
-        assert_eq!(v["error"]["code"], "model_not_found");
-        assert_eq!(v["error"]["param"], "model");
-        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[test]

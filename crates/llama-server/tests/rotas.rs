@@ -235,9 +235,10 @@ fn stream_com_tool_call_manda_o_delta_de_tool_calls() {
     );
 }
 
-/// `model` diferente do servido é 404 no formato da OpenAI, e no streaming antes do SSE.
+/// `model` diferente do servido é atendido com o modelo servido (há um só), como no
+/// llama.cpp: recusar quebraria o opencode quando o servidor sobe sem `--nome`.
 #[test]
-fn modelo_diferente_do_servido_responde_404_model_not_found() {
+fn modelo_diferente_do_servido_e_atendido() {
     for stream in [false, true] {
         let corpo = json!({
             "model": "gpt-4o",
@@ -248,9 +249,7 @@ fn modelo_diferente_do_servido_responde_404_model_not_found() {
             &req("POST", "/v1/chat/completions", &corpo.to_string()),
             "</think>ok<|im_end|>",
         );
-        assert!(r.starts_with("HTTP/1.1 404"), "stream={stream}: {r}");
-        assert!(!r.contains("text/event-stream"), "stream={stream}: {r}");
-        assert_eq!(corpo_json(&r)["error"]["code"], "model_not_found");
+        assert!(r.starts_with("HTTP/1.1 200"), "stream={stream}: {r}");
     }
 }
 

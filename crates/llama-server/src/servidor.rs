@@ -163,13 +163,19 @@ fn rota_rapida<W: Write>(
     Ok(true)
 }
 
-/// O corpo de um chat vira pedido, ou status e corpo do erro: 400 para parâmetro inválido,
-/// 404 para modelo que não é o servido. O que depende do tokenizer (o contexto) fica para o
-/// `Motor::preparar`, no worker.
+/// O corpo de um chat vira pedido, ou status e corpo do erro (400 para parâmetro inválido).
+/// O que depende do tokenizer (o contexto) fica para o `Motor::preparar`, no worker.
+///
+/// `model` diferente do servido **não** é erro: o servidor tem um modelo só e responde com
+/// ele, como o llama.cpp — um 404 quebraria o opencode quando o servidor sobe sem `--nome`.
+/// Mas fica no log, para o erro de configuração do cliente não passar calado.
 fn validar_chat(corpo: &[u8], nome: &str) -> Result<Pedido, (u16, Vec<u8>)> {
     let pedido = api::parse_pedido(corpo).map_err(|e| (400, api::erro_json(&e.to_string())))?;
     if !api::modelo_confere(&pedido.modelo, nome) {
-        return Err((404, api::erro_modelo_json(&pedido.modelo, nome)));
+        eprintln!(
+            "[api] pedido para o modelo `{}`; respondendo com `{nome}`, o único servido",
+            pedido.modelo
+        );
     }
     Ok(pedido)
 }

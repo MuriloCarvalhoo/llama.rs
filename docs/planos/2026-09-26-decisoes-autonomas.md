@@ -14,6 +14,32 @@ e como desfazer.
 - **3.1 (refrigeração da card1) não é executado**: pede root (`pwm1`/`power1_cap`) e é decisão de
   hardware do usuário. Fica anotado com a recomendação no fim deste arquivo.
 
+## Agente principal
+
+1. **0.1 — snapshot logo depois do último token especial, e um só.** A causa do `0 do cache`
+   era o BPE fundir o `\n` final do prompt de geração com o turno seguinte; a fronteira depois
+   de um token especial (`Tokenizer::e_especial`) não se mexe. **Não** implementei vários
+   checkpoints: cada snapshot custa ~155 MB de VRAM (estado recorrente das 48 camadas lineares)
+   e o uso real (opencode) é uma conversa que só cresce. Uma conversa que **ramifica** (trocar
+   uma mensagem do meio) ainda reinicia. Desfazer: `motor.rs` voltar a chamar `prefill`.
+2. **A verificação do 0.1 usa turnos naturais** (`MARCO_NATURAL=1` em
+   `scripts/bench-conversa/conversa.py`): o protocolo do benchmark de 2026-09-25 troca a última
+   mensagem pela pergunta final nos marcos, o que é justamente uma ramificação.
+3. **GEMM do Q6_K fica opcional** (`LLAMA_RS_GEMM_Q6K=1`): no bloco 32 ele foi mais lento que o
+   matvec-COLS (39,5 contra 35 ms por bloco). O Q5_K vai pelo GEMM por padrão (52 → 14,7 ms).
+4. **Revisei duas escolhas do agente A** (itens 1 e 2 da seção dele):
+   - `model` diferente do servido **é atendido** (com uma linha `[api]` no log), como no
+     llama.cpp. O 404 quebraria o opencode sempre que o servidor subisse sem `--nome`, e o
+     servidor tem um modelo só. Desfazer: voltar o `return Err((404, ...))` em
+     `servidor::validar_chat`.
+   - `max_tokens: -1` (e `max_completion_tokens: -1`) vale como "sem limite", como no llama.cpp;
+     os demais valores ≤ 0 seguem 400.
+5. **"Veja como o llama.cpp faz de melhor, como o perfil, e copie em Rust"** — li como **o perfil
+   do prefill**, onde o llama.cpp é 2,8× mais rápido (318 contra 115 tok/s com 7,6k): estudar o
+   MMQ do HIP e portar a ideia para os shaders Vulkan, no padrão do repositório (item 1.4 + 1.2).
+   Se o pedido era sobre a ferramenta de perfil em si, o `LLAMA_RS_PROFILE` já dá o tempo por op
+   e o que falta é o 3.2 (memória).
+
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao
