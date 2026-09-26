@@ -94,9 +94,28 @@ e como desfazer.
       então não é latência de memória.
     **Não entrou nada.** Descobrir o que limita o split16 pede o RGP, não mais tentativas.
     Ficaram a bancada e casos de 3 e 5 tokens no teste de correção da atenção fatiada.
-    Achado de passagem: os dois GEMM do prefill com 16 KB de LDS usam 256 VGPRs e derramam
-    115–123 registradores (15 KB de scratch cada) — `RADV_DEBUG=shaderstats,nocache` com
-    `MESA_SHADER_CACHE_DISABLE=true`. Candidato forte para o 1.2.
+    Achado de passagem, **não identificado**: dois pipelines com 16 KB de LDS usam 256 VGPRs
+    e derramam 115–123 registradores (15 KB de scratch cada), pelo
+    `RADV_DEBUG=shaderstats,nocache` com `MESA_SHADER_CACHE_DISABLE=true`. A saída não traz
+    o nome do shader. Pela conta de LDS não são os GEMM (o `mul_mm.comp` declara ~7 KB, o
+    `mul_mm_q4k.comp` ~13,5 KB). Vale descobrir quais são antes do 1.2: se estiverem no
+    caminho do prefill, é custo de graça.
+
+11. **2.0 — MTP só abaixo de 12k de contexto (`MTP_ATE`), e não uma escolha medida.**
+    Medido com o `llama-cli` (MTP em todo passo contra sem MTP, 2–3 execuções intercaladas,
+    as GPUs esfriando a 65 °C entre elas): +3% com 1k, −3% com 4k, empate com 8k, −12 a −21%
+    com 16k e −13% com 29k. Entre execuções da mesma configuração o decode varia ~10% (a 16k,
+    20,8 e 24,8 tok/s sem MTP), então só diferenças maiores que isso contam.
+    - **Tentei antes uma escolha adaptativa** (os tokens/s de cada modo, provando o outro a
+      cada 64 passos) e descartei: a cabeça MTP tem KV-cache próprio, que não anda durante os
+      passos simples, e as provas de MTP saíam com aceitação menor — medido dentro de uma
+      execução, o MTP aparecia a 20,6 tok/s contra 28,5 do simples a 1k, onde as execuções
+      separadas dão empate. A estimativa favorecia o simples por construção.
+    - **O limite é um palpite informado, não um ótimo:** o ganho no curto depende do texto
+      (+29% numa conversa de 20 turnos com 1,4k, em 2026-09-25), a perda no fundo não.
+      `LLAMA_RS_MTP_ATE=N` muda o limite sem recompilar (`0` = sempre).
+    - Com temp 0 a saída continua idêntica com e sem MTP (conferido a 1k).
+    Desfazer: `MTP_ATE = usize::MAX`.
 
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 

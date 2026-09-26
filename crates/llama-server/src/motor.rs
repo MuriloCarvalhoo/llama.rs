@@ -230,7 +230,8 @@ impl<'a> Motor<'a> {
             }
             // O verify escreve `VERIFY_TOK` posições a partir da de `token`; sem espaço para
             // todas, o resto da geração segue token a token.
-            if usar_mtp && self.sessao.tokens().len() + VERIFY_TOK <= self.ctx {
+            let pos = self.sessao.tokens().len();
+            if usar_mtp && pos + VERIFY_TOK <= self.ctx && llama_model::mtp_compensa(pos) {
                 let passo = self
                     .sessao
                     .passo_mtp(self.gpu, &sampler, &mut rng, token)

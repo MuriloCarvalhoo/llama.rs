@@ -34,8 +34,8 @@ pub use error::ModelError;
 #[cfg(feature = "gpu")]
 pub use gpu::{
     AuxLayer, GpuAuxWeights, GpuLayerRaw, GpuMatmul, GpuRawWeights, GpuResidentDecode,
-    HIDDEN_CABECA, MixerRaw, MtpAux, MtpRaw, PassoMtp, QTensor, TokenEmbd, VERIFY_TOK,
-    gerar_streaming_residente,
+    HIDDEN_CABECA, MTP_ATE, MixerRaw, MtpAux, MtpRaw, PassoMtp, QTensor, TokenEmbd, VERIFY_TOK,
+    gerar_streaming_residente, mtp_compensa,
 };
 pub use model::Model;
 #[cfg(feature = "gpu")]

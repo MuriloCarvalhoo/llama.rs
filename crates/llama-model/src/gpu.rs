@@ -689,7 +689,7 @@ fn gerar_ids_residente(
         }
 
         // `next` vai para a posição `pos`; o verify escreve dali até `pos + VERIFY_TOK - 1`.
-        if usar_mtp && pos + VERIFY_TOK <= config.ctx {
+        if usar_mtp && pos + VERIFY_TOK <= config.ctx && mtp_compensa(pos) {
             let passo = passo_mtp(gpu, sampler, rng, next, hidden, pos, config.vocab)?;
             pos = passo.pos;
             hidden = passo.hidden;
@@ -749,6 +749,39 @@ pub(crate) fn prefill_residente(
     }
     Ok((logits, pos, hidden))
 }
+
+/// Se o passo de MTP ainda compensa com o KV-cache em `pos`.
+///
+/// O verify de 3 tokens lê os pesos uma vez, mas paga a atenção sobre o contexto inteiro uma
+/// vez por token, e a atenção cresce com `pos`. Medido em 2026-09-26 no Qwen3.8-27B (decode
+/// do `llama-cli`, MTP em todo passo contra sem MTP, médias de 2–3 execuções):
+///
+/// | contexto | 1k | 4k | 8k | 16k | 29k |
+/// |---|---|---|---|---|---|
+/// | MTP / sem | +3% | −3% | 0 | −12 a −21% | −13% |
+///
+/// O ganho no curto depende do texto — numa conversa de 20 turnos, com 1,4k, foi +29% —, a
+/// perda no fundo não. Acima de [`MTP_ATE`] o laço segue com o decode simples.
+/// `LLAMA_RS_MTP_ATE=N` muda o limite (`0` = MTP em toda posição), para medir.
+///
+/// Uma escolha medida passo a passo (os tokens/s de cada modo, provando o outro de tempos em
+/// tempos) foi tentada e descartada: a cabeça MTP tem KV-cache próprio, que não anda durante
+/// os passos simples, e as provas de MTP saíam com aceitação menor — a estimativa favorecia o
+/// simples mesmo onde o MTP rendia mais.
+pub fn mtp_compensa(pos: usize) -> bool {
+    static ATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let ate = *ATE.get_or_init(|| {
+        std::env::var("LLAMA_RS_MTP_ATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(MTP_ATE, |n: usize| if n == 0 { usize::MAX } else { n })
+    });
+    pos < ate
+}
+
+/// Posição do KV-cache a partir da qual o passo de MTP deixa de compensar — entre o 8k em que
+/// ele empata e o 16k em que já perde. Ver [`mtp_compensa`].
+pub const MTP_ATE: usize = 12 * 1024;
 
 /// O que um passo de speculative decoding produziu.
 pub struct PassoMtp {
