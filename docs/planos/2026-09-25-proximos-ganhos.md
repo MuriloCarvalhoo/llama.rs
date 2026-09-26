@@ -5,6 +5,38 @@ atenção de contexto longo, E01/E02/E05). Cada item traz a evidência que o jus
 estimativa de esforço para uma pessoa familiarizada com o código. A comparação com o llama.cpp que
 motiva a ordem está em [`../benchmark-conversa-longa-2026-09-25.md`](../benchmark-conversa-longa-2026-09-25.md).
 
+## Estado em 2026-09-26
+
+Rodada executada sem consulta; as escolhas estão em
+[`2026-09-26-decisoes-autonomas.md`](2026-09-26-decisoes-autonomas.md).
+
+| # | Estado |
+|---|---|
+| 0.1 | **Feito** (`1769c35`): snapshot depois do último token especial. TTFT com 30k de 387 s para 31,5 s |
+| 1.1 | **Feito** (`0b3fca3`): Q5_K pelo GEMM por padrão; Q6_K pelo GEMM acima de 32 colunas |
+| 1.2 | **Parte**: tiles de 32 colunas com o grid em Y e bloco de 256 (`0b1070f`), passo de K = 64 no Q4_K (`c19bd80`). Falta o K = 64 no Q5_K/Q6_K (~1,1 de ~4,4 ms/token) |
+| 1.3 | **Não feito, provavelmente desnecessário**: o problema era 40 workgroups para 60 CUs nas formas de saída 5120; com o bloco de 256 e os tiles em Y são 8× mais |
+| 1.4 | **Feito**: o estudo do MMQ virou o 1.2 (256 tokens por bloco, tiles de coluna, K = 64). Prefill frio com 7,5k de 134,5 para 171,9 tok/s |
+| 2.0 | **Feito**: MTP só com o KV-cache abaixo de 12k (`MTP_ATE`, `LLAMA_RS_MTP_ATE`). Medido: +3% a 1k, empate a 8k, −12 a −21% a 16k, −13% a 29k (decisão 11) |
+| 2.1 | **Descartado com medição**: a atenção não é limitada por conta (cortar 30% das operações do laço não mudou o tempo), então o `v_dot2` não ajudaria (decisão 12) |
+| 2.2 | **Aberto, investigado**: o Q4_K acompanha o clock do núcleo (380–430 GB/s em `min_sclk`, 564–621 em `standard`), e não é a soma de `x` do `dmin` |
+| 2.3 | **Aberto**: a fusão da norma já tinha sido medida e rejeitada (`65e9614`); sobram as ops do delta-net |
+| 3.1 | **Sua decisão** (pede root) — **agora o maior ganho que sobrou**: a card1 passa de 95 °C até num prompt de 1k, desce ao `min_sclk` e lê ~30% menos que a card2 no mesmo kernel; é ~25% do decode (decisão 12) |
+| 3.2 | **Feito** (`3677b72`) |
+| 3.3 | **Feito** (`3d55d89`) |
+| 4.1–4.5 | **Feitos** (`fc432e5`, `6b6f5e1`, `5a45b8c`, `5da9f21`, `b4dd4ea`) |
+
+Surgiram no caminho:
+
+- **Travamento da GPU no prefill de contexto fundo** — corrigido (`9ff9a14`). O driver deste
+  kernel reseta submit com mais de 2 s; o bloco de prefill agora vai em um submit por camada
+  de atenção.
+- **Atenção em contexto fundo** — 27% do decode, 39% do verify e metade do prefill a 29k.
+  Dois kernels que juntavam as cabeças do grupo GQA ficaram mais lentos que o atual; o
+  próximo passo é o RGP para saber o que o limita (decisão 10).
+- **Matvec do verify** — com 3 colunas o `matvec_q4k_v` lê a 281 GB/s contra 450 do decode, e
+  é 33% do verify. Se chegasse perto do decode, o MTP ganharia ~12%.
+
 ## 0. Reuso de prefixo entre turnos — o maior ganho para o opencode
 
 | # | O quê | Evidência | Esforço |

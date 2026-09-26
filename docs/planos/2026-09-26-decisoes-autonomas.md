@@ -117,6 +117,29 @@ e como desfazer.
     - Com temp 0 a saída continua idêntica com e sem MTP (conferido a 1k).
     Desfazer: `MTP_ATE = usize::MAX`.
 
+12. **2.1, 2.2 e 2.3 — medidos, nenhum virou código.** O que as medições mostraram:
+    - **A card1 roda boa parte do decode em `min_sclk`.** Até num prompt de 1k ela passa de
+      95 °C e a escada desce. No perfil, o mesmo `matvec_q4k` lê 662 GB/s na GPU0 (card2) e
+      452 na GPU1 (card1); o `matvec_q6k`, 704 contra 518. A GPU1 faz 26 de ~41 ms por
+      token. Com a card1 no clock da outra, o decode ganharia ~25% — é o **3.1**, e ele é o
+      maior ganho que sobrou. Não tirei o `min_sclk` da escada: sem ele a card1 chegou a
+      103 °C.
+    - **O matvec Q4_K acompanha o clock do núcleo** (bancada: 380–430 GB/s em `min_sclk`,
+      564–621 em `standard`). Não é a soma de `x` do termo do `dmin`: zerá-la (como faz o
+      `q8_1` do llama.cpp, que guarda a soma pronta) não mudou nada. O 2.2 continua aberto,
+      e a causa ainda não está identificada.
+    - **A atenção também acompanha o clock** (1,19 / 0,82 / 0,71 ms em `min_sclk` /
+      `standard` / `peak`), mas não é conta: reescalar `acc` só quando o máximo sobe (−30%
+      das operações do laço, resultado idêntico) deu o mesmo tempo. Sobra a L2, que no Vega
+      roda no clock do núcleo e serve as releituras do grupo GQA a ~1 TB/s. Por isso
+      descartei o **2.1** (`v_dot2` corta ~14% das operações, e cortar 30% não mudou nada).
+    - **Geometria do matvec do verify:** `LLAMA_RS_MATVEC_GEOM=128,4` deixa o
+      `matvec_q4k_v` ~9% mais rápido (22,7 → 20,6 ms na GPU1) e o decode ~3% mais lento. Os
+      dois usam a mesma geometria; separar as duas é um ganho pequeno que ficou anotado.
+    - **2.3:** a fusão da norma num dispatch só já foi medida e rejeitada em `65e9614`
+      (20,5–34,6 µs contra 21 µs), porque a redução global cabe em 1 CU dos 60. As outras ops
+      pequenas (delta-net) são o trabalho de 1–2 dias do plano e ficaram abertas.
+
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao
