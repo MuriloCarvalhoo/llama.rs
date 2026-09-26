@@ -247,12 +247,12 @@ impl Buf {
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
         let buffer = create_buf(d, bytes, usage)?;
-        let mem = alloc_and_bind(ctx, phys, d, buffer, false)?;
-        Ok(Self {
+        Self::montar(
+            d,
             buffer,
-            mem,
-            size: bytes,
-        })
+            alloc_and_bind(ctx, phys, d, buffer, false),
+            bytes,
+        )
     }
 
     /// Buffer host-visible TRANSFER_SRC | TRANSFER_DST de `bytes` (upload/readback).
@@ -265,12 +265,7 @@ impl Buf {
         use crate::tensor::{alloc_and_bind, create_buf};
         let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
         let buffer = create_buf(d, bytes, usage)?;
-        let mem = alloc_and_bind(ctx, phys, d, buffer, true)?;
-        Ok(Self {
-            buffer,
-            mem,
-            size: bytes,
-        })
+        Self::montar(d, buffer, alloc_and_bind(ctx, phys, d, buffer, true), bytes)
     }
 
     /// Buffer host-visible que a **CPU vai ler** (readback). A diferença para `host` é o
@@ -284,12 +279,31 @@ impl Buf {
         use crate::tensor::{alloc_and_bind_cached, create_buf};
         let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
         let buffer = create_buf(d, bytes, usage)?;
-        let mem = alloc_and_bind_cached(ctx, phys, d, buffer)?;
-        Ok(Self {
+        Self::montar(
+            d,
             buffer,
-            mem,
-            size: bytes,
-        })
+            alloc_and_bind_cached(ctx, phys, d, buffer),
+            bytes,
+        )
+    }
+
+    /// Junta um buffer recém-criado com a memória dele. Se a alocação falhou, o buffer é
+    /// destruído aqui: ainda não existe o `Buf` cujo `destroy` o levaria, e numa carga que
+    /// esbarra na VRAM ele sobrava até o fim do processo.
+    fn montar(
+        d: &ash::Device,
+        buffer: vk::Buffer,
+        mem: Result<vk::DeviceMemory, vk::Result>,
+        size: vk::DeviceSize,
+    ) -> Result<Self, MatmulError> {
+        match mem {
+            Ok(mem) => Ok(Self { buffer, mem, size }),
+            Err(e) => {
+                // SAFETY: buffer criado pelo chamador neste device, sem memória nem uso.
+                unsafe { d.destroy_buffer(buffer, None) };
+                Err(e.into())
+            }
+        }
     }
 
     fn destroy(&self, d: &ash::Device) {
@@ -5525,15 +5539,40 @@ impl Drop for ResidentForward<'_> {
         unsafe {
             d.destroy_descriptor_pool(self.desc_pool, None);
         }
+        // Todas as pipelines da struct: a lista antiga cobria 8 das 31, e as outras só
+        // morriam com o device.
         for p in [
             &self.matvec,
+            &self.quantize_x,
+            &self.matvec_q5k,
+            &self.matvec_q6k,
+            &self.matvec_q4k,
+            &self.matvec_b,
+            &self.matvec_q5k_b,
+            &self.matvec_q6k_b,
+            &self.matvec_q4k_b,
+            &self.mul_mm_q4k,
+            &self.matvec_v,
+            &self.matvec_q5k_v,
+            &self.matvec_q6k_v,
+            &self.matvec_q4k_v,
             &self.rmsnorm,
             &self.norm_fused,
             &self.norm_p2,
             &self.rope,
+            &self.kv_pack,
             &self.attention,
+            &self.attention_split,
+            &self.attention_split16,
+            &self.attn_reduce,
             &self.swiglu_quant,
             &self.add,
+            &self.delta_net,
+            &self.dn_conv,
+            &self.dn_gates,
+            &self.dn_norm,
+            &self.dn_l2_qk,
+            &self.gate_quant,
         ] {
             // SAFETY: handles criados por nós, ordem inversa.
             unsafe {

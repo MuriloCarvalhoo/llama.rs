@@ -279,7 +279,12 @@ fn alloc_with_flags(
     let memory = unsafe { dev.allocate_memory(&alloc_info, None)? };
 
     // SAFETY: buf e memory foram criados pelo mesmo device; offset 0 e valido.
-    unsafe { dev.bind_buffer_memory(buf, memory, 0)? };
+    if let Err(e) = unsafe { dev.bind_buffer_memory(buf, memory, 0) } {
+        // Quem chama só recebe o erro, sem a memória: liberá-la aqui ou ela sobra.
+        // SAFETY: memory acabou de ser alocada e não está ligada a nada.
+        unsafe { dev.free_memory(memory, None) };
+        return Err(e);
+    }
 
     Ok(memory)
 }

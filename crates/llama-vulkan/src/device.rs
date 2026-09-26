@@ -330,7 +330,16 @@ impl VulkanDevice {
             ..Default::default()
         };
         // SAFETY: `device` é válido e `pool_info` aponta para dados válidos na stack frame atual.
-        let cmd_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+        let cmd_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+            Ok(p) => p,
+            Err(e) => {
+                // O `Drop` que destruiria o device ainda não existe: destruí-lo aqui, senão
+                // ele sobra até o fim do processo.
+                // SAFETY: device criado acima, sem nenhum objeto filho vivo.
+                unsafe { device.destroy_device(None) };
+                return Err(e);
+            }
+        };
         Ok(Self {
             device,
             queue,
