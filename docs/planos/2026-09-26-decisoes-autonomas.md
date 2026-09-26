@@ -4,6 +4,16 @@ Registro das decisões tomadas sem consulta ao executar `2026-09-25-proximos-gan
 "se precisar tomar decisão anote que depois eu vejo"). Cada uma diz o que foi decidido, por quê
 e como desfazer.
 
+## Organização do trabalho
+
+- **Itens que usam GPU ficam num agente só**, em série: medições concorrentes nas mesmas MI50 se
+  contaminam, e duas cargas do 27B juntas quebram a margem de 2 GB da GPU do monitor.
+- **Itens só de CPU vão para agentes em worktree** e entram no `master` por cherry-pick depois de
+  revisados: (A) servidor — 4.2, 4.3, 4.5; (B) 4.1, 3.3, 4.4 (este último só compilado no agente;
+  a verificação com a GPU é feita depois no `master`).
+- **3.1 (refrigeração da card1) não é executado**: pede root (`pwm1`/`power1_cap`) e é decisão de
+  hardware do usuário. Fica anotado com a recomendação no fim deste arquivo.
+
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao
@@ -35,3 +45,25 @@ e como desfazer.
    não numérico, 400.
 8. **Testes de rota passaram a mandar `"model":"modelo-teste"`** (o nome servido nos testes) em
    vez de `"m"`, que agora seria 404.
+
+## Agente B — itens 4.1, 3.3 e 4.4
+
+1. **4.1, laço do `llama-cli`:** a regra é a do motor do servidor, copiada, não compartilhada.
+   Os dois laços têm estruturas diferentes (o servidor passa pela `Sessao` e por uma fila de
+   `pendentes`; o CLI chama `passo_mtp` direto), e juntá-los seria uma refatoração maior que a
+   correção. Para testar sem tokenizer, o laço foi para `gerar_ids_residente` (sobre ids).
+   Prompt que enche o contexto (`len >= ctx`) virou `ModelError::ContextOverflow` antes do
+   prefill — antes era um erro do backend no meio do prefill.
+2. **3.3, `scripts/monitor-gpu.sh`:** lê o sysfs direto em vez de `sensors` (mais rápido, sem
+   dependência) e mata só o PID. Os guardas de `scripts/bench-conversa/` ficaram como estão,
+   porque o roteiro do benchmark os usa; dá para trocá-los pelo monitor depois.
+3. **Monitor em repouso (achado no 3.3, corrigido também no `device.rs`):** às 2 h o
+   `card2-DP-8` estava `disconnected` — o DisplayPort desconecta com a tela dormindo. A
+   detecção por conector marcava então as duas GPUs como "sem monitor" (500 MiB), e o
+   compositor precisa de VRAM na card2 quando a tela acorda. **Decisão:** sem nenhum conector
+   ativo, 2 GiB em todas (script e `margens_vram` no Vulkan). Custo: um modelo que só coubesse
+   com 500 MiB de folga na card2 não carrega com a tela dormindo — preferi o lado seguro.
+4. **4.4, E06:** o mínimo nos três pontos citados (device, `Buf`, `alloc_with_flags`) e o `Drop`
+   com as 31 pipelines. **Não** tratei o caso de `new_pipelines_only_on` falhar no meio da
+   criação das pipelines (as já criadas sobram até o device morrer): exigiria um guarda por
+   pipeline, e só acontece com o driver recusando um shader — raro e fatal de qualquer jeito.
