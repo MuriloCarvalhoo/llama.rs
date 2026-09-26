@@ -45,6 +45,39 @@ e como desfazer.
    de N exige GEMM`) em vez de calcular 32 colunas em silêncio. `LLAMA_RS_BATCH` continua
    mandando. O resto do prompt vai em blocos de 32 (`plan_resto`) — sem isso o bloco 256 perdia
    até 10 s por turno no token a token. Desfazer: `batch_do_modelo` devolver 32.
+7. **GEMM do Q4_K com passo de K = 64** (`mul_mm_q4k.comp`) e não 128: o 128 foi medido pior
+   em todas as formas. O Q5_K e o Q6_K seguem no passo 32 (somam ~1,1 de ~4,4 ms/token).
+8. **Travamentos da GPU de 2026-09-26 — a causa é o prazo de 2 s do driver por submit.**
+   Cinco resets do ring gfx na card1 (03:17, 03:31, 03:42, 04:00, 04:12), todos no prefill
+   de contexto fundo com o bloco de 256. Neste kernel (7.3) o `amdgpu.lockup_timeout` padrão
+   é **2000 ms** (`modinfo -p amdgpu`), não os ~10 s de kernels antigos, e o bloco de 256
+   com 29k posições levava ~2 s na card1 a 1316 MHz: a atenção de cada token relê o
+   KV-cache inteiro. Nos três últimos resets o contador de fences andou exatamente 150 entre
+   um e outro — o mesmo ponto do prompt, não temperatura. O monitor confirma: a card1
+   alternava com a card2 normalmente até o último submit, que começou 1,5–2 s antes do reset.
+   Ontem os blocos de 32 nunca chegavam perto de 2 s.
+   - **Correção:** no prefill, um submit por camada de atenção (`cortar_submit`), cada um
+     com uma só, qualquer que seja o número de camadas do shard (numa GPU só, sem
+     layer-split, o bloco teria as 16).
+   - **O `llama-cli` ignorava o orçamento e o bloco do resto:** tinha um laço de prefill
+     próprio (`prefill_residente`), copiado do da `Sessao` antes de os dois existirem.
+     Agora os dois usam o mesmo.
+   - `ORCAMENTO_BLOCO` passou a 256 × 32k (limita o custo de uma camada de atenção, ~0,3 s
+     por submit com o contexto inteiro do opencode).
+   - `espera_fence` desiste em 60 s com `ERROR_DEVICE_LOST` em vez de girar para sempre.
+   - **Desfeito:** eu tinha atribuído os resets à descida da escada térmica (três deles
+     coincidiram com o degrau `min_sclk`) e tirado o `min_sclk`, além de só trocar o
+     pstate entre submits. A coincidência era real, o mecanismo não: o `min_sclk` deixa o
+     submit mais lento e ele passa dos 2 s. Com o corte, as duas mudanças voltaram atrás —
+     sem o `min_sclk` a card1 chegou a 103 °C, a 2 °C do watchdog.
+   - **Para você decidir:** `amdgpu.lockup_timeout=10000` em `/etc/modprobe.d/` devolve o
+     prazo antigo (pede root e reboot). Não é necessário com o corte; seria só margem.
+9. **O teste `prefill_em_batch_bate_com_token_a_token_no_qwen35` estava quebrado** desde
+   o bloco de 256 (`cfg.ctx = 64` com uma sequência de 515 tokens) e, por baixo disso,
+   desde o Q5_K pelo GEMM: o erro relativo é ~9e-3, não < 1e-3. Com `LLAMA_RS_GEMM_K56=0`
+   ele é 0 — o caminho do matvec é bit a bit o do decode —, e o GEMM bate com o matvec a
+   1e-5 por matriz. A diferença é a requantização em int8 de cada camada virando outro
+   arredondamento. Tolerância passou a 2e-2, com o argmax igual ainda exigido.
 
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 

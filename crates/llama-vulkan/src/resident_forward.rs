@@ -137,6 +137,25 @@ pub(crate) fn imprimir_ram_do_processo() {
     }
 }
 
+/// Depois disto sem o fence sinalizar, o passo é dado como perdido (ver `espera_fence`).
+const ESPERA_MAXIMA_FENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Orçamento de um bloco de prefill em **tokens do bloco × posições até o fim dele**. A
+/// atenção do bloco relê o KV-cache uma vez por token, então o custo dela cresce com esse
+/// produto, e o driver reseta um submit que passa de 2 s (ver `cortar_submit`). Acima do
+/// orçamento o prefill usa blocos de `RESTO_TOK`.
+///
+/// Com um submit por camada de atenção, o orçamento limita o custo de **uma** camada:
+/// medido na card1 a 1316 MHz, ~0,18 s por camada com 256 × 29k, então 256 × 32k (o
+/// contexto inteiro que o opencode usa) fica em ~0,3 s por submit contando as camadas
+/// lineares vizinhas. O bloco de 32 cabe até 262k posições.
+const ORCAMENTO_BLOCO: usize = 1 << 23;
+
+/// Se um bloco de `n_tok` tokens a partir de `pos0` cabe no orçamento de um submit.
+pub(crate) fn bloco_cabe(pos0: usize, n_tok: usize) -> bool {
+    n_tok <= RESTO_TOK || (pos0 + n_tok).saturating_mul(n_tok) <= ORCAMENTO_BLOCO
+}
+
 /// Largura do plano do **resto**: com o bloco de prefill maior que isto, o que sobra de um
 /// prompt depois dos blocos cheios vai em blocos de 32 antes de cair token a token. Sem ele,
 /// com o bloco de 256 até 255 tokens iriam pelo decode, a ~40 ms cada — 10 s num turno.
@@ -964,6 +983,10 @@ pub(crate) struct ResidentState<'w> {
     /// só um submit. `None` sem MTP ou sem camada de atenção linear.
     pub rollback_cmds: Vec<vk::CommandBuffer>,
     pub token_cmd: vk::CommandBuffer,
+    /// Command buffers de reserva do bloco de prefill, um por camada de atenção do plano
+    /// do bloco: o bloco vai em vários submits (ver `cortar_submit`), e cada um precisa do
+    /// seu, porque os anteriores ainda estão na GPU quando o seguinte é gravado.
+    pub lote_cmds: Vec<vk::CommandBuffer>,
     pub token_fence: vk::Fence,
     /// Perfilamento por op via timestamp queries. `Some` só com LLAMA_RS_PROFILE=1.
     pub prof: Option<Prof>,
@@ -1921,6 +1944,7 @@ impl<'ctx> ResidentForward<'ctx> {
                 mtp_barreiras: Vec::new(),
                 rollback_cmds: Vec::new(),
                 token_cmd,
+                lote_cmds: Vec::new(),
                 token_fence,
                 prof: None,
             }
@@ -2013,6 +2037,25 @@ impl<'ctx> ResidentForward<'ctx> {
             }
             st.plan = plan;
             st.prof = prof;
+            let cortes = [&st.plan_batch, &st.plan_resto]
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .filter(|op| matches!(op, PlannedOp::Atencao { .. }))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if cortes > 0 {
+                let info = vk::CommandBufferAllocateInfo {
+                    command_pool: me.dev.cmd_pool,
+                    level: vk::CommandBufferLevel::PRIMARY,
+                    command_buffer_count: cortes as u32,
+                    ..Default::default()
+                };
+                // SAFETY: device e pool válidos; o pool tem RESET_COMMAND_BUFFER.
+                st.lote_cmds = unsafe { me.dev.device.allocate_command_buffers(&info)? };
+            }
         }
         me.gravar_rollback()?;
         // Com tudo alocado, a margem vira garantia: a GPU do monitor fica com 2 GiB livres e
@@ -3306,21 +3349,60 @@ impl<'ctx> ResidentForward<'ctx> {
         }
     }
 
+    /// Fecha `cmd`, submete sem fence e abre `prox` com uma barreira — o que vier gravado
+    /// nele espera tudo o que o submit anterior escreveu. Devolve `prox`, já em `begin`.
+    ///
+    /// O driver reseta a fila de um submit que passa de `amdgpu.lockup_timeout` (**2 s**
+    /// no kernel 7.3) sem olhar se ele ainda progride, e o bloco de prefill passa disso: a
+    /// atenção de 256 tokens relê o KV-cache inteiro por token, e com 29k posições a card1
+    /// levava ~2 s por bloco (cinco resets em 2026-09-26). Um submit por camada de atenção
+    /// deixa cada um com uma só, qualquer que seja o número de camadas do shard.
+    fn cortar_submit(
+        &self,
+        cmd: vk::CommandBuffer,
+        prox: vk::CommandBuffer,
+    ) -> Result<vk::CommandBuffer, MatmulError> {
+        let d = &self.dev.device;
+        let submit = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        // SAFETY: cmd em gravação; `prox` não está na GPU (o fence do passo anterior, que
+        // cobre todos os submits dele, foi aguardado) e o pool tem RESET_COMMAND_BUFFER.
+        unsafe {
+            d.end_command_buffer(cmd)?;
+            d.queue_submit(self.dev.queue, &[submit], vk::Fence::null())?;
+            d.reset_command_buffer(prox, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            };
+            d.begin_command_buffer(prox, &begin)?;
+        }
+        self.full_barrier(prox);
+        Ok(prox)
+    }
+
     /// Grava a stack inteira do bloco em `cmd` (já em `begin`). `pos` é a posição absoluta
     /// do **último** token de `tokens` — é dela que saem `total_len` e o RoPE, e os shaders
     /// derivam a posição de cada token do bloco por `pos - (n_tok - 1) + t`.
+    ///
+    /// No prefill o bloco sai em vários submits, um a cada camada de atenção
+    /// (`cortar_submit`); devolve o command buffer em que a gravação terminou, que quem
+    /// chama fecha e submete com o fence.
     #[cfg_attr(
         feature = "profiling",
         tracing::instrument(skip_all, name = "gravar_cmdbuf")
     )]
     fn record_token(
         &self,
-        cmd: vk::CommandBuffer,
+        mut cmd: vk::CommandBuffer,
         tokens: &[u32],
         pos: usize,
         x_in: Option<&[f32]>,
         modo: Modo,
-    ) {
+    ) -> Result<vk::CommandBuffer, MatmulError> {
         let d = &self.dev.device;
         let st = self
             .state
@@ -3349,7 +3431,15 @@ impl<'ctx> ResidentForward<'ctx> {
             }
         }
 
+        let mut reserva = st.lote_cmds.iter();
         for (op_idx, op) in plan.iter().enumerate() {
+            if modo == Modo::Batch
+                && op_idx > 0
+                && matches!(op, PlannedOp::Atencao { .. })
+                && let Some(&prox) = reserva.next()
+            {
+                cmd = self.cortar_submit(cmd, prox)?;
+            }
             // Com o perfil ligado, serializa tudo: sem barreira as ops de um mesmo grupo se
             // sobrepõem e os timestamps de fim passam a medir a soma, não cada op. O TOTAL
             // impresso fica então acima do tempo real de um token.
@@ -3472,6 +3562,7 @@ impl<'ctx> ResidentForward<'ctx> {
         unsafe {
             d.cmd_copy_buffer(cmd, src.buffer, st.logits_host.buffer, &[region]);
         }
+        Ok(cmd)
     }
 
     /// Grava o plano da cabeça MTP em `cmd` (já em `begin`).
@@ -5383,10 +5474,23 @@ impl<'ctx> ResidentForward<'ctx> {
     /// seu laço de espera. Diagnóstico e números medidos em `docs/performance-tuning.md`.
     fn espera_fence(&self, st: &ResidentState<'_>) -> Result<(), MatmulError> {
         let d = &self.dev.device;
+        let t0 = std::time::Instant::now();
         loop {
             // SAFETY: fence válido e submetido.
             if unsafe { d.get_fence_status(st.token_fence)? } {
                 return Ok(());
+            }
+            // Um submit que passa do limite do driver (2 s no ring gfx, ver `cortar_submit`)
+            // é resetado pelo kernel, e o fence dele pode nunca sinalizar: em 2026-09-26 o
+            // processo girou 12 minutos a 99% de CPU com as GPUs paradas. Muito acima de
+            // qualquer passo legítimo, isso é GPU perdida — falha alto em vez de girar.
+            if t0.elapsed() > ESPERA_MAXIMA_FENCE {
+                eprintln!(
+                    "[gpu] GPU{}: o passo não terminou em {} s (reset do driver?)",
+                    self.phys_idx,
+                    ESPERA_MAXIMA_FENCE.as_secs()
+                );
+                return Err(MatmulError::Vulkan(vk::Result::ERROR_DEVICE_LOST));
             }
             std::hint::spin_loop();
         }
@@ -5421,8 +5525,12 @@ impl<'ctx> ResidentForward<'ctx> {
             };
             d.begin_command_buffer(cmd, &begin)?;
         }
+        // Antes da gravação: no prefill o primeiro submit sai de dentro dela.
+        if let Some(p) = &self.pstate {
+            p.em_uso(modo == Modo::Batch);
+        }
         let t0 = std::time::Instant::now();
-        self.record_token(cmd, tokens, pos, x_in, modo);
+        let cmd = self.record_token(cmd, tokens, pos, x_in, modo)?;
         // SAFETY: cmd em gravação.
         unsafe {
             d.end_command_buffer(cmd)?;
@@ -5435,9 +5543,6 @@ impl<'ctx> ResidentForward<'ctx> {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        if let Some(p) = &self.pstate {
-            p.em_uso(modo == Modo::Batch);
-        }
         // SAFETY: fence resetado antes do submit; cmd válido.
         unsafe {
             d.reset_fences(&[st.token_fence])?;
@@ -5502,6 +5607,9 @@ impl llama_model::GpuResidentDecode for ResidentForward<'_> {
             .as_ref()
             .filter(|st| !st.plan_resto.is_empty())
             .map_or(0, |_| RESTO_TOK)
+    }
+    fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
+        bloco_cabe(pos0, n_tok)
     }
     fn decode_batch(
         &self,
@@ -5687,6 +5795,9 @@ impl Drop for ResidentForward<'_> {
                 d.free_command_buffers(self.dev.cmd_pool, &[st.token_cmd]);
                 if !st.rollback_cmds.is_empty() {
                     d.free_command_buffers(self.dev.cmd_pool, &st.rollback_cmds);
+                }
+                if !st.lote_cmds.is_empty() {
+                    d.free_command_buffers(self.dev.cmd_pool, &st.lote_cmds);
                 }
                 d.destroy_fence(st.token_fence, None);
             }

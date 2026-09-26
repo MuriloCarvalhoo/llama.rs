@@ -316,7 +316,8 @@ fn prefill_em_batch_bate_com_token_a_token_no_qwen35() {
     }
     let f = gguf::GgufFile::parse(&bytes).unwrap();
     let mut cfg = llama_model::LlamaConfig::from_gguf(&f).unwrap();
-    cfg.ctx = 64;
+    // Cabe a sequência de `2 * nb + 3` abaixo com o bloco de 256 do Q4_K_M.
+    cfg.ctx = 1024;
     let raw = llama_model::GpuRawWeights::from_gguf(&f, &bytes, &cfg).unwrap();
     let aux = llama_model::GpuAuxWeights::from_gguf(&f, &bytes, &cfg).unwrap();
     let backend = llama_vulkan::LayerSplitForward::new(&ctx, &cfg, &raw, &aux).unwrap();
@@ -370,6 +371,11 @@ fn prefill_em_batch_bate_com_token_a_token_no_qwen35() {
         seq.len(),
         seq.len() % nb
     );
-    assert!(max_rel < 1e-3, "erro relativo {max_rel} deve ser < 1e-3");
+    // Não é bit a bit desde que o Q5_K do bloco vai pelo GEMM (2026-09-26): ele bate com o
+    // matvec a 1e-5 por matriz (`gemm_em_lds_bate_com_o_matvec_q4k`), mas cada camada
+    // requantiza a ativação em int8, e um desvio desse tamanho vira outro arredondamento em
+    // alguns elementos — 1/127 do bloco cada. Em 64 camadas isso dá ~9e-3; com
+    // `LLAMA_RS_GEMM_K56=0` o erro volta a 0.
+    assert!(max_rel < 2e-2, "erro relativo {max_rel} deve ser < 2e-2");
     assert_eq!(arg(&referencia), arg(&logits), "mesmo token escolhido");
 }

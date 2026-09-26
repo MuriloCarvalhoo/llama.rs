@@ -250,6 +250,9 @@ impl llama_model::GpuResidentDecode for LayerSplitForward<'_> {
             .first()
             .map_or(0, llama_model::GpuResidentDecode::batch_resto)
     }
+    fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
+        crate::resident_forward::bloco_cabe(pos0, n_tok)
+    }
 
     fn reset(&self) {
         for shard in &self.shards {

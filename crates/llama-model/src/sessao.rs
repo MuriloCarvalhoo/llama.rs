@@ -131,7 +131,7 @@ mod tests {
 mod com_backend {
     use super::{Reuso, planejar_reuso};
     use crate::ModelError;
-    use crate::gpu::GpuResidentDecode;
+    use crate::gpu::{GpuResidentDecode, prefill_residente};
 
     /// Sessão de geração sobre um backend residente.
     ///
@@ -284,33 +284,15 @@ mod com_backend {
             Ok(passo)
         }
 
-        /// Prefill de `ids[pos0..]`: blocos de `batch_size()`, depois de `batch_resto()`, e o
-        /// que sobrar token a token.
-        /// Em batch cada peso do modelo sai da VRAM uma vez para N tokens.
+        /// Prefill de `ids[pos0..]` (ver [`prefill_residente`]). Quem chama garante que há
+        /// o que processar.
         fn processar(
             &mut self,
             gpu: &dyn GpuResidentDecode,
             ids: &[u32],
             pos0: usize,
         ) -> Result<(), ModelError> {
-            let mut pos = pos0;
-            // Blocos cheios, depois blocos do resto (o backend aceita os dois), e o que sobrar
-            // token a token.
-            for nb in [gpu.batch_size(), gpu.batch_resto()] {
-                while nb > 1 && ids.len() - pos >= nb {
-                    let Some(bloco) = ids.get(pos..pos + nb) else {
-                        break;
-                    };
-                    self.logits = gpu.decode_batch(bloco, pos)?;
-                    self.hidden = nb - 1;
-                    pos += nb;
-                }
-            }
-            for &t in ids.get(pos..).unwrap_or(&[]) {
-                self.logits = gpu.decode(t, pos)?;
-                self.hidden = 0;
-                pos += 1;
-            }
+            (self.logits, _, self.hidden) = prefill_residente(gpu, ids, pos0)?;
             self.tokens
                 .extend_from_slice(ids.get(pos0..).unwrap_or(&[]));
             Ok(())
@@ -341,6 +323,8 @@ mod testes_de_sessao {
         nb: usize,
         /// `batch_resto` do backend: 0 = não há bloco menor.
         resto: usize,
+        /// Orçamento de `lote_cabe` (tokens × posições); `None` = sem limite.
+        orcamento: Option<usize>,
         /// Se o backend guarda snapshot. `false` reproduz o comportamento de antes desta
         /// frente, que é também o dos backends que não implementam `marcar`.
         snapshot: bool,
@@ -352,6 +336,7 @@ mod testes_de_sessao {
             BackendFalso {
                 nb,
                 resto: 0,
+                orcamento: None,
                 snapshot: false,
                 chamadas: RefCell::new(Vec::new()),
             }
@@ -384,6 +369,10 @@ mod testes_de_sessao {
         }
         fn batch_resto(&self) -> usize {
             self.resto
+        }
+        fn lote_cabe(&self, pos0: usize, n_tok: usize) -> bool {
+            self.orcamento
+                .is_none_or(|o| n_tok <= self.resto || (pos0 + n_tok) * n_tok <= o)
         }
         fn decode_batch(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, ModelError> {
             self.chamadas
@@ -661,5 +650,32 @@ mod testes_de_sessao {
             ]
         );
         assert_eq!(s.tokens().len(), 11);
+    }
+
+    /// Bloco cheio que estoura o orçamento do backend (contexto fundo) vira blocos do resto:
+    /// com o bloco de 256, 16k de contexto passavam do limite de tempo do driver.
+    #[test]
+    fn bloco_cheio_fora_do_orcamento_vira_blocos_do_resto() {
+        let gpu = BackendFalso {
+            resto: 2,
+            orcamento: Some(32),
+            ..BackendFalso::novo(4)
+        };
+        let mut s = Sessao::nova(&gpu);
+        gpu.chamadas.borrow_mut().clear();
+
+        s.prefill(&gpu, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            .unwrap();
+
+        // (0+4)*4 = 16 cabe; (4+4)*4 = 32 cabe; (8+4)*4 = 48 não: dali em diante, de 2 em 2.
+        assert_eq!(
+            gpu.registradas(),
+            vec![
+                "Batch([1, 2, 3, 4], 0)".to_owned(),
+                "Batch([5, 6, 7, 8], 4)".to_owned(),
+                "Batch([9, 10], 8)".to_owned(),
+                "Decode(11, 10)".to_owned()
+            ]
+        );
     }
 }

@@ -390,6 +390,12 @@ pub trait GpuResidentDecode {
     fn batch_resto(&self) -> usize {
         0
     }
+    /// Se um bloco de `n_tok` tokens a partir de `pos0` cabe num passo só. O backend pode
+    /// recusar blocos grandes em contexto fundo (o custo da atenção do bloco cresce com
+    /// tokens × posições); o prefill então segue com o bloco de `batch_resto`.
+    fn lote_cabe(&self, _pos0: usize, _n_tok: usize) -> bool {
+        true
+    }
     /// Processa `tokens` nas posições `pos0..pos0 + tokens.len()` de uma vez, retornando
     /// os logits **do último** — os anteriores já ficaram no KV-cache, e é só isso que o
     /// prefill precisa. `tokens.len()` tem de ser exatamente `batch_size()` ou
@@ -663,7 +669,7 @@ fn gerar_ids_residente(
         return Err(ModelError::ContextOverflow(prompt_ids.len(), config.ctx));
     }
     gpu.reset();
-    let (mut logits, mut pos, mut hidden) = prefill_residente(gpu, prompt_ids)?;
+    let (mut logits, mut pos, mut hidden) = prefill_residente(gpu, prompt_ids, 0)?;
     let first_idx = sampler.sample(&logits, rng);
     let mut next = u32::try_from(first_idx).map_err(|_| ModelError::Overflow)?;
     let usar_mtp = gpu.tem_mtp();
@@ -710,28 +716,31 @@ fn gerar_ids_residente(
     Ok(())
 }
 
-/// Prefill de `ids`: blocos de `batch_size()` e o resto token a token.
+/// Prefill de `ids[pos0..]`: blocos de `batch_size()` enquanto `lote_cabe`, depois de
+/// `batch_resto()`, e o que sobrar token a token. É o laço do `llama-cli` e da `Sessao`.
 ///
 /// Devolve os logits do último token, a posição seguinte e **o índice do token dentro do
 /// último bloco** que produziu esses logits. O terceiro só interessa ao MTP: é qual dos
 /// hidden que ficaram na GPU a cabeça deve consumir.
-fn prefill_residente(
+pub(crate) fn prefill_residente(
     gpu: &dyn GpuResidentDecode,
     ids: &[u32],
+    pos0: usize,
 ) -> Result<(Vec<f32>, usize, usize), ModelError> {
     // Em batch cada peso do modelo sai da VRAM uma vez para N tokens em vez de uma por
     // token — o decode é limitado por banda, e é aí que está o custo de um prompt longo.
-    let nb = gpu.batch_size();
     let mut logits = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = pos0;
     let mut hidden = 0usize;
-    while nb > 1 && ids.len() - pos >= nb {
-        let Some(bloco) = ids.get(pos..pos + nb) else {
-            break;
-        };
-        logits = gpu.decode_batch(bloco, pos)?;
-        pos += nb;
-        hidden = nb - 1;
+    for nb in [gpu.batch_size(), gpu.batch_resto()] {
+        while nb > 1 && ids.len() - pos >= nb && gpu.lote_cabe(pos, nb) {
+            let Some(bloco) = ids.get(pos..pos + nb) else {
+                break;
+            };
+            logits = gpu.decode_batch(bloco, pos)?;
+            pos += nb;
+            hidden = nb - 1;
+        }
     }
     for &t in ids.get(pos..).unwrap_or(&[]) {
         logits = gpu.decode(t, pos)?;
