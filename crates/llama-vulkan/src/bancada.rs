@@ -217,6 +217,12 @@ pub(crate) fn medir(
         let qp = d.create_query_pool(&qp_info, None).unwrap();
 
         let grupos = push.n_out.div_ceil(k.rows_por_wg);
+        // O GEMM fatia o bloco em tiles de 32 colunas, um por grupo em Y.
+        let grupos_y = if k.rows_por_wg == crate::resident_forward::GEMM_LINHAS_POR_WG {
+            u32::try_from(cols.div_ceil(32)).unwrap_or(1)
+        } else {
+            1
+        };
         let mut us = 0.0;
         // Primeira submissão aquece (clocks, caches de pipeline); a segunda é a medida.
         for _ in 0..2 {
@@ -263,7 +269,7 @@ pub(crate) fn medir(
                 ..Default::default()
             };
             for _ in 0..REPS {
-                d.cmd_dispatch(cmd, grupos, 1, 1);
+                d.cmd_dispatch(cmd, grupos, grupos_y, 1);
                 d.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -401,11 +407,11 @@ fn bancada_mul_mm() {
     let cols = crate::resident_forward::batch_size();
     let spec = [(0, cols as u32)];
     let k = Kernel {
-        spv: crate::MUL_MM_SPV,
+        spv: crate::MUL_MM_Q4K_SPV,
         spec: &spec,
         rows_por_wg: crate::resident_forward::GEMM_LINHAS_POR_WG,
     };
-    let variantes = [("mul_mm", k)];
+    let variantes = [("mul_mm_q4k", k)];
     let pstate = phys
         .pci
         .as_deref()

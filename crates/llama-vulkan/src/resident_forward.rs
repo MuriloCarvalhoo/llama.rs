@@ -1320,7 +1320,7 @@ impl<'ctx> ResidentForward<'ctx> {
             8
         };
         let mul_mm_q4k =
-            ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols)])?;
+            ComputePipeline::with(d, crate::MUL_MM_Q4K_SPV, 5, push_mv, &[(0, gemm_cols)])?;
         let mul_mm_q5k =
             ComputePipeline::with(d, crate::MUL_MM_SPV, 5, push_mv, &[(0, gemm_cols), (1, 1)])?;
         let mul_mm_q6k =

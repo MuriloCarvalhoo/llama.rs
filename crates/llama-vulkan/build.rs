@@ -31,6 +31,8 @@ fn main() {
         ("gate_quant.comp", "GATE_QUANT_SPV"),
         // GEMM com tiling em LDS para o prefill (experimental, atrás de knob).
         ("mul_mm.comp", "MUL_MM_SPV"),
+        // O GEMM do Q4_K, com passo de K = 64 (ver o cabeçalho).
+        ("mul_mm_q4k.comp", "MUL_MM_Q4K_SPV"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

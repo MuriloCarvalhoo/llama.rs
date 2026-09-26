@@ -458,7 +458,7 @@ pub fn dispatch_mul_mm_q4k(
         ctx,
         phys,
         dev,
-        crate::MUL_MM_SPV,
+        crate::MUL_MM_Q4K_SPV,
         w_bytes,
         x_f32,
         n_in,

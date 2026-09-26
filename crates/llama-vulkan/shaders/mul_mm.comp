@@ -43,6 +43,8 @@
 // ## Formato
 //
 // Q4_K, Q5_K e Q6_K, pela constante `TIPO` (ver abaixo); o plano escolhe por tipo de peso.
+// Em produção o Q4_K vai por `mul_mm_q4k.comp`, com passo de K = 64 (16-70% mais rápido na
+// bancada); o `TIPO = 0` daqui fica como a base de que o Q5_K deriva.
 // Os layouts de superbloco sao os de `q4_k_matvec.comp`, `q5_k_matvec.comp` e
 // `q6_k_matvec.comp`, que documentam a extracao de escala e minimo de 6 bits.
 //

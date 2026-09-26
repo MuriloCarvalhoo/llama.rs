@@ -129,6 +129,12 @@ idêntica.
 | 128 | 5,51 | — | — |
 | **256** | **4,89** | **159,8 tok/s** | **118,0 tok/s** |
 
+Em seguida o GEMM do Q4_K ganhou passo de K = 64 (`mul_mm_q4k.comp`: o par de sub-blocos que
+divide os bytes de `qs` sai da memória uma vez, e as barreiras valem para 64 elementos). Passo
+128 ficou pior. Com o bloco 256: GEMM Q4_K de 2,90 para 2,41 ms/token, prefill de 4,89 para 4,35
+ms/token, servidor com 7,5k frio a **171,9 tok/s** e turno de 1,3k a **125,0 tok/s**, saída
+idêntica. O llama.cpp HIP faz 318 tok/s no frio de 7,6k.
+
 ## O que mais precisa virar batch
 
 O matvec não é o único: **todo o resto do plano assume um vetor**. Os que precisam de uma
