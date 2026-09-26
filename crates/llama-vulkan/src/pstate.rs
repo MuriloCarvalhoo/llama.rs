@@ -31,9 +31,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const OCIOSO: Duration = Duration::from_secs(2);
-/// Junction em °C. O crit da MI50 é 105 e o watchdog do usuário mata em 105.
-const QUENTE: i64 = 95;
-const FRIO: i64 = 85;
+/// Junction em °C. Na MI50 o `temp2_crit` é 105 (o firmware corta o clock sozinho) e o
+/// `temp2_emergency` é 110, o teto que o usuário deu: passar de 100 é normal nesta placa. Até
+/// 2026-09-26 a escada descia em 95, e a card1 passava boa parte do decode em `min_sclk`,
+/// lendo ~30% menos que a card2 no mesmo kernel.
+const QUENTE: i64 = 102;
+const FRIO: i64 = 95;
 const PERIODO: Duration = Duration::from_millis(250);
 
 // uapi/drm/amdgpu_drm.h: DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx),

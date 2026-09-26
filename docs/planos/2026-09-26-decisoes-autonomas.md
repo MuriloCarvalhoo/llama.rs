@@ -140,6 +140,15 @@ e como desfazer.
       (20,5–34,6 µs contra 21 µs), porque a redução global cabe em 1 CU dos 60. As outras ops
       pequenas (delta-net) são o trabalho de 1–2 dias do plano e ficaram abertas.
 
+13. **Escada térmica em 102/95 °C (era 95/85) e monitor matando em 108 °C (era 104)**, pela
+    regra que você deu depois da rodada: nesta placa passar de 100 °C é normal, o teto é 110
+    (o `temp2_emergency`; o `temp2_crit`, em que o firmware corta o clock sozinho, é 105).
+    Medido com a ventilação no máximo, no prompt de 29k: a card1 chega a 100–102 °C em
+    10–20 s de prefill em `peak`, a card2 fica em 83 °C com a mesma carga, e a HBM das duas
+    não passa de 78 °C (crit 94). Não houve ganho mensurável ao subir o limiar (prefill de
+    272 para 269 s): perto de 100 °C o próprio firmware já baixa a card1 para 1425 MHz. Os
+    ~20 °C de diferença entre as duas placas com a mesma carga são refrigeração da card1.
+
 ## Agente A — robustez do servidor (itens 4.2, 4.3 e 4.5)
 
 1. **`model` estrito, com o campo ausente aceito.** Vale `model` vazio/ausente ou igual ao

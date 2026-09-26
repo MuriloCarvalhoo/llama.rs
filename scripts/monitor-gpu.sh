@@ -7,7 +7,8 @@
 #
 # Limites (os mesmos das memórias do projeto):
 #   - VRAM livre: 2048 MiB na GPU que dirige o monitor (conector `connected`), 500 MiB na outra;
-#   - junction > 104 °C (regra do usuário: 105) ou HBM ("mem") > 90 °C (crit = 94 °C).
+#   - junction > 108 °C (regra do usuário: nunca passar de 110, o `temp2_emergency`) ou HBM
+#     ("mem") > 90 °C (crit = 94 °C).
 # Mata pelo PID, nunca por nome: `pkill -f` casaria o próprio shell que chamou o script, e
 # `pkill -x llama-server` mataria o runner do Ollama, que tem o mesmo nome.
 #
@@ -82,7 +83,7 @@ while kill -0 "$PID" 2>/dev/null; do
 
         motivo=""
         (( livre < margem[$n] )) && motivo="VRAM livre ${livre} MiB < ${margem[$n]}"
-        (( j > 104 )) && motivo="junction ${j} °C > 104"
+        (( j > 108 )) && motivo="junction ${j} °C > 108"
         (( m > 90 )) && motivo="mem ${m} °C > 90"
         if [ -n "$motivo" ] && [ -z "$matou" ]; then
             matou="$n: $motivo"

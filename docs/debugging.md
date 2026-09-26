@@ -53,7 +53,7 @@ scripts/monitor-gpu.sh $!
 
 Amostra VRAM livre, junction/mem, potência e o nível de `sclk`/`mclk` de cada MI50 a cada 0,25 s
 e mata **o PID** (nunca por nome) se a GPU do monitor ficar com menos de 2048 MiB livres, a outra
-com menos de 500 MiB, a junction passar de 104 °C ou a HBM de 90 °C. Com o monitor em repouso
+com menos de 500 MiB, a junction passar de 108 °C (o `temp2_emergency` da MI50 é 110) ou a HBM de 90 °C. Com o monitor em repouso
 (conector `disconnected`) vale 2048 MiB para todas. Ao fim imprime mínimos, máximos e o
 histograma de clocks por GPU; o log tem uma linha por GPU e amostra. Sai com 3 quando matou.
 
@@ -63,7 +63,7 @@ histograma de clocks por GPU; o log tem uma linha por GPU e amostra. Sai com 3 q
 |---|---|
 | `LLAMA_RS_GPU=N` | Força o índice da GPU, em vez da seleção automática por VRAM livre |
 | `LLAMA_RS_SPLIT=N` | Fixa a fronteira do layer-split na camada N, em vez de derivar da VRAM livre |
-| `LLAMA_RS_PSTATE=standard\|peak\|auto` | Clock da GPU durante a geração (`pstate.rs`). `standard` (padrão) fixa núcleo em 1316 MHz e HBM em 1000; `peak` fixa o núcleo em 1700 e desce para `standard` com a junction em 95 °C; `auto` deixa o DPM do driver |
+| `LLAMA_RS_PSTATE=standard\|peak\|auto` | Clock da GPU durante a geração (`pstate.rs`). `standard` (padrão) fixa núcleo em 1316 MHz e HBM em 1000; `peak` fixa o núcleo em 1700; com a junction em 102 °C qualquer modo desce um degrau (`peak` → `standard` → `min_sclk`) e sobe de volta abaixo de 95; `auto` deixa o DPM do driver |
 | `LLAMA_RS_PROFILE=1` | Liga a coleta de timestamps de GPU |
 | `LLAMA_RS_ATTN16=0` | Volta a atenção de contexto longo ao `attention_split.comp` (uma posição do KV por wave) em vez do `attention_split16.comp` |
 | `LLAMA_RS_MTP_ATE=N` | Com `--mtp`, usa o passo de MTP só com o KV-cache abaixo da posição `N` (padrão `llama_model::MTP_ATE`); `0` usa em toda posição. Para medir o MTP em contexto fundo |
