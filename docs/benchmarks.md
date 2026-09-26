@@ -4,6 +4,20 @@ Todos os números abaixo são token generation (decode), não prompt processing 
 sampling padrão, medidos com `--timings` (mede da emissão do primeiro token em diante, exclui o
 tempo de prefill do prompt). Hardware: 2× AMD MI50 (Radeon Pro VII, gfx906, 16 GB HBM2 cada).
 
+## Conversa longa até 30k tokens (2026-09-25)
+
+Mesma conversa nos dois servidores, decode medido com o contexto no cache (detalhes, prefill e
+método em [`benchmark-conversa-longa-2026-09-25.md`](benchmark-conversa-longa-2026-09-25.md)):
+
+| contexto | llama.rs | llama.rs + MTP | llama.cpp HIP | llama.cpp HIP + MTP |
+|---:|---:|---:|---:|---:|
+| 1.448 | **26,0** | **33,5** | 23,4 | 21,3 |
+| 15.745 | **24,0** | **25,2** | 21,9 | 19,7 |
+| 30.644 | **22,2** | 20,3 | 20,4 | 19,5 |
+
+Prefill: o llama.cpp é ~2,8× mais rápido (318 contra 115 tok/s com 7,6k), e o llama.rs ainda
+refaz o prefill inteiro a cada turno de uma conversa (387 s de TTFT com 30k).
+
 ## Qwen3.8-27B (híbrido atenção + gated delta-net), 2× MI50 layer-split
 
 | Config | tok/s |
