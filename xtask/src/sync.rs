@@ -85,7 +85,8 @@ impl Generator<'_> {
     fn commit(&self, sha: &str, seq: &mut u32) -> Result<usize> {
         let plans = plan_commit(self.map, &self.git.changes(sha)?)?;
         let subject = self.git.subject(sha)?;
-        let mut created = 0;
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        let mut next_seq = *seq;
         for (krate, plan) in plans {
             // Crate ainda não registrada: ela nasce com baseline posterior a este commit.
             if !self.state.crates.contains_key(&krate) {
@@ -98,7 +99,7 @@ impl Generator<'_> {
                 self.git.diff(sha, &files)?
             };
             let meta = TaskMeta {
-                seq: *seq,
+                seq: next_seq,
                 sha: sha.to_owned(),
                 krate,
                 subject: subject.clone(),
@@ -107,12 +108,25 @@ impl Generator<'_> {
                 vendor_deleted: plan.vendor_deleted,
             };
             let body = self.body(&meta, &diff)?;
-            let path = self.pending_dir.join(meta.file_name());
-            std::fs::write(&path, task::render(&meta, &body)?)
-                .with_context(|| format!("gravando {}", path.display()))?;
-            *seq += 1;
-            created += 1;
+            files.push((
+                self.pending_dir.join(meta.file_name()),
+                task::render(&meta, &body)?,
+            ));
+            next_seq += 1;
         }
+        // Tudo em memória antes de gravar; se uma gravação falhar, desfaz as do commit.
+        let mut written: Vec<&Path> = Vec::new();
+        for (path, contents) in &files {
+            if let Err(e) = std::fs::write(path, contents) {
+                for done in &written {
+                    let _ = std::fs::remove_file(done);
+                }
+                return Err(e).with_context(|| format!("gravando {}", path.display()));
+            }
+            written.push(path);
+        }
+        *seq = next_seq;
+        let created = files.len();
         Ok(created)
     }
 
@@ -224,14 +238,31 @@ pub fn run(paths: &Paths, dry_run: bool) -> Result<()> {
         }
     }
     // Grava o progresso mesmo se um commit falhou: a próxima execução continua dele.
-    state.upstream.synced = task::recompute_synced(&git, &state.upstream.cursor, &pending_dir)?;
-    state.save(&paths.upstream_toml())?;
+    // Se o synced não puder ser recalculado, fica o valor anterior.
+    let synced = task::pending(&pending_dir)
+        .and_then(|pending| task::recompute_synced(&git, &state.upstream.cursor, &pending));
+    let mut synced_err = None;
+    match synced {
+        Ok(sha) => state.upstream.synced = sha,
+        Err(e) => synced_err = Some(e.context("recalculando o synced")),
+    }
+    let save_err = state.save(&paths.upstream_toml()).err();
     println!(
         "{created} tarefas novas em sync/pending/ · cursor {} · synced {}",
         short(&state.upstream.cursor),
         short(&state.upstream.synced)
     );
-    outcome
+    // Prioridade do erro devolvido: o do commit, depois o da gravação, depois o do synced.
+    let mut errors = outcome.err().into_iter().chain(save_err).chain(synced_err);
+    let Some(first) = errors.next() else {
+        return Ok(());
+    };
+    let others: Vec<String> = errors.map(|e| format!("{e:#}")).collect();
+    if others.is_empty() {
+        Err(first)
+    } else {
+        Err(first.context(format!("outras falhas: {}", others.join("; "))))
+    }
 }
 
 /// `--dry-run`: o que cada commit pede, por crate, sem gravar nada.
@@ -270,6 +301,7 @@ fn report(git: &Git, map: &SyncMap, state: &State, commits: &[String]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{CrateState, CrateStatus};
     use crate::testutil::{FIXTURE_MAP, Fixture};
 
     #[test]
@@ -364,5 +396,68 @@ mod tests {
             State::load(&paths.upstream_toml()).unwrap().upstream.cursor,
             c1
         );
+    }
+
+    #[test]
+    fn sync_desfaz_tarefas_de_commit_que_falha_no_meio() {
+        let fx = Fixture::new();
+        let paths = fx.paths();
+        let mut state = State::load(&paths.upstream_toml()).unwrap();
+        state.crates.insert(
+            "outra".into(),
+            CrateState {
+                baseline: fx.base.clone(),
+                status: CrateStatus::Porting,
+            },
+        );
+        state.save(&paths.upstream_toml()).unwrap();
+        fx.upstream.write("keep/a.cpp", "int a = 4;\n");
+        fx.upstream.write("other/o.cpp", "int o;\n");
+        let c1 = fx.upstream.commit("toca duas crates");
+        // Um diretório no lugar do segundo arquivo faz a gravação dele falhar.
+        let pending_dir = paths.pending_dir();
+        std::fs::create_dir_all(pending_dir.join(format!("00002-{}-outra.md", short(&c1))))
+            .unwrap();
+
+        assert!(run(&paths, false).is_err());
+
+        assert!(task::pending(&pending_dir).unwrap().is_empty());
+        assert!(
+            !pending_dir
+                .join(format!("00001-{}-k.md", short(&c1)))
+                .exists()
+        );
+        let state = State::load(&paths.upstream_toml()).unwrap();
+        assert_eq!(state.upstream.cursor, fx.base);
+    }
+
+    #[test]
+    fn sync_grava_o_cursor_mesmo_se_o_synced_falha() {
+        let fx = Fixture::new();
+        let paths = fx.paths();
+        // Tarefa válida de um commit que não existe: recalcular o synced falha.
+        let ghost = TaskMeta {
+            seq: 0,
+            sha: "f".repeat(40),
+            krate: "k".into(),
+            subject: "fantasma".into(),
+            port: vec![],
+            vendor: vec![],
+            vendor_deleted: vec![],
+        };
+        std::fs::create_dir_all(paths.pending_dir()).unwrap();
+        std::fs::write(
+            paths.pending_dir().join(ghost.file_name()),
+            task::render(&ghost, "").unwrap(),
+        )
+        .unwrap();
+        fx.upstream.write("keep/a.cpp", "int a = 5;\n");
+        let c1 = fx.upstream.commit("bom");
+
+        assert!(run(&paths, false).is_err());
+
+        let state = State::load(&paths.upstream_toml()).unwrap();
+        assert_eq!(state.upstream.cursor, c1);
+        assert_eq!(state.upstream.synced, fx.base);
     }
 }

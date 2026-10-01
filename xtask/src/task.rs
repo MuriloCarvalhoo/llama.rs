@@ -66,7 +66,7 @@ pub fn pending(dir: &Path) -> Result<Vec<(TaskMeta, PathBuf)>> {
     }
     for entry in std::fs::read_dir(dir).with_context(|| format!("lendo {}", dir.display()))? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "md") {
+        if path.is_file() && path.extension().is_some_and(|e| e == "md") {
             tasks.push((read_meta(&path)?, path));
         }
     }
@@ -75,8 +75,12 @@ pub fn pending(dir: &Path) -> Result<Vec<(TaskMeta, PathBuf)>> {
 }
 
 /// Tudo antes da tarefa pendente mais antiga está feito; sem pendências, tudo até o cursor.
-pub fn recompute_synced(git: &Git, cursor: &str, pending_dir: &Path) -> Result<String> {
-    match pending(pending_dir)?.first() {
+pub fn recompute_synced(
+    git: &Git,
+    cursor: &str,
+    pending: &[(TaskMeta, PathBuf)],
+) -> Result<String> {
+    match pending.first() {
         Some((oldest, _)) => git.rev_parse(&format!("{}^", oldest.sha)),
         None => Ok(cursor.to_owned()),
     }
@@ -111,8 +115,8 @@ pub fn apply(paths: &Paths, file: &Path) -> Result<()> {
 /// `cargo xtask task done`: fecha a tarefa e recalcula o `synced`.
 pub fn done(paths: &Paths, file: &Path) -> Result<()> {
     let meta = read_meta(file)?;
-    let pending_dir = paths.pending_dir();
-    let older: Vec<String> = pending(&pending_dir)?
+    let all = pending(&paths.pending_dir())?;
+    let older: Vec<String> = all
         .iter()
         .filter(|(m, _)| m.krate == meta.krate && m.seq < meta.seq)
         .map(|(m, _)| m.file_name())
@@ -124,11 +128,16 @@ pub fn done(paths: &Paths, file: &Path) -> Result<()> {
             older.join(", ")
         );
     }
-    std::fs::remove_file(file).with_context(|| format!("removendo {}", file.display()))?;
+    // Só remove o arquivo depois de gravar o estado: uma falha antes disso deixa a tarefa no lugar.
+    let rest: Vec<_> = all
+        .into_iter()
+        .filter(|(m, _)| m.file_name() != meta.file_name())
+        .collect();
     let mut state = State::load(&paths.upstream_toml())?;
     let git = git::open_upstream(&paths.upstream_clone(), &state.upstream.repo)?;
-    state.upstream.synced = recompute_synced(&git, &state.upstream.cursor, &pending_dir)?;
+    state.upstream.synced = recompute_synced(&git, &state.upstream.cursor, &rest)?;
     state.save(&paths.upstream_toml())?;
+    std::fs::remove_file(file).with_context(|| format!("removendo {}", file.display()))?;
     println!("synced = {}", git::short(&state.upstream.synced));
     Ok(())
 }
@@ -192,5 +201,24 @@ mod tests {
             State::load(&paths.upstream_toml()).unwrap().upstream.synced,
             c2
         );
+    }
+
+    #[test]
+    fn done_nao_perde_a_tarefa_se_o_estado_falha() {
+        let fx = Fixture::new();
+        fx.upstream.write("keep/a.cpp", "int a = 2;\n");
+        fx.upstream.commit("c1");
+        let paths = fx.paths();
+        crate::sync::run(&paths, false).unwrap();
+        let tasks = pending(&paths.pending_dir()).unwrap();
+        let file = &tasks[0].1;
+
+        let mut state = State::load(&paths.upstream_toml()).unwrap();
+        state.upstream.repo = "/caminho/que/nao/existe".into();
+        state.save(&paths.upstream_toml()).unwrap();
+        std::fs::remove_dir_all(paths.upstream_clone()).unwrap();
+
+        assert!(done(&paths, file).is_err());
+        assert!(file.exists());
     }
 }
