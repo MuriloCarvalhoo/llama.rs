@@ -322,3 +322,34 @@ por dia.
 | `ash` 0.38 cobre Vulkan 1.3.281; o `ggml-vulkan` pode usar extensões mais novas | Verificar no início da trilha E2; se faltar extensão, carregar os ponteiros de função à mão ou usar `ash` do git |
 | A ilha HIP exige structs C compatíveis com o upstream | Isolada no M6, com spec próprio; não afeta o núcleo idiomático |
 | ROCm atual com suporte limitado à gfx906 | O Vulkan cobre as MI50 desde o M3; o HIP é incremental |
+
+## 8. Decisões pendentes para o plano do M1
+
+Levantadas na revisão final do M0 (2026-10-01). O xtask do M0 não as trata; o plano do M1
+precisa resolvê-las **antes** de registrar a primeira crate em `UPSTREAM.toml`.
+
+1. **`baseline` e `status` não são lidos pelo `sync`.** O sync só checa se a crate está
+   registrada. Um `baseline` herdado mais antigo que o `cursor` (§4.5) perde as tarefas do
+   intervalo; um mais novo gera tarefas já cobertas pelo porte inicial. Opções: um comando
+   `cargo xtask register <crate>` que garante `baseline == cursor` (ou gera as tarefas que
+   faltam), ou um cursor por crate.
+2. **A ordem entre crates de §4.4 não é imposta.** `task done` só exige a ordem dentro da
+   crate, e o `seq` de um mesmo commit segue a ordem alfabética das crates, não a de
+   dependência. Precisa existir antes do primeiro catch-up.
+3. **Oráculo, `synced` e trabalho em paralelo.**
+   - `oracle-build` usa o `synced` global por padrão, mas uma crate em `porting` é testada no
+     próprio `baseline` (§4.5, §5.1).
+   - Todo `task done` reescreve a linha única `synced`, e PRs paralelos por crate (§4.4, §6.3)
+     conflitam nela.
+   - Cada worktree clona o upstream de novo em `.upstream/`. Direção sugerida: `synced` por
+     crate calculado sob demanda, um clone compartilhado entre worktrees e trava no
+     `oracle-build`.
+
+Também em aberto, de menor prioridade:
+
+- A regra `tools/**` → `ignore` do `map.toml` engole um arquivo novo dentro de um diretório
+  de tool do escopo. O ideal é trocar por listas explícitas por diretório.
+- A cópia vendor inicial de uma crate no próprio `baseline` (por exemplo os
+  `models/ggml-vocab-*` da crate `llama`) não tem comando.
+- `UPSTREAM.toml` e as tarefas são gravados com `fs::write`. Gravar num temporário e renomear
+  tornaria a escrita atômica.
