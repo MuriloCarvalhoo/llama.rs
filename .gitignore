@@ -1,0 +1,15 @@
+/target
+/build-oracle
+/models
+/refs/tensors.txt
+
+# Benchmark GPU (scripts/benchmark-gpu.sh): clone + builds + relatórios
+/llama.cpp
+/build-vulkan
+/.deps
+/bench-results
+
+target
+
+# Clone do upstream, worktrees e builds do oráculo (cargo xtask)
+/.upstream/
