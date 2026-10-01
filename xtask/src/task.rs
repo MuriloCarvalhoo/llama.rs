@@ -58,7 +58,7 @@ pub fn read_meta(path: &Path) -> Result<TaskMeta> {
     parse_meta(&text).with_context(|| format!("em {}", path.display()))
 }
 
-/// Tarefas pendentes, em ordem de `seq`.
+/// Tarefas pendentes, em ordem de `seq` (empate: nome do arquivo).
 pub fn pending(dir: &Path) -> Result<Vec<(TaskMeta, PathBuf)>> {
     let mut tasks = Vec::new();
     if !dir.exists() {
@@ -70,7 +70,8 @@ pub fn pending(dir: &Path) -> Result<Vec<(TaskMeta, PathBuf)>> {
             tasks.push((read_meta(&path)?, path));
         }
     }
-    tasks.sort_unstable_by_key(|(meta, _)| meta.seq);
+    tasks
+        .sort_unstable_by(|(a, pa), (b, pb)| (a.seq, pa.file_name()).cmp(&(b.seq, pb.file_name())));
     Ok(tasks)
 }
 

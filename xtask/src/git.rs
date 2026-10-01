@@ -155,7 +155,15 @@ impl Git {
     /// Diff de `sha` contra o primeiro pai, restrito a `paths`.
     pub fn diff(&self, sha: &str, paths: &[&str]) -> Result<String> {
         let parent = format!("{sha}^");
-        let mut args = vec!["diff", "--no-renames", parent.as_str(), sha, "--"];
+        let mut args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            parent.as_str(),
+            sha,
+            "--",
+        ];
         args.extend_from_slice(paths);
         Ok(String::from_utf8_lossy(&self.run(&args)?).into_owned())
     }

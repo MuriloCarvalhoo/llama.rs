@@ -122,6 +122,18 @@ path = "src/models/{models.h,llama.cpp,qwen2.cpp,qwen3.cpp,qwen35.cpp,qwen3vl.cp
 action = "port"
 crate = "llama"
 
+# Bases compartilhadas das arquiteturas fora do escopo (existentes em ec7630a).
+[[rule]]
+path = "src/models/{mamba-base,rwkv6-base,rwkv7-base}.cpp"
+action = "ignore"
+
+# Base compartilhada nova nunca pode sumir em silêncio: o upstream já adicionou
+# `delta-net-base.cpp` no mesmo commit que editou `qwen35.cpp` (cc45f2ada). Fica como port.
+[[rule]]
+path = "src/models/*-base.cpp"
+action = "port"
+crate = "llama"
+
 # Arquiteturas fora do escopo (D5). Arquitetura nova no upstream também cai aqui.
 [[rule]]
 path = "src/models/*.cpp"

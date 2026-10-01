@@ -1,5 +1,6 @@
 //! `sync/map.toml`: cada caminho do upstream recebe uma ação. Vale a primeira regra que casar.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -69,6 +70,14 @@ impl SyncMap {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("lendo {}", path.display()))?;
         Self::parse(&text)
+    }
+
+    /// Nomes de crate citados pelas regras.
+    pub fn crates(&self) -> BTreeSet<&str> {
+        self.rules
+            .iter()
+            .filter_map(|r| r.krate.as_deref())
+            .collect()
     }
 
     /// A primeira regra que casa com `path`.
@@ -142,6 +151,13 @@ crate = "ggml"
             Some((Action::Port, Some("ggml")))
         );
         assert_eq!(classify(&map, "ggml/include/ggml-metal.h"), None);
+    }
+
+    #[test]
+    fn crates_lista_os_nomes_das_regras() {
+        let map = SyncMap::parse(MAP).unwrap();
+        let nomes: Vec<&str> = map.crates().into_iter().collect();
+        assert_eq!(nomes, vec!["ggml", "ggml-vulkan", "llama"]);
     }
 
     #[test]

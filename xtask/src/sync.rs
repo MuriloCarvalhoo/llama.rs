@@ -1,6 +1,6 @@
 //! `cargo xtask sync`: transforma commits novos do upstream em tarefas de porte.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use crate::git::{self, Change, Git, short};
 use crate::map::{Action, SyncMap};
 use crate::paths::Paths;
-use crate::state::State;
+use crate::state::{CrateState, State};
 use crate::task::{self, TaskMeta};
 
 /// O que um commit pede para uma crate.
@@ -74,7 +74,9 @@ pub fn rust_modules(crates_dir: &Path) -> Result<BTreeMap<String, Vec<PathBuf>>>
 struct Generator<'a> {
     git: &'a Git,
     map: &'a SyncMap,
-    state: &'a State,
+    crates: &'a BTreeMap<String, CrateState>,
+    /// (sha, crate) que já têm tarefa em `sync/pending/`.
+    existing: &'a BTreeSet<(String, String)>,
     modules: &'a BTreeMap<String, Vec<PathBuf>>,
     root: &'a Path,
     pending_dir: &'a Path,
@@ -89,7 +91,11 @@ impl Generator<'_> {
         let mut next_seq = *seq;
         for (krate, plan) in plans {
             // Crate ainda não registrada: ela nasce com baseline posterior a este commit.
-            if !self.state.crates.contains_key(&krate) {
+            if !self.crates.contains_key(&krate) {
+                continue;
+            }
+            // Execução interrompida antes de gravar o cursor: não duplica a tarefa.
+            if self.existing.contains(&(sha.to_owned(), krate.clone())) {
                 continue;
             }
             let diff = if plan.port.is_empty() {
@@ -185,9 +191,29 @@ impl Generator<'_> {
     }
 }
 
+/// Toda crate registrada em `UPSTREAM.toml` precisa ser citada por alguma regra do map;
+/// senão um erro de digitação apagaria as tarefas dela em silêncio.
+fn check_crates(state: &State, map: &SyncMap) -> Result<()> {
+    let known = map.crates();
+    let unknown: Vec<&str> = state
+        .crates
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "crate(s) em UPSTREAM.toml sem regra em sync/map.toml: {} (erro de digitação?)",
+            unknown.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub fn run(paths: &Paths, dry_run: bool) -> Result<()> {
     let mut state = State::load(&paths.upstream_toml())?;
     let map = SyncMap::load(&paths.map_toml())?;
+    check_crates(&state, &map)?;
     let git = git::open_upstream(&paths.upstream_clone(), &state.upstream.repo)?;
     git.fetch()?;
     let target = git.rev_parse("origin/master")?;
@@ -206,35 +232,38 @@ pub fn run(paths: &Paths, dry_run: bool) -> Result<()> {
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("criando {}", pending_dir.display()))?;
     let modules = rust_modules(&paths.crates_dir())?;
-    let mut seq = task::pending(&pending_dir)?
-        .last()
-        .map_or(1, |(meta, _)| meta.seq + 1);
+    let current = task::pending(&pending_dir)?;
+    let mut seq = current.last().map_or(1, |(meta, _)| meta.seq + 1);
+    let existing: BTreeSet<(String, String)> = current
+        .iter()
+        .map(|(meta, _)| (meta.sha.clone(), meta.krate.clone()))
+        .collect();
     let mut created = 0;
     let mut outcome = Ok(());
     {
         let generator = Generator {
             git: &git,
             map: &map,
-            state: &state,
+            crates: &state.crates,
+            existing: &existing,
             modules: &modules,
             root: paths.root(),
             pending_dir: &pending_dir,
         };
-        let mut cursor = None;
         for sha in &commits {
             match generator.commit(sha, &mut seq) {
-                Ok(n) => {
-                    created += n;
-                    cursor = Some(sha);
-                }
+                Ok(n) => created += n,
                 Err(e) => {
                     outcome = Err(e.context(format!("no commit {}", short(sha))));
                     break;
                 }
             }
-        }
-        if let Some(sha) = cursor {
+            // Cursor gravado a cada commit: uma interrupção não faz a próxima execução repeti-lo.
             state.upstream.cursor.clone_from(sha);
+            if let Err(e) = state.save(&paths.upstream_toml()) {
+                outcome = Err(e.context(format!("gravando o cursor em {}", short(sha))));
+                break;
+            }
         }
     }
     // Grava o progresso mesmo se um commit falhou: a próxima execução continua dele.
@@ -429,6 +458,76 @@ mod tests {
         );
         let state = State::load(&paths.upstream_toml()).unwrap();
         assert_eq!(state.upstream.cursor, fx.base);
+    }
+
+    #[test]
+    fn sync_reexecutado_apos_interrupcao_nao_duplica_tarefas() {
+        let fx = Fixture::new();
+        fx.upstream.write("keep/a.cpp", "int a = 6;\n");
+        let c1 = fx.upstream.commit("muda a");
+        let paths = fx.paths();
+        let antes = std::fs::read_to_string(paths.upstream_toml()).unwrap();
+
+        run(&paths, false).unwrap();
+        // Simula a morte do processo depois de gravar as tarefas e antes do cursor.
+        std::fs::write(paths.upstream_toml(), antes).unwrap();
+        run(&paths, false).unwrap();
+
+        let tasks = task::pending(&paths.pending_dir()).unwrap();
+        assert_eq!(tasks.len(), 1);
+        let (meta, _) = &tasks[0];
+        assert_eq!(
+            (meta.seq, meta.sha.as_str(), meta.krate.as_str()),
+            (1, c1.as_str(), "k")
+        );
+        let state = State::load(&paths.upstream_toml()).unwrap();
+        assert_eq!(state.upstream.cursor, c1);
+    }
+
+    #[test]
+    fn sync_grava_o_cursor_a_cada_commit() {
+        let fx = Fixture::new();
+        fx.upstream.write("keep/a.cpp", "int a = 7;\n");
+        let c1 = fx.upstream.commit("ok");
+        fx.upstream.write("novo/x.c", "x\n");
+        fx.upstream.commit("caminho sem regra");
+        let paths = fx.paths();
+
+        assert!(run(&paths, false).is_err());
+
+        // O cursor já estava gravado em c1 antes da falha do commit seguinte.
+        assert_eq!(
+            State::load(&paths.upstream_toml()).unwrap().upstream.cursor,
+            c1
+        );
+        assert_eq!(task::pending(&paths.pending_dir()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_recusa_crate_registrada_fora_do_map() {
+        for dry_run in [true, false] {
+            let fx = Fixture::new();
+            let paths = fx.paths();
+            let mut state = State::load(&paths.upstream_toml()).unwrap();
+            state.crates.insert(
+                "ggml_cpu".into(),
+                CrateState {
+                    baseline: fx.base.clone(),
+                    status: CrateStatus::Porting,
+                },
+            );
+            state.save(&paths.upstream_toml()).unwrap();
+            fx.upstream.write("keep/a.cpp", "int a = 8;\n");
+            fx.upstream.commit("muda a");
+
+            let Err(e) = run(&paths, dry_run) else {
+                panic!("devia falhar")
+            };
+            assert!(format!("{e:#}").contains("ggml_cpu"));
+            let depois = State::load(&paths.upstream_toml()).unwrap();
+            assert_eq!(depois.upstream.cursor, fx.base);
+            assert!(depois.crates.contains_key("ggml_cpu"));
+        }
     }
 
     #[test]

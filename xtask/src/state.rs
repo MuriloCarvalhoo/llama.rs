@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 const HEADER: &str = "# Lido e gravado pelo `cargo xtask`. Design: docs/superpowers/specs/2026-10-01-llama-rs-port-design.md §4.\n\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     pub upstream: Upstream,
     #[serde(default)]
@@ -16,6 +17,7 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub repo: String,
     /// Último commit para o qual o `xtask sync` já gerou tarefas.
@@ -25,6 +27,7 @@ pub struct Upstream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrateState {
     /// SHA que o porte inicial desta crate mira.
     pub baseline: String,
@@ -82,5 +85,28 @@ mod tests {
                 .unwrap()
                 .contains("[crates.ggml-cpu]")
         );
+    }
+
+    #[test]
+    fn campo_ou_tabela_desconhecida_e_erro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("UPSTREAM.toml");
+        let base = format!(
+            "[upstream]\nrepo = \"r\"\ncursor = \"{}\"\nsynced = \"{}\"\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let casos = [
+            // tabela no singular
+            format!("{base}[crate.ggml]\nbaseline = \"c\"\nstatus = \"porting\"\n"),
+            // campo desconhecido em upstream
+            base.replace("repo = \"r\"", "repo = \"r\"\nextra = 1"),
+            // campo desconhecido em crate
+            format!("{base}[crates.ggml]\nbaseline = \"c\"\nstatus = \"porting\"\nextra = 1\n"),
+        ];
+        for text in casos {
+            std::fs::write(&path, &text).unwrap();
+            assert!(State::load(&path).is_err(), "devia falhar:\n{text}");
+        }
     }
 }
