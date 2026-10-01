@@ -5,6 +5,7 @@ mod check_map;
 mod ci;
 mod git;
 mod map;
+mod oracle;
 mod paths;
 mod state;
 mod sync;
@@ -47,6 +48,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Compila o upstream numa revisão para servir de oráculo
+    OracleBuild {
+        /// Revisão do upstream (padrão: o synced de UPSTREAM.toml)
+        rev: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -70,6 +76,7 @@ fn main() -> ExitCode {
         Cmd::Task {
             cmd: TaskCmd::Done { file },
         } => task::done(&paths, &file),
+        Cmd::OracleBuild { rev } => oracle::run(&paths, rev.as_deref()).map(drop),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

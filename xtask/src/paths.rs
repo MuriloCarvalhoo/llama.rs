@@ -41,6 +41,10 @@ impl Paths {
         self.root.join("crates")
     }
 
+    pub fn upstream_dir(&self) -> PathBuf {
+        self.root.join(".upstream")
+    }
+
     pub fn upstream_clone(&self) -> PathBuf {
         self.root.join(".upstream/llama.cpp")
     }

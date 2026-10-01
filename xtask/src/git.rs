@@ -164,6 +164,13 @@ impl Git {
     pub fn show(&self, sha: &str, path: &str) -> Result<Vec<u8>> {
         self.run(&["show", &format!("{sha}:{path}")])
     }
+
+    /// Checkout de `sha` em `dest`, sem branch.
+    pub fn worktree_add(&self, dest: &Path, sha: &str) -> Result<()> {
+        let dest = dest.to_str().context("caminho não é UTF-8")?;
+        self.run(&["worktree", "add", "--quiet", "--detach", dest, sha])
+            .map(drop)
+    }
 }
 
 #[cfg(test)]
