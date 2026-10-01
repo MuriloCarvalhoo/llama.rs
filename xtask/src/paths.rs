@@ -20,6 +20,18 @@ impl Paths {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    pub fn upstream_toml(&self) -> PathBuf {
+        self.root.join("UPSTREAM.toml")
+    }
+
+    pub fn map_toml(&self) -> PathBuf {
+        self.root.join("sync/map.toml")
+    }
+
+    pub fn upstream_clone(&self) -> PathBuf {
+        self.root.join(".upstream/llama.cpp")
+    }
 }
 
 #[cfg(test)]

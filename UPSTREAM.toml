@@ -1,0 +1,6 @@
+# Lido e gravado pelo `cargo xtask`. Design: docs/superpowers/specs/2026-10-01-llama-rs-port-design.md §4.
+
+[upstream]
+repo = "https://github.com/ggml-org/llama.cpp"
+cursor = "ec7630a640789c393694fb194f1bbbf0369fc62d"
+synced = "ec7630a640789c393694fb194f1bbbf0369fc62d"

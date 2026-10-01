@@ -1,0 +1,276 @@
+# sync/map.toml — classifica cada arquivo de ggml-org/llama.cpp.
+# Vale a primeira regra que casar. `*` não atravessa `/`; `**` atravessa; `{a,b}` alterna.
+# Ações: port (traduzir para Rust) · vendor (cópia verbatim em vendor/upstream/) · ignore.
+# Diretório do escopo listado arquivo a arquivo: um arquivo novo nele faz o check-map falhar.
+# Design: docs/superpowers/specs/2026-10-01-llama-rs-port-design.md §2 (escopo) e §4 (sync).
+
+# ── API pública da libllama ───────────────────────────────────────────────
+[[rule]]
+path = "include/{llama.h,llama-cpp.h}"
+action = "port"
+crate = "llama"
+
+# ── ggml: headers públicos ────────────────────────────────────────────────
+[[rule]]
+path = "ggml/include/{ggml.h,ggml-alloc.h,ggml-backend.h,ggml-cpp.h,gguf.h}"
+action = "port"
+crate = "ggml"
+
+[[rule]]
+path = "ggml/include/ggml-cpu.h"
+action = "port"
+crate = "ggml-cpu"
+
+[[rule]]
+path = "ggml/include/ggml-vulkan.h"
+action = "port"
+crate = "ggml-vulkan"
+
+[[rule]]
+path = "ggml/include/ggml-cuda.h"
+action = "vendor"
+crate = "ggml-hip"
+
+# Outros backends e o otimizador de treino.
+[[rule]]
+path = "ggml/include/{ggml-blas.h,ggml-cann.h,ggml-et.h,ggml-hexagon.h,ggml-metal.h,ggml-opencl.h,ggml-openvino.h,ggml-opt.h,ggml-rpc.h,ggml-sycl.h,ggml-virtgpu.h,ggml-webgpu.h,ggml-zdnn.h,ggml-zendnn.h}"
+action = "ignore"
+
+# ── ggml: núcleo ──────────────────────────────────────────────────────────
+# Fora: otimizador de treino, carga dinâmica de backends (aqui o registro é estático), build.
+[[rule]]
+path = "ggml/src/{ggml-opt.cpp,ggml-backend-dl.cpp,ggml-backend-dl.h,ggml-version.h.in,CMakeLists.txt}"
+action = "ignore"
+
+[[rule]]
+path = "ggml/src/*.{c,cpp,h}"
+action = "port"
+crate = "ggml"
+
+[[rule]]
+path = "ggml/{CMakeLists.txt,.gitignore,cmake/**}"
+action = "ignore"
+
+# ── ggml-cpu: só x86 (AVX2) e o caminho genérico ──────────────────────────
+[[rule]]
+path = "ggml/src/ggml-cpu/arch/x86/**"
+action = "port"
+crate = "ggml-cpu"
+
+[[rule]]
+path = "ggml/src/ggml-cpu/arch/**"
+action = "ignore"
+
+# AMX (Sapphire Rapids+), KleidiAI (ARM), SpacemiT (RISC-V), HBM (Xeon Max): ausentes no Broadwell.
+[[rule]]
+path = "ggml/src/ggml-cpu/{amx/**,kleidiai/**,spacemit/**,cmake/**,CMakeLists.txt,hbm.cpp,hbm.h}"
+action = "ignore"
+
+[[rule]]
+path = "ggml/src/ggml-cpu/{llamafile,tiled}/*.{cpp,h}"
+action = "port"
+crate = "ggml-cpu"
+
+[[rule]]
+path = "ggml/src/ggml-cpu/*.{c,cpp,h}"
+action = "port"
+crate = "ggml-cpu"
+
+# ── ggml-vulkan: host em Rust, shaders verbatim ───────────────────────────
+[[rule]]
+path = "ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp"
+action = "port"
+crate = "ggml-vulkan"
+
+[[rule]]
+path = "ggml/src/ggml-vulkan/vulkan-shaders/CMakeLists.txt"
+action = "ignore"
+
+[[rule]]
+path = "ggml/src/ggml-vulkan/vulkan-shaders/**"
+action = "vendor"
+crate = "ggml-vulkan"
+
+[[rule]]
+path = "ggml/src/ggml-vulkan/{CMakeLists.txt,cmake/**}"
+action = "ignore"
+
+[[rule]]
+path = "ggml/src/ggml-vulkan/*.{cpp,h}"
+action = "port"
+crate = "ggml-vulkan"
+
+# ── ggml-hip: ilha C++ verbatim (M6; o spec próprio do M6 pode reclassificar) ─
+[[rule]]
+path = "ggml/src/{ggml-cuda,ggml-hip}/**"
+action = "vendor"
+crate = "ggml-hip"
+
+# ── ggml: backends fora do escopo ─────────────────────────────────────────
+[[rule]]
+path = "ggml/src/{ggml-blas,ggml-cann,ggml-et,ggml-hexagon,ggml-metal,ggml-musa,ggml-opencl,ggml-openvino,ggml-rpc,ggml-sycl,ggml-virtgpu,ggml-webgpu,ggml-zdnn,ggml-zendnn}/**"
+action = "ignore"
+
+# ── llama (src/) ──────────────────────────────────────────────────────────
+# Caches específicos do DeepSeek e a quantização (tool fora do escopo).
+[[rule]]
+path = "src/{llama-kv-cache-dsa,llama-kv-cache-dsa-iswa,llama-kv-cache-dsv4,llama-kv-cache-msa,llama-quant}.{cpp,h}"
+action = "ignore"
+
+[[rule]]
+path = "src/models/{models.h,llama.cpp,qwen2.cpp,qwen3.cpp,qwen35.cpp,qwen3vl.cpp,delta-net-base.cpp}"
+action = "port"
+crate = "llama"
+
+# Arquiteturas fora do escopo (D5). Arquitetura nova no upstream também cai aqui.
+[[rule]]
+path = "src/models/*.cpp"
+action = "ignore"
+
+[[rule]]
+path = "src/{CMakeLists.txt,llama-version.h.in}"
+action = "ignore"
+
+[[rule]]
+path = "src/*.{cpp,h}"
+action = "port"
+crate = "llama"
+
+# ── common/ ───────────────────────────────────────────────────────────────
+# Fora: llguidance (biblioteca externa opcional), imatrix (quantização), build.
+[[rule]]
+path = "common/{CMakeLists.txt,build-info.cpp.in,llguidance.cpp,imatrix-loader.cpp,imatrix-loader.h,parsers/sources.cmake}"
+action = "ignore"
+
+[[rule]]
+path = "common/**/README.md"
+action = "ignore"
+
+[[rule]]
+path = "common/**/*.{cpp,h,hpp}"
+action = "port"
+crate = "common"
+
+# ── tools no escopo (D6) ──────────────────────────────────────────────────
+[[rule]]
+path = "tools/cli/*.{cpp,h}"
+action = "port"
+crate = "llama-cli"
+
+[[rule]]
+path = "tools/completion/*.cpp"
+action = "port"
+crate = "llama-completion"
+
+[[rule]]
+path = "tools/llama-bench/*.cpp"
+action = "port"
+crate = "llama-bench"
+
+[[rule]]
+path = "tools/perplexity/*.cpp"
+action = "port"
+crate = "llama-perplexity"
+
+# Suíte pytest do upstream: roda contra o binário Rust (spec §5.2, camada 7).
+[[rule]]
+path = "tools/server/tests/**"
+action = "vendor"
+crate = "llama-server"
+
+[[rule]]
+path = "tools/server/*.{cpp,h}"
+action = "port"
+crate = "llama-server"
+
+[[rule]]
+path = "tools/mtmd/{tests/**,test-1.jpeg,test-2.mp3,test-3.mp4,tests.sh}"
+action = "vendor"
+crate = "mtmd"
+
+# mtmd-cli é um binário à parte; legacy-models e debug são ferramentas de conversão.
+[[rule]]
+path = "tools/mtmd/{mtmd-cli.cpp,deprecation-warning.cpp,legacy-models/**,debug/**}"
+action = "ignore"
+
+# Só os encoders de visão da família Qwen.
+[[rule]]
+path = "tools/mtmd/models/{models.h,qwen2vl.cpp,qwen3vl.cpp}"
+action = "port"
+crate = "mtmd"
+
+[[rule]]
+path = "tools/mtmd/models/*.cpp"
+action = "ignore"
+
+[[rule]]
+path = "tools/mtmd/*.{cpp,h}"
+action = "port"
+crate = "mtmd"
+
+# Demais tools, READMEs, CMakeLists e a web UI (tools/ui; decidir no M4).
+[[rule]]
+path = "tools/**"
+action = "ignore"
+
+# ── tests/: cada teste vai para a crate que ele exercita ──────────────────
+[[rule]]
+path = "tests/{test-backend-ops,test-gguf,test-alloc,test-rope,test-quantize-fns,test-double-float,test-col2im-1d}.cpp"
+action = "port"
+crate = "ggml"
+
+[[rule]]
+path = "tests/{test-barrier,test-tiled-mulmat}.cpp"
+action = "port"
+crate = "ggml-cpu"
+
+[[rule]]
+path = "tests/{test-tokenizer-0,test-tokenizer-1-bpe,test-tokenizer-1-spm,test-unicode,test-sampling,test-backend-sampler,test-grammar-parser,test-grammar-integration,test-llama-grammar,test-llama-archs,test-batch-alloc,test-model-load-cancel,test-autorelease,test-save-load-state,test-state-restore-fragmented,test-recurrent-state-rollback,test-thread-safety}.cpp"
+action = "port"
+crate = "llama"
+
+[[rule]]
+path = "tests/{test-chat,test-chat-analysis,test-chat-auto-parser,test-chat-peg-parser,test-chat-template,test-jinja,test-json-schema,test-json-schema-to-grammar,test-peg-parser,test-arg-parser,test-log,test-reasoning-budget,test-gbnf-validator,test-model-resolution}.cpp"
+action = "port"
+crate = "common"
+
+[[rule]]
+path = "tests/peg-parser/*.{cpp,h}"
+action = "port"
+crate = "common"
+
+[[rule]]
+path = "tests/test-mtmd-impl.cpp"
+action = "port"
+crate = "mtmd"
+
+# Fora: treino, RPC, llguidance, quantização, fusão (decidir no M3), metadados do HF,
+# teste que exige modelo grande, harness C e scripts.
+[[rule]]
+path = "tests/{test-opt.cpp,test-rpc-multi-server.cpp,test-rpc-multi-server.sh,test-grammar-llguidance.cpp,test-quantize-perf.cpp,test-quantize-stats.cpp,test-quant-type-selection.cpp,test-fusion.cpp,test-export-graph-ops.cpp,test-gguf-model-data.cpp,gguf-model-data.cpp,gguf-model-data.h,test-rset-release.cpp,test-c.c,test-mtmd-c-api.c,testing.h,test-lora-conversion-inference.sh,test-tokenizer-0.py,test-tokenizer-0.sh,test-tokenizer-random.py,test-tokenizers-repo.sh,CMakeLists.txt,.gitignore,fusion/**,snapshots/**}"
+action = "ignore"
+
+# ── models/: fixtures de tokenizer e templates de chat ────────────────────
+[[rule]]
+path = "models/ggml-vocab-{llama-spm,llama-bpe,qwen2,qwen35}.gguf*"
+action = "vendor"
+crate = "llama"
+
+[[rule]]
+path = "models/templates/**"
+action = "vendor"
+crate = "common"
+
+[[rule]]
+path = "models/**"
+action = "ignore"
+
+# ── fora do escopo: conversão Python, exemplos, CI, docs, libs C++ de terceiros ─
+[[rule]]
+path = "{.devops,.gemini,.github,.pi,app,benches,ci,cmake,conversion,docs,examples,gguf-py,grammars,licenses,media,pocs,requirements,scripts,skills,vendor}/**"
+action = "ignore"
+
+# Arquivos da raiz: README, scripts de conversão, configs de build e lint.
+[[rule]]
+path = "*"
+action = "ignore"

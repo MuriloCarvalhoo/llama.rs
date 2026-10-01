@@ -33,5 +33,6 @@ pub fn run(paths: &Paths) -> Result<()> {
             bail!("falhou: cargo {line}");
         }
     }
-    Ok(())
+    eprintln!("==> check-map");
+    crate::check_map::run(paths, None)
 }

@@ -1,8 +1,14 @@
 //! Automação do llama.rs: sync com o upstream, oráculo e CI.
 //! Design: docs/superpowers/specs/2026-10-01-llama-rs-port-design.md
 
+mod check_map;
 mod ci;
+mod git;
+mod map;
 mod paths;
+mod state;
+#[cfg(test)]
+mod testutil;
 
 use std::process::ExitCode;
 
@@ -19,8 +25,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// fmt + clippy + testes
+    /// fmt + clippy + testes + check-map
     Ci,
+    /// Confere se todo arquivo do upstream casa uma regra de sync/map.toml
+    CheckMap {
+        /// Revisão do upstream (padrão: o cursor de UPSTREAM.toml)
+        #[arg(long)]
+        rev: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -28,6 +40,7 @@ fn main() -> ExitCode {
     let paths = Paths::from_manifest();
     let result = match cli.cmd {
         Cmd::Ci => ci::run(&paths),
+        Cmd::CheckMap { rev } => check_map::run(&paths, rev.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
