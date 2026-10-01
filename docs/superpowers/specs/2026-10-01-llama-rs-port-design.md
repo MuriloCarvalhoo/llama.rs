@@ -117,13 +117,17 @@ llama.rs/
 ```toml
 # UPSTREAM.toml
 [upstream]
-repo     = "https://github.com/ggml-org/llama.cpp"
-baseline = "ec7630a640789c393694fb194f1bbbf0369fc62d"   # alvo do porte inicial
-synced   = "ec7630a640789c393694fb194f1bbbf0369fc62d"   # tudo até aqui está em Rust
+repo   = "https://github.com/ggml-org/llama.cpp"
+cursor = "ec7630a640789c393694fb194f1bbbf0369fc62d"   # último commit com tarefas geradas
+synced = "ec7630a640789c393694fb194f1bbbf0369fc62d"   # todas as tarefas até aqui concluídas
 
 [crates.ggml]
-status = "porting"   # porting | synced
+baseline = "ec7630a640789c393694fb194f1bbbf0369fc62d"   # alvo do porte inicial desta crate
+status   = "porting"                                    # porting | synced
 ```
+
+Só crates registradas em `[crates]` recebem tarefas. Commits anteriores ao registro de uma
+crate não geram tarefa para ela (§4.5).
 
 `sync/map.toml` é uma lista ordenada de regras; vale a primeira que casar:
 
@@ -159,20 +163,27 @@ o comando falhar. Assim nada novo do upstream passa sem classificação.
 
 ### 4.3 `cargo xtask sync`
 
-1. `git fetch` num clone dedicado em `.upstream/` (ignorado pelo git). O `~/llama.cpp`
-   local não é tocado.
-2. Lista os commits `synced..origin/master`, do mais antigo para o mais novo.
-3. Roda `check-map`. Se falhar, para.
-4. Classifica os arquivos tocados por cada commit:
-   - `vendor` → copia para `vendor/upstream/<caminho>` automaticamente;
-   - `ignore` → pula;
-   - `port` → gera `sync/pending/<seq>-<sha7>-<crate>.md` com a mensagem do commit, o diff
-     filtrado aos caminhos do crate e os módulos Rust de destino (pelos marcadores
-     `//! upstream:`).
-5. Depois de portar a tarefa e com `cargo xtask ci` verde, o commit sai como
-   `sync(<crate>): <assunto do upstream> (upstream <sha7>)`, e a tarefa é removida de
-   `sync/pending/`.
-6. Quando não há tarefas pendentes até o commit `T`, `synced` avança para `T`.
+1. `git fetch` num clone dedicado em `.upstream/llama.cpp` (ignorado pelo git). O
+   `~/llama.cpp` local não é tocado. O clone é **completo** (sem `--filter`): um clone
+   parcial busca objeto por objeto sob demanda, e um clone parcial interrompido vira um laço
+   de buscas que não termina. O clone é feito em `llama.cpp.tmp` e renomeado no fim.
+2. Lista os commits `cursor..origin/master`, do mais antigo para o mais novo.
+3. Classifica os arquivos tocados por cada commit. Um caminho sem regra **para** o sync
+   nesse commit; o `cursor` guarda o progresso até o commit anterior.
+   - `vendor` e `port` → uma tarefa `sync/pending/<seq>-<sha7>-<crate>.md` por crate
+     registrada, com a mensagem do commit, as listas de arquivos, o diff dos arquivos a
+     portar e os módulos Rust de destino (pelos marcadores `//! upstream:`);
+   - `ignore` → pula.
+4. Para cada tarefa, na ordem de `seq` dentro da crate:
+   1. `cargo xtask task apply <tarefa>` copia os arquivos vendor **na versão daquele commit**.
+      Copiar só na hora da tarefa mantém shader e código host da mesma versão.
+   2. Portar o diff para os módulos Rust.
+   3. `cargo xtask ci` verde.
+   4. `cargo xtask task done <tarefa>` remove a tarefa (recusa se houver tarefa anterior da
+      mesma crate pendente) e recalcula `synced`: o pai do commit da tarefa pendente mais
+      antiga, ou o `cursor` quando não sobra nenhuma.
+   5. Commit `sync(<crate>): <assunto do upstream> (upstream <sha7>)`.
+5. `cargo xtask sync --dry-run` mostra a classificação por commit e por crate, sem gravar.
 
 ### 4.4 Ordem e paralelismo no sync
 
@@ -184,8 +195,12 @@ o comando falhar. Assim nada novo do upstream passa sem classificação.
 
 ### 4.5 Porte inicial vs. sync contínuo
 
-- Um crate em `porting` mira o `baseline` fixo, nunca um alvo móvel.
-- Ao terminar, ele reaplica `baseline..synced` (catch-up) e passa para `synced`.
+- Uma crate nasce registrada em `UPSTREAM.toml` com `baseline` = o `cursor` daquele dia.
+  Exceção: se uma crate de que ela depende ainda está em `porting`, herda o `baseline` dela.
+- Uma crate em `porting` mira o próprio `baseline` fixo, nunca um alvo móvel. O oráculo é
+  compilado nesse SHA.
+- Enquanto ela porta, o `xtask sync` acumula as tarefas dela em `sync/pending/`. Ao terminar
+  o porte inicial, ela processa essas tarefas (catch-up) e passa para `synced`.
 
 ### 4.6 Cadência e volume
 
