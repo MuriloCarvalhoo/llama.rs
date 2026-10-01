@@ -5,6 +5,22 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+/// Uma mudança de arquivo num commit, relativa ao primeiro pai.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Arquivo criado ou modificado.
+    Upsert(String),
+    Deleted(String),
+}
+
+impl Change {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Upsert(p) | Self::Deleted(p) => p,
+        }
+    }
+}
+
 /// Os 7 primeiros caracteres de um SHA.
 pub fn short(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
@@ -82,6 +98,19 @@ impl Git {
         String::from_utf8(self.run(args)?).context("saída do git não é UTF-8")
     }
 
+    pub fn fetch(&self) -> Result<()> {
+        self.run(&["fetch", "--quiet", "origin"]).map(drop)
+    }
+
+    /// SHA completo de `rev`.
+    pub fn rev_parse(&self, rev: &str) -> Result<String> {
+        let spec = format!("{rev}^{{commit}}");
+        Ok(self
+            .run_text(&["rev-parse", "--verify", &spec])?
+            .trim()
+            .to_owned())
+    }
+
     /// Todos os arquivos da árvore em `rev`.
     pub fn ls_tree(&self, rev: &str) -> Result<Vec<String>> {
         let out = self.run_text(&["ls-tree", "-r", "-z", "--name-only", rev])?;
@@ -90,6 +119,50 @@ impl Git {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+
+    /// Commits depois de `from` até `to`, do mais antigo ao mais novo, pelo primeiro pai.
+    pub fn commits_between(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let range = format!("{from}..{to}");
+        let out = self.run_text(&["rev-list", "--reverse", "--first-parent", &range])?;
+        Ok(out.lines().map(str::to_owned).collect())
+    }
+
+    /// Arquivos que `sha` mudou em relação ao primeiro pai.
+    pub fn changes(&self, sha: &str) -> Result<Vec<Change>> {
+        let parent = format!("{sha}^");
+        let out = self.run_text(&["diff", "--no-renames", "--name-status", "-z", &parent, sha])?;
+        let mut fields = out.split('\0').filter(|s| !s.is_empty());
+        let mut changes = Vec::new();
+        while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+            let path = path.to_owned();
+            changes.push(if status == "D" {
+                Change::Deleted(path)
+            } else {
+                Change::Upsert(path)
+            });
+        }
+        Ok(changes)
+    }
+
+    pub fn subject(&self, sha: &str) -> Result<String> {
+        Ok(self
+            .run_text(&["log", "-1", "--format=%s", sha])?
+            .trim()
+            .to_owned())
+    }
+
+    /// Diff de `sha` contra o primeiro pai, restrito a `paths`.
+    pub fn diff(&self, sha: &str, paths: &[&str]) -> Result<String> {
+        let parent = format!("{sha}^");
+        let mut args = vec!["diff", "--no-renames", parent.as_str(), sha, "--"];
+        args.extend_from_slice(paths);
+        Ok(String::from_utf8_lossy(&self.run(&args)?).into_owned())
+    }
+
+    /// Conteúdo de `path` em `sha`.
+    pub fn show(&self, sha: &str, path: &str) -> Result<Vec<u8>> {
+        self.run(&["show", &format!("{sha}:{path}")])
     }
 }
 
@@ -126,5 +199,48 @@ mod tests {
         let sha = repo.commit("c1");
         let git = Git::new(repo.path());
         assert_eq!(git.ls_tree(&sha).unwrap(), vec!["a.txt", "dir/b.txt"]);
+    }
+
+    #[test]
+    fn commits_e_mudancas_em_ordem() {
+        let repo = TempRepo::init();
+        repo.write("a.txt", "1\n");
+        repo.write("b.txt", "1\n");
+        let c1 = repo.commit("c1");
+        repo.write("a.txt", "2\n");
+        repo.write("n.txt", "novo\n");
+        let c2 = repo.commit("c2");
+        repo.remove("b.txt");
+        let c3 = repo.commit("c3: remove b");
+        let git = Git::new(repo.path());
+
+        assert_eq!(
+            git.commits_between(&c1, &c3).unwrap(),
+            vec![c2.clone(), c3.clone()]
+        );
+        assert_eq!(
+            git.changes(&c2).unwrap(),
+            vec![
+                Change::Upsert("a.txt".into()),
+                Change::Upsert("n.txt".into())
+            ]
+        );
+        assert_eq!(
+            git.changes(&c3).unwrap(),
+            vec![Change::Deleted("b.txt".into())]
+        );
+        assert_eq!(git.subject(&c3).unwrap(), "c3: remove b");
+        assert!(git.diff(&c2, &["a.txt"]).unwrap().contains("+2"));
+        assert_eq!(git.rev_parse("HEAD").unwrap(), c3);
+    }
+
+    #[test]
+    fn show_le_arquivo_na_revisao() {
+        let repo = TempRepo::init();
+        repo.write("a.txt", "v1");
+        let c1 = repo.commit("c1");
+        repo.write("a.txt", "v2");
+        repo.commit("c2");
+        assert_eq!(Git::new(repo.path()).show(&c1, "a.txt").unwrap(), b"v1");
     }
 }

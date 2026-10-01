@@ -29,6 +29,18 @@ impl Paths {
         self.root.join("sync/map.toml")
     }
 
+    pub fn pending_dir(&self) -> PathBuf {
+        self.root.join("sync/pending")
+    }
+
+    pub fn vendor_dir(&self) -> PathBuf {
+        self.root.join("vendor/upstream")
+    }
+
+    pub fn crates_dir(&self) -> PathBuf {
+        self.root.join("crates")
+    }
+
     pub fn upstream_clone(&self) -> PathBuf {
         self.root.join(".upstream/llama.cpp")
     }
